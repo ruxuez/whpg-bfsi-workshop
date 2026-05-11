@@ -1,7 +1,14 @@
 #!/usr/bin/env python3
 """
-NetVista × EDB WarehousePG — Network Analytics Demo
-with Data Reload support (runs the 4 SQL scripts in sequence).
+NetVista × EDB WarehousePG — Network Analytics Demo (Workshop Edition)
+TRIMMED: 7 queries across 3 panels (was 12/4) — paced for a 45-min lab slot.
+
+What changed vs the original:
+  Panel 1 (Network Traffic):     1A  +  1C        (dropped 1B z-score)
+  Panel 2 (Log Analytics):       2A  +  2C        (dropped 2B suspicious DNS)
+  Panel 3 (IPAM/SLA + Forensic): 3C  +  4B        (dropped 3A, 3B, 4A, 4C; 4B promoted)
+  Panel 4: removed entirely
+  + a new "Comprehension Check" tab with 2 discussion questions
 
 SETUP:
     pip3 install flask psycopg2-binary
@@ -26,33 +33,33 @@ DB = {
     "password": os.environ.get("WHPG_PASS", ""),
 }
 
+# Schema where the workshop tables live. Override with WHPG_SCHEMA=...
+# if the lab loaded into a different schema name.
+SCHEMA = os.environ.get("WHPG_SCHEMA", "netvista_demo")
+
 # ── Reload scripts (in order) ───────────────────────────────────────────────
 WORKSHOP_DIR = os.environ.get("WORKSHOP_DIR", "/scripts/sql/")
 RELOAD_SCRIPTS = [
     ("01_schema.sql",            "Drop & recreate schema"),
     ("02_seed_reference.sql",    "Seed reference tables"),
-    ("03_load_external.sql",      "Seed traffic data (~50M rows, Jan-Apr 2026)"),
+    ("03_load_external.sql",     "Seed traffic data (~50M rows, Jan-Apr 2026)"),
     ("06_ai_analytics.sql",      "Build AI / pgvector analytics"),
     ("07_kmeans_fallback.sql",   "K-Means assignments (MADlib or SQL fallback)"),
 ]
 
-# # Global reload state so the SSE stream can follow it
-# _reload_lock   = threading.Lock()
-# _reload_running = False
-# _reload_log    = []   # list of (ts, level, msg)
-
-# def _append_log(level, msg):
-#     ts = datetime.now().strftime("%H:%M:%S")
-#     _reload_log.append((ts, level, msg))
 
 # ── DB helper ───────────────────────────────────────────────────────────────
 def run(sql, params=None):
-    conn = psycopg2.connect(**DB)
+    # Set search_path via connection options — this applies BEFORE any query
+    # runs and survives MPP dispatch; avoids races with autocommit + cur.execute.
+    conn = psycopg2.connect(
+        options=f'-c search_path={SCHEMA},public',
+        **DB,
+    )
     conn.set_session(autocommit=True)
     try:
         cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
         t0 = time.perf_counter()
-        cur.execute("SET search_path TO netvista_demo, public;")
         cur.execute(sql, params)
         ms = round((time.perf_counter() - t0) * 1000, 1)
         rows = []
@@ -67,12 +74,48 @@ def run(sql, params=None):
             rows.append(r)
         return {"data": rows, "ms": ms, "rows": len(rows)}
     except Exception as e:
-        return {"data": [], "ms": 0, "rows": 0, "error": str(e)}
+        # Helpful diagnostic when the schema/tables are missing
+        msg = str(e)
+        if "does not exist" in msg and "relation" in msg:
+            msg += (f"  [hint: search_path is set to '{SCHEMA},public'. "
+                    f"Verify schema exists: \\dn in psql, "
+                    f"or set WHPG_SCHEMA env var to the correct name.]")
+        return {"data": [], "ms": 0, "rows": 0, "error": msg}
     finally:
         conn.close()
 
 
-# ── 12 curated queries ───────────────────────────────────────────────────────
+# ── Diagnostic endpoint: confirm schema + table visibility ──────────────────
+def diagnose_schema():
+    """Returns what the app sees: current schema, search_path, and table list."""
+    try:
+        conn = psycopg2.connect(
+            options=f'-c search_path={SCHEMA},public',
+            **DB,
+        )
+        conn.set_session(autocommit=True)
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute("SHOW search_path;")
+        sp = cur.fetchone()
+        cur.execute("""
+            SELECT schemaname, tablename
+            FROM pg_tables
+            WHERE schemaname NOT IN ('pg_catalog','information_schema','pg_toast')
+            ORDER BY schemaname, tablename;
+        """)
+        tables = cur.fetchall()
+        conn.close()
+        return {
+            "configured_schema": SCHEMA,
+            "active_search_path": dict(sp).get("search_path"),
+            "tables_visible": [dict(t) for t in tables],
+            "ok": True,
+        }
+    except Exception as e:
+        return {"configured_schema": SCHEMA, "ok": False, "error": str(e)}
+
+
+# ── 7 curated queries (trimmed from 12) ──────────────────────────────────────
 QUERIES = [
     # ── Panel 1: Network Traffic ─────────────────────────────────────────────
     {
@@ -88,26 +131,6 @@ WHERE n.ts BETWEEN '2026-04-01' AND '2026-04-23 23:59:59'
   AND t.active = TRUE AND t.confidence >= 80
 GROUP BY 1, 2, 3, 4
 ORDER BY hit_count DESC LIMIT 20"""
-    },
-    {
-        "id": "1b", "panel": 0,
-        "name": "1B · Anomaly Detection (z-score)",
-        "desc": "Traffic spikes > 3σ in the current month",
-        "sql": """WITH hourly AS (
-    SELECT date_trunc('hour', ts) AS hour, src_ip,
-        SUM(bytes) AS total_bytes, COUNT(*) AS flow_count
-    FROM netflow_logs WHERE ts BETWEEN '2026-04-01' AND '2026-04-23 23:59:59'
-    GROUP BY 1, 2
-), stats AS (
-    SELECT src_ip, AVG(total_bytes) AS avg_b, STDDEV(total_bytes) AS std_b
-    FROM hourly GROUP BY 1 HAVING STDDEV(total_bytes) > 0
-)
-SELECT h.hour, h.src_ip::text, h.total_bytes, h.flow_count,
-    ROUND(s.avg_b::numeric, 0) AS avg_bytes,
-    ROUND(((h.total_bytes - s.avg_b) / s.std_b)::numeric, 2) AS z_score
-FROM hourly h JOIN stats s ON h.src_ip = s.src_ip
-WHERE (h.total_bytes - s.avg_b) / s.std_b > 3
-ORDER BY z_score DESC LIMIT 20"""
     },
     {
         "id": "1c", "panel": 0,
@@ -138,24 +161,6 @@ WHERE s.severity <= 2 AND s.ts BETWEEN '2026-04-01' AND '2026-04-23 23:59:59'
 ORDER BY s.ts DESC LIMIT 30"""
     },
     {
-        "id": "2b", "panel": 1,
-        "name": "2B · Suspicious DNS + FW Deny",
-        "desc": "Hosts querying bad domains AND being blocked",
-        "sql": """SELECT d.client_ip::text, d.query_name,
-    COUNT(DISTINCT d.dns_id) AS dns_queries,
-    COUNT(DISTINCT f.fw_id) AS fw_denies,
-    MAX(d.ts) AS last_dns_query, MAX(f.ts) AS last_fw_deny
-FROM dns_logs d
-JOIN firewall_logs f ON d.client_ip = f.src_ip
-    AND f.action IN ('DENY', 'DROP')
-    AND f.ts BETWEEN d.ts - interval '1 hour' AND d.ts + interval '1 hour'
-WHERE (d.query_name LIKE '%.evil.%' OR d.query_name LIKE '%.xyz'
-   OR d.query_name LIKE '%exfil%' OR d.query_name LIKE '%malware%'
-   OR d.query_name LIKE '%c2-%' OR d.query_name LIKE '%darknet%')
-  AND d.ts BETWEEN '2026-04-01' AND '2026-04-23 23:59:59'
-GROUP BY 1, 2 ORDER BY dns_queries DESC LIMIT 20"""
-    },
-    {
         "id": "2c", "panel": 1,
         "name": "2C · Log Volume Dashboard",
         "desc": "All 5 sources — $2M+ Splunk savings",
@@ -172,36 +177,7 @@ UNION ALL SELECT 'bgp', COUNT(*)
 ORDER BY events DESC"""
     },
 
-    # ── Panel 3: IPAM & SLA ───────────────────────────────────────────────────
-    {
-        "id": "3a", "panel": 2,
-        "name": "3A · Subnet Utilization",
-        "desc": "Native CIDR containment — <<= operator on /8 block",
-        "sql": """SELECT subnet::text, masklen(subnet) AS prefix_len, region_code,
-    description, allocated_ips, total_ips, utilization_pct, health_status
-FROM v_ipam_utilization
-WHERE subnet <<= '10.0.0.0/8'::cidr
-ORDER BY utilization_pct DESC"""
-    },
-    {
-        "id": "3b", "panel": 2,
-        "name": "3B · SLA Breach Timeline",
-        "desc": "Hourly breach/warning per customer — current month",
-        "sql": """SELECT date_trunc('hour', m.ts) AS hour,
-    c.customer_name, c.tier,
-    ROUND(AVG(m.latency_ms), 1) AS avg_latency,
-    sc.latency_sla_ms,
-    CASE WHEN AVG(m.latency_ms) > sc.latency_sla_ms THEN 'BREACH'
-         WHEN AVG(m.latency_ms) > sc.latency_sla_ms * 0.8 THEN 'WARNING'
-         ELSE 'OK' END AS status
-FROM network_metrics m
-JOIN customers c ON m.customer_id = c.customer_id
-JOIN sla_contracts sc ON c.customer_id = sc.customer_id AND sc.effective_to IS NULL
-WHERE m.ts BETWEEN '2026-04-01' AND '2026-04-23 23:59:59'
-GROUP BY 1, 2, 3, 5
-HAVING AVG(m.latency_ms) > sc.latency_sla_ms * 0.8
-ORDER BY 1 DESC, avg_latency DESC"""
-    },
+    # ── Panel 3: IPAM, SLA & Forensic Bonus ──────────────────────────────────
     {
         "id": "3c", "panel": 2,
         "name": "3C · QoE Scorecard",
@@ -220,28 +196,10 @@ JOIN network_metrics m ON c.customer_id = m.customer_id AND m.ts BETWEEN '2026-0
 GROUP BY 1, 2, 3, 9
 ORDER BY qoe_score ASC"""
     },
-
-    # ── Panel 4: Security ─────────────────────────────────────────────────────
     {
-        "id": "4a", "panel": 3,
-        "name": "4A · Live Threats + Geo",
-        "desc": "Aggregated threat matches with country enrichment",
-        "sql": """SELECT n.src_ip::text, t.feed_name, t.category AS threat,
-    t.confidence, g.country_name AS src_country,
-    COUNT(*) AS flow_count,
-    pg_size_pretty(SUM(n.bytes)) AS total_bytes,
-    COUNT(DISTINCT n.dst_ip) AS unique_targets
-FROM netflow_logs n
-JOIN threat_intel_feeds t ON n.src_ip <<= t.ip_range AND t.active AND t.confidence >= 80
-LEFT JOIN geo_ip g ON n.src_ip <<= g.network
-WHERE n.ts BETWEEN '2026-04-01' AND '2026-04-23 23:59:59'
-GROUP BY 1, 2, 3, 4, 5
-ORDER BY flow_count DESC LIMIT 20"""
-    },
-    {
-        "id": "4b", "panel": 3,
-        "name": "4B · Forensic IP Trace",
-        "desc": "Trace 185.220.101.34 across ALL log sources",
+        "id": "4b", "panel": 2,
+        "name": "★ BONUS · Forensic IP Trace",
+        "desc": "Trace 185.220.101.34 across ALL log sources in one query",
         "sql": """SELECT * FROM (
     (SELECT 'netflow' AS source, ts, 'src→' || host(dst_ip) || ':' || dst_port AS detail, bytes::text AS extra
         FROM netflow_logs WHERE src_ip = '185.220.101.34'::inet AND ts BETWEEN '2026-04-01' AND '2026-04-23 23:59:59'
@@ -260,46 +218,28 @@ ORDER BY flow_count DESC LIMIT 20"""
         ORDER BY ts DESC LIMIT 15)
 ) forensic ORDER BY ts DESC LIMIT 40"""
     },
-    {
-        "id": "4c", "panel": 3,
-        "name": "4C · Regional Threat Summary",
-        "desc": "The 'wow' query — top threat + riskiest customer + hottest subnet per region",
-        "sql": """WITH threat_ips AS (
-    SELECT ip_range, category FROM threat_intel_feeds WHERE active AND confidence >= 70
-), ts AS (
-    SELECT r.region_code, t.category, COUNT(*) AS hits,
-        ROW_NUMBER() OVER (PARTITION BY r.region_code ORDER BY COUNT(*) DESC) AS rn
-    FROM netflow_logs n JOIN threat_ips t ON n.src_ip <<= t.ip_range
-    JOIN regions r ON n.region_id = r.region_id
-    WHERE n.ts BETWEEN '2026-04-01' AND '2026-04-23 23:59:59' GROUP BY 1, 2
-), rc AS (
-    SELECT r.region_code, c.customer_name, AVG(m.latency_ms) AS avg_lat,
-        ROW_NUMBER() OVER (PARTITION BY r.region_code ORDER BY AVG(m.latency_ms) DESC) AS rn
-    FROM network_metrics m JOIN customers c ON m.customer_id = c.customer_id
-    JOIN regions r ON c.region_id = r.region_id
-    WHERE m.ts BETWEEN '2026-04-01' AND '2026-04-23 23:59:59' GROUP BY 1, 2
-), hs AS (
-    SELECT r.region_code, network(set_masklen(n.src_ip, 24)) AS subnet,
-        COUNT(*) FILTER (WHERE n.src_ip <<= ANY(SELECT ip_range FROM threat_ips)) AS tflows,
-        ROW_NUMBER() OVER (PARTITION BY r.region_code ORDER BY
-            COUNT(*) FILTER (WHERE n.src_ip <<= ANY(SELECT ip_range FROM threat_ips)) DESC) AS rn
-    FROM netflow_logs n JOIN regions r ON n.region_id = r.region_id
-    WHERE n.ts BETWEEN '2026-04-01' AND '2026-04-23 23:59:59' GROUP BY 1, 2
-)
-SELECT ts.region_code, ts.category AS top_threat, ts.hits AS threat_hits,
-    rc.customer_name AS highest_risk_customer, ROUND(rc.avg_lat, 1) AS their_latency_ms,
-    hs.subnet::text AS hottest_subnet, hs.tflows AS threat_flows
-FROM ts JOIN rc ON ts.region_code = rc.region_code AND rc.rn = 1
-JOIN hs ON ts.region_code = hs.region_code AND hs.rn = 1
-WHERE ts.rn = 1 ORDER BY ts.hits DESC"""
-    },
 ]
 
 PANELS = [
     {"name": "Network Traffic", "icon": "1", "desc": "Native inet operators on 31M+ netflow rows"},
     {"name": "Log Analytics",   "icon": "2", "desc": "Cross-source correlation — replace Splunk"},
-    {"name": "IPAM & SLA",      "icon": "3", "desc": "CIDR math + real-time customer SLA monitoring"},
-    {"name": "Security",        "icon": "4", "desc": "Threat intel + geo enrichment + forensics"},
+    {"name": "IPAM/SLA + Forensic Bonus", "icon": "3", "desc": "Customer QoE scoring + multi-source IP trace"},
+]
+
+# ── Comprehension check questions (rendered as a tab in the dashboard) ──────
+CHECK_QUESTIONS = [
+    {
+        "kind": "concept",
+        "title": "Why was src_ip <<= ip_range fast on 33M flows?",
+        "ask": "You ran the threat-intel join in roughly 1 second. Name three things that made that fast — that wouldn't be true on single-node Postgres or on Snowflake.",
+        "listen": "Native inet/cidr type (no string parsing) · MPP parallelism across all segments · no UDF overhead — the operator is built into the planner",
+    },
+    {
+        "kind": "practical",
+        "title": "If we changed netflow_logs' distribution key…",
+        "ask": "Today netflow_logs is DISTRIBUTED BY (region_id). If we re-distributed it by src_ip instead, which Lab 1 query gets faster, and which gets slower?",
+        "listen": "Faster: 1A threat-intel join — rows now co-located by src_ip, no Motion needed. Slower: 1C top talkers by subnet — the GROUP BY no longer aligns with distribution, forcing a Redistribute.",
+    },
 ]
 
 
@@ -307,7 +247,13 @@ PANELS = [
 
 @app.route("/api/queries")
 def api_queries():
-    return jsonify({"panels": PANELS, "queries": QUERIES})
+    return jsonify({"panels": PANELS, "queries": QUERIES, "check": CHECK_QUESTIONS})
+
+
+@app.route("/api/diag")
+def api_diag():
+    """Visit /api/diag to see what schema/tables the app can see."""
+    return jsonify(diagnose_schema())
 
 
 @app.route("/api/run", methods=["POST"])
@@ -342,98 +288,12 @@ def api_sql():
     return jsonify(run(sql))
 
 
-# ── Data Reload ──────────────────────────────────────────────────────────────
-
-# @app.route("/api/reload/start", methods=["POST"])
-# def api_reload_start():
-#     global _reload_running, _reload_log
-#     with _reload_lock:
-#         if _reload_running:
-#             return jsonify({"ok": False, "msg": "Reload already in progress"}), 409
-#         _reload_running = True
-#         _reload_log = []
-
-#     def _run():
-#         global _reload_running
-#         try:
-#             _append_log("info", f"Starting full data reload in {WORKSHOP_DIR}")
-#             _append_log("info", f"Running {len(RELOAD_SCRIPTS)} scripts sequentially")
-#             t_total = time.time()
-
-#             for fname, label in RELOAD_SCRIPTS:
-#                 fpath = os.path.join(WORKSHOP_DIR, fname)
-#                 if not os.path.exists(fpath):
-#                     _append_log("error", f"✗ Script not found: {fpath}")
-#                     continue
-
-#                 _append_log("step", f"▶ [{label}]  psql -d gpadmin -f {fname}")
-#                 t0 = time.time()
-#                 try:
-#                     proc = subprocess.Popen(
-#                         ["psql", "-d", DB["dbname"], "-U", DB["user"], "-f", fpath,
-#                          "-v", "ON_ERROR_STOP=0"],
-#                         stdout=subprocess.PIPE,
-#                         stderr=subprocess.STDOUT,
-#                         text=True,
-#                         cwd=WORKSHOP_DIR,
-#                     )
-#                     for line in proc.stdout:
-#                         line = line.rstrip()
-#                         if line:
-#                             # classify line
-#                             lvl = "log"
-#                             if "ERROR" in line or "FATAL" in line:
-#                                 lvl = "error"
-#                             elif "NOTICE" in line or "WARNING" in line:
-#                                 lvl = "notice"
-#                             elif line.startswith("INSERT") or line.startswith("CREATE") \
-#                                     or line.startswith("DROP") or line.startswith("ANALYZE") \
-#                                     or line.startswith("TRUNCATE"):
-#                                 lvl = "ok"
-#                             _append_log(lvl, line)
-#                     proc.wait()
-#                     elapsed = round(time.time() - t0, 1)
-#                     if proc.returncode == 0:
-#                         _append_log("ok", f"✓ {fname} completed in {elapsed}s")
-#                     else:
-#                         _append_log("error", f"✗ {fname} exited with code {proc.returncode} ({elapsed}s)")
-#                 except Exception as e:
-#                     _append_log("error", f"✗ Failed to run {fname}: {e}")
-
-#             total_elapsed = round(time.time() - t_total, 1)
-#             _append_log("done", f"🎉 Full reload complete in {total_elapsed}s — ~50M rows loaded (Jan–Apr 2026)")
-#         finally:
-#             _reload_running = False
-
-#     t = threading.Thread(target=_run, daemon=True)
-#     t.start()
-#     return jsonify({"ok": True, "msg": "Reload started"})
-
-
-# @app.route("/api/reload/status")
-# def api_reload_status():
-#     """Returns current log + running flag — polled by the UI every 1s."""
-#     return jsonify({
-#         "running": _reload_running,
-#         "log": _reload_log,   # list of [ts, level, msg]
-#     })
-
-
-# @app.route("/api/reload/abort", methods=["POST"])
-# def api_reload_abort():
-#     # We can't kill a running psql cleanly, but we can flip the flag
-#     global _reload_running
-#     _reload_running = False
-#     _append_log("error", "⚠ Reload aborted by user — current script may still be running")
-#     return jsonify({"ok": True})
-
-
 @app.route("/")
 def index():
     return render_template_string(HTML, panels=PANELS, queries=QUERIES,
+                                  check=CHECK_QUESTIONS,
                                   reload_scripts=RELOAD_SCRIPTS,
-                                  workshop_dir=WORKSHOP_DIR
-                                  )
+                                  workshop_dir=WORKSHOP_DIR)
 
 
 # ── HTML template ────────────────────────────────────────────────────────────
@@ -449,7 +309,6 @@ HTML = r"""<!DOCTYPE html>
   --muted:#4b5563;--accent:#059669;--adim:rgba(6,214,160,.12);
   --warn:#d97706;--wdim:rgba(251,191,36,.1);--danger:#ef4444;--ddim:rgba(239,68,68,.1);
   --blue:#2563eb;--bdim:rgba(59,130,246,.1);--purple:#7c3aed;--cyan:#0891b2;
-  --reload:#0f172a;
 }
 *{margin:0;padding:0;box-sizing:border-box}
 body{background:var(--bg);color:var(--text);font-family:'Outfit',system-ui,sans-serif}
@@ -480,8 +339,8 @@ body{background:var(--bg);color:var(--text);font-family:'Outfit',system-ui,sans-
      transition:.18s;white-space:nowrap;font-weight:500}
 .tab:hover{color:var(--text);background:rgba(0,0,0,.04)}
 .tab.on{background:var(--adim);border-color:rgba(6,214,160,.3);color:var(--accent);font-weight:600}
-.tab.reload-tab{border-color:rgba(251,191,36,.3);color:var(--warn)}
-.tab.reload-tab.on{background:var(--wdim);border-color:rgba(251,191,36,.5);color:var(--warn)}
+.tab.check-tab{border-color:rgba(217,119,6,.3);color:var(--warn)}
+.tab.check-tab.on{background:var(--wdim);border-color:rgba(217,119,6,.5);color:var(--warn)}
 
 /* ── layout ── */
 .main{padding:24px 28px;max-width:1440px;margin:0 auto}
@@ -519,7 +378,6 @@ body{background:var(--bg);color:var(--text);font-family:'Outfit',system-ui,sans-
 .p0 .qid{background:var(--adim);color:var(--accent)}
 .p1 .qid{background:var(--bdim);color:var(--blue)}
 .p2 .qid{background:rgba(167,139,250,.15);color:var(--purple)}
-.p3 .qid{background:var(--ddim);color:var(--danger)}
 .qname{flex:1;font-size:14px;font-weight:500}
 .qdesc{color:var(--dim);font-size:11px}
 .qtm .t{background:var(--adim);color:var(--accent);padding:2px 8px;border-radius:4px;
@@ -560,62 +418,30 @@ tr:last-child td{border-bottom:none}
         cursor:pointer;font-family:inherit;margin-top:10px;transition:.15s}
 .runbtn:hover{opacity:.85}
 
-/* ── RELOAD PANEL ── */
-.reload-card{background:var(--card);border:1px solid var(--border);border-radius:12px;
-             overflow:hidden;margin-bottom:14px}
-.reload-hdr{background:#0f172a;padding:18px 22px;display:flex;align-items:center;
-            justify-content:space-between;gap:14px;flex-wrap:wrap}
-.reload-title{color:#e2e8f0;font-size:16px;font-weight:700}
-.reload-sub{color:#94a3b8;font-size:12px;margin-top:2px}
-.reload-actions{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
-.btn-reload{background:linear-gradient(135deg,#d97706,#b45309);color:#fff;border:0;
-            padding:10px 24px;border-radius:8px;font-size:13px;font-weight:700;
-            cursor:pointer;font-family:inherit;transition:.15s;white-space:nowrap}
-.btn-reload:hover{opacity:.88}.btn-reload:disabled{opacity:.4;cursor:not-allowed}
-.btn-abort{background:var(--ddim);color:var(--danger);border:1px solid rgba(239,68,68,.3);
-           padding:8px 16px;border-radius:8px;font-size:12px;font-weight:600;
-           cursor:pointer;font-family:inherit;transition:.15s}
-.btn-abort:hover{background:rgba(239,68,68,.2)}.btn-abort:disabled{opacity:.4;cursor:not-allowed}
-
-.reload-body{padding:20px 22px}
-.reload-steps{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:10px;margin-bottom:18px}
-.step-card{background:var(--bg);border:1px solid var(--border);border-radius:8px;
-           padding:12px 14px;transition:.2s}
-.step-card.active{border-color:var(--warn);background:var(--wdim)}
-.step-card.done{border-color:var(--accent);background:var(--adim)}
-.step-card.error{border-color:var(--danger);background:var(--ddim)}
-.step-num{font-family:'JetBrains Mono',monospace;font-size:10px;font-weight:700;
-          color:var(--dim);margin-bottom:4px;text-transform:uppercase;letter-spacing:.05em}
-.step-name{font-size:12px;font-weight:600;color:var(--text)}
-.step-file{font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--muted);margin-top:2px}
-.step-status{font-size:10px;font-weight:600;margin-top:5px}
-.step-status.idle{color:var(--dim)}.step-status.running{color:var(--warn)}
-.step-status.done{color:var(--accent)}.step-status.error{color:var(--danger)}
-
-/* log box */
-.logbox{background:#0d1117;border:1px solid #30363d;border-radius:8px;
-        height:360px;overflow-y:auto;padding:12px 14px;
-        font-family:'JetBrains Mono',monospace;font-size:11px;line-height:1.7}
-.log-line{display:flex;gap:10px;padding:1px 0;border-bottom:1px solid rgba(255,255,255,.03)}
-.log-ts{color:#484f58;min-width:60px;flex-shrink:0}
-.log-msg{flex:1;word-break:break-all}
-.log-info   .log-msg{color:#8b949e}
-.log-step   .log-msg{color:#79c0ff;font-weight:600}
-.log-ok     .log-msg{color:#3fb950}
-.log-notice .log-msg{color:#d29922}
-.log-error  .log-msg{color:#f85149}
-.log-done   .log-msg{color:#58a6ff;font-weight:700;font-size:12px}
-.log-log    .log-msg{color:#8b949e}
-
-.reload-status-bar{display:flex;align-items:center;gap:12px;
-                   background:var(--bg);border:1px solid var(--border);
-                   border-radius:8px;padding:10px 14px;margin-bottom:12px;flex-wrap:wrap}
-.rstat{font-size:12px;color:var(--dim)}
-.rstat strong{color:var(--text);font-family:'JetBrains Mono',monospace}
-.progress-ring{width:14px;height:14px;border:2px solid var(--border);
-               border-top-color:var(--warn);border-radius:50%;
-               animation:sp .7s linear infinite;display:none}
-.progress-ring.active{display:inline-block}
+/* ── COMPREHENSION CHECK PANEL ── */
+.check-intro{background:linear-gradient(135deg,#fef3c7,#fde68a);border:1px solid rgba(217,119,6,.3);
+             border-radius:11px;padding:18px 22px;margin-bottom:20px}
+.check-intro h2{color:#92400e;font-size:18px;margin-bottom:6px}
+.check-intro p{color:#78350f;font-size:13px;line-height:1.55}
+.check-grid{display:grid;grid-template-columns:1fr 1fr;gap:18px;margin-bottom:24px}
+@media(max-width:900px){.check-grid{grid-template-columns:1fr}}
+.qcheck{background:var(--card);border:1px solid var(--border);border-radius:11px;overflow:hidden}
+.qcheck .head{padding:12px 18px;color:#fff;font-weight:700;font-size:12px;letter-spacing:.5px;text-transform:uppercase}
+.qcheck.concept .head{background:var(--accent)}
+.qcheck.practical .head{background:#1A4767}
+.qcheck .body{padding:18px 22px}
+.qcheck .ttl{font-size:15px;font-weight:600;color:#1A4767;margin-bottom:12px;line-height:1.4}
+.qcheck .ttl code{background:#eef2f4;padding:2px 7px;border-radius:3px;font-family:'JetBrains Mono',monospace;color:#c0392b;font-size:13px}
+.qcheck .ask{font-size:13px;color:var(--text);margin-bottom:14px;line-height:1.6}
+.qcheck .ask code{background:#eef2f4;padding:1px 6px;border-radius:3px;font-family:'JetBrains Mono',monospace;color:#c0392b;font-size:11.5px}
+.qcheck .reveal-btn{background:var(--bdim);color:var(--blue);border:1px solid rgba(59,130,246,.3);
+                    padding:7px 14px;border-radius:6px;cursor:pointer;font-family:inherit;
+                    font-size:12px;font-weight:600;transition:.15s}
+.qcheck .reveal-btn:hover{background:rgba(59,130,246,.18)}
+.qcheck .listen{display:none;margin-top:14px;padding:14px 16px;background:#eef2f4;border-left:3px solid var(--accent);border-radius:0 6px 6px 0;font-size:12px;color:var(--muted);line-height:1.6;font-style:italic}
+.qcheck .listen.on{display:block}
+.qcheck .listen b{color:#1A4767;font-style:normal}
+.qcheck .listen-label{font-size:10px;font-weight:700;color:var(--accent);text-transform:uppercase;letter-spacing:1px;margin-bottom:6px;font-style:normal}
 
 /* ── footer ── */
 .ft{margin-top:32px;padding:14px 0;border-top:1px solid var(--border);
@@ -649,14 +475,23 @@ tr:last-child td{border-bottom:none}
 <div class="tabs" id="tabs">
   <button class="tab on" onclick="switchTab(0)">Network Traffic</button>
   <button class="tab"    onclick="switchTab(1)">Log Analytics</button>
-  <button class="tab"    onclick="switchTab(2)">IPAM &amp; SLA</button>
-  <button class="tab"    onclick="switchTab(3)">Security</button>
+  <button class="tab"    onclick="switchTab(2)">IPAM/SLA + Bonus</button>
+  <button class="tab check-tab" onclick="switchTab(3)">✓ Check Understanding</button>
   <button class="tab"    onclick="switchTab(4)" style="margin-left:4px;border-color:rgba(167,139,250,.3);color:var(--purple)">SQL Editor</button>
 </div>
 
 <div class="main" id="main">
 
-  <!-- Query panels 0-3 injected by JS -->
+  <!-- Query panels 0-2 injected by JS -->
+
+  <!-- Comprehension Check panel -->
+  <div class="pnl" id="pnl-3">
+    <div class="check-intro">
+      <h2>Check your understanding</h2>
+      <p>Two questions to surface what stuck. <strong>Talk to the person next to you</strong> — compare answers, then we'll regroup. Click "Reveal answer" once you've discussed.</p>
+    </div>
+    <div class="check-grid" id="check-grid"></div>
+  </div>
 
   <!-- SQL EDITOR panel -->
   <div class="pnl" id="pnl-4">
@@ -682,13 +517,14 @@ WHERE n.nspname = 'netvista_demo'
 
   <div class="ft">
     <div>EDB WarehousePG — Native network types + MPP parallel engine</div>
-    <div style="font-family:'JetBrains Mono',monospace" id="ftr">50M rows | 7 regions</div>
+    <div style="font-family:'JetBrains Mono',monospace" id="ftr">7 queries · 3 panels</div>
   </div>
 </div><!-- /main -->
 
 <script>
 const PANELS = {{ panels|tojson }};
 const QUERIES = {{ queries|tojson }};
+const CHECK = {{ check|tojson }};
 const results = {};
 let activeTab = 0;
 
@@ -700,7 +536,7 @@ function tickClock(){
 tickClock(); setInterval(tickClock, 1000);
 
 // ── Helpers ────────────────────────────────────────────────────────────────
-function esc(s){ return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+function esc(s){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
 function fmt(n){
   if(n==null) return '—';
   n = Number(n);
@@ -719,11 +555,10 @@ function tbl(rows){
   return h+'</tbody></table>';
 }
 
-// ── Build query panels (0–3) ───────────────────────────────────────────────
+// ── Build query panels (0–2) ───────────────────────────────────────────────
 function buildPanels(){
   const main = document.getElementById('main');
-  // Insert before the SQL editor panel (pnl-4)
-  const anchor = document.getElementById('pnl-4');
+  const anchor = document.getElementById('pnl-3');
 
   PANELS.forEach((p, pi)=>{
     const qs = QUERIES.filter(q=>q.panel===pi);
@@ -733,7 +568,7 @@ function buildPanels(){
       <div class="sstat"><div class="l">Queries</div><div class="v" style="color:var(--accent)">${qs.length}</div></div>
       <div class="sstat"><div class="l">Completed</div><div class="v" style="color:var(--blue)" id="done-${pi}">0</div></div>
       <div class="sstat"><div class="l">Total Time</div><div class="v" style="color:var(--warn)" id="tms-${pi}">—</div></div>
-      <button class="rabtn" id="rabtn-${pi}" onclick="runPanel(${pi})">▶ Run All 3</button>
+      <button class="rabtn" id="rabtn-${pi}" onclick="runPanel(${pi})">▶ Run All ${qs.length}</button>
     </div>`;
     h += `<div class="qgrid">`;
     qs.forEach(q=>{
@@ -760,6 +595,24 @@ function buildPanels(){
     const div = document.createElement('div');
     div.innerHTML = h;
     main.insertBefore(div.firstChild, anchor);
+  });
+}
+
+// ── Build comprehension check ──────────────────────────────────────────────
+function buildCheck(){
+  const grid = document.getElementById('check-grid');
+  CHECK.forEach((q, idx)=>{
+    const div = document.createElement('div');
+    div.className = 'qcheck '+q.kind;
+    div.innerHTML = `
+      <div class="head">Question ${idx+1} — ${q.kind}</div>
+      <div class="body">
+        <div class="ttl">${q.title.replace(/`([^`]+)`/g, '<code>$1</code>')}</div>
+        <div class="ask">${q.ask.replace(/`([^`]+)`/g, '<code>$1</code>')}</div>
+        <button class="reveal-btn" onclick="this.parentElement.querySelector('.listen').classList.toggle('on');this.textContent=this.textContent.includes('Reveal')?'Hide answer':'Reveal answer'">Reveal answer</button>
+        <div class="listen"><div class="listen-label">What we're listening for</div>${esc(q.listen).replace(/Faster:|Slower:/g, m=>'<b>'+m+'</b>')}</div>
+      </div>`;
+    grid.appendChild(div);
   });
 }
 
@@ -795,9 +648,10 @@ async function runQ(id){
 
 async function runPanel(pi){
   const btn = document.getElementById('rabtn-'+pi);
+  const qs = QUERIES.filter(q=>q.panel===pi);
   btn.disabled=true; btn.textContent='Running…';
-  for(const q of QUERIES.filter(q=>q.panel===pi)) await runQ(q.id);
-  btn.disabled=false; btn.textContent='▶ Run All 3';
+  for(const q of qs) await runQ(q.id);
+  btn.disabled=false; btn.textContent='▶ Run All '+qs.length;
 }
 
 function updatePanel(pi){
@@ -833,159 +687,17 @@ async function runSQL(){
   } catch(e){ document.getElementById('sqlr').innerHTML = `<div style="color:var(--danger);padding:16px">${e.message}</div>`; }
 }
 
-// ── DATA RELOAD ────────────────────────────────────────────────────────────
-let reloadPollTimer = null;
-let reloadStartTs   = null;
-let lastLogLen      = 0;
-
-const STEP_KEYWORDS = [
-  '01_schema',
-  '02_seed_reference',
-  '03_load_external',
-  '06_ai_analytics',
-  '07_kmeans_fallback',
-];
-
-function setStepState(idx, state){
-  const card = document.getElementById('step-'+idx);
-  const st   = document.getElementById('step-st-'+idx);
-  if(!card) return;
-  card.className = 'step-card' + (state!=='idle' ? ' '+state : '');
-  st.className   = 'step-status '+state;
-  const labels = {idle:'Waiting', active:'Running…', done:'✓ Done', error:'✗ Error'};
-  st.textContent = labels[state] || state;
-}
-
-function guessActiveStep(logLines){
-  // Walk backwards to find the last "step" entry and map to STEP_KEYWORDS index
-  for(let i = logLines.length-1; i >= 0; i--){
-    const [,, msg] = logLines[i];
-    for(let s=0; s<STEP_KEYWORDS.length; s++){
-      if(msg && msg.includes(STEP_KEYWORDS[s])) return s;
-    }
-  }
-  return -1;
-}
-
-function renderLog(logLines, append=false){
-  const box = document.getElementById('reload-log');
-  if(!append){ box.innerHTML = ''; lastLogLen = 0; }
-  const newLines = logLines.slice(lastLogLen);
-  newLines.forEach(([ts, lvl, msg])=>{
-    const div = document.createElement('div');
-    div.className = 'log-line log-'+lvl;
-    div.innerHTML = `<span class="log-ts">${esc(ts)}</span><span class="log-msg">${esc(msg)}</span>`;
-    box.appendChild(div);
-  });
-  if(newLines.length){ box.scrollTop = box.scrollHeight; }
-  lastLogLen = logLines.length;
-}
-
-async function pollReload(){
-  try{
-    const r = await(await fetch('/api/reload/status')).json();
-    renderLog(r.log, true);
-
-    // Update elapsed
-    if(reloadStartTs){
-      const sec = Math.round((Date.now()-reloadStartTs)/1000);
-      document.getElementById('rstat-elapsed').textContent = sec+'s';
-    }
-
-    // Determine active step from log content
-    const activeStep = guessActiveStep(r.log);
-    for(let i=0; i<STEP_KEYWORDS.length; i++){
-      // Mark done if a later step has started, or if done log line seen
-      const isDone = activeStep > i || (!r.running && r.log.some(([,,m])=>m && m.includes('✓') && m.includes(STEP_KEYWORDS[i])));
-      const isErr  = r.log.some(([,l,])=>l==='error') && activeStep===i && !isDone;
-      const isActive = r.running && activeStep===i;
-      if(isDone)       setStepState(i, 'done');
-      else if(isErr)   setStepState(i, 'error');
-      else if(isActive)setStepState(i, 'active');
-      else             setStepState(i, 'idle');
-    }
-
-    // Update step counter
-    const stepsDone = STEP_KEYWORDS.filter((_,i)=>
-      r.log.some(([,,m])=>m && m.includes('✓') && m.includes(STEP_KEYWORDS[i]))
-    ).length;
-    document.getElementById('rstat-step').textContent = stepsDone+' / '+STEP_KEYWORDS.length;
-
-    if(r.running){
-      document.getElementById('rstat-txt').textContent = 'Running';
-      document.getElementById('reload-spinner').classList.add('active');
-    } else {
-      document.getElementById('reload-spinner').classList.remove('active');
-      clearInterval(reloadPollTimer);
-      reloadPollTimer = null;
-      document.getElementById('btn-reload').disabled = false;
-      document.getElementById('btn-abort').disabled  = true;
-      document.getElementById('rstat-txt').textContent =
-        r.log.some(([,l])=>l==='done') ? '✓ Complete' : 'Idle';
-      document.getElementById('tab-reload').textContent = '✓ Reload Done';
-      setTimeout(()=>{ document.getElementById('tab-reload').textContent = '⟳ Data Reload'; }, 5000);
-    }
-  } catch(e){ console.error('poll error', e); }
-}
-
-async function startReload(){
-  if(!confirm('This will drop and recreate the entire schema (~5–8 min). Proceed?')) return;
-
-  lastLogLen = 0;
-  document.getElementById('reload-log').innerHTML = '';
-  for(let i=0; i<STEP_KEYWORDS.length; i++) setStepState(i,'idle');
-
-  const r = await(await fetch('/api/reload/start',{method:'POST'})).json();
-  if(!r.ok){ alert('Error: '+r.msg); return; }
-
-  reloadStartTs = Date.now();
-  document.getElementById('btn-reload').disabled = true;
-  document.getElementById('btn-abort').disabled  = false;
-  document.getElementById('rstat-txt').textContent = 'Running';
-  document.getElementById('rstat-elapsed').textContent = '0s';
-  document.getElementById('reload-spinner').classList.add('active');
-  document.getElementById('tab-reload').textContent = '↻ Reloading…';
-
-  reloadPollTimer = setInterval(pollReload, 1000);
-}
-
-async function abortReload(){
-  if(!confirm('Abort the reload? The current script may continue running.')) return;
-  await fetch('/api/reload/abort',{method:'POST'});
-  clearInterval(reloadPollTimer);
-  document.getElementById('btn-reload').disabled = false;
-  document.getElementById('btn-abort').disabled  = true;
-  document.getElementById('rstat-txt').textContent = 'Aborted';
-  document.getElementById('reload-spinner').classList.remove('active');
-}
-
-function clearLog(){
-  document.getElementById('reload-log').innerHTML='';
-  lastLogLen = 0;
-}
-
 // ── Row count ──────────────────────────────────────────────────────────────
 fetch('/api/sql',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sql:
   "SELECT SUM(c)::bigint AS total FROM (SELECT COUNT(*) AS c FROM netflow_logs WHERE ts BETWEEN '2026-04-01' AND '2026-04-23 23:59:59' UNION ALL SELECT COUNT(*) FROM dns_logs WHERE ts BETWEEN '2026-04-01' AND '2026-04-23 23:59:59' UNION ALL SELECT COUNT(*) FROM firewall_logs WHERE ts BETWEEN '2026-04-01' AND '2026-04-23 23:59:59' UNION ALL SELECT COUNT(*) FROM syslog_events WHERE ts BETWEEN '2026-04-01' AND '2026-04-23 23:59:59' UNION ALL SELECT COUNT(*) FROM bgp_events WHERE ts BETWEEN '2026-04-01' AND '2026-04-23 23:59:59' UNION ALL SELECT COUNT(*) FROM network_metrics) x"
 })}).then(r=>r.json()).then(d=>{
   const t = d.data?.[0]?.total;
-  if(t){ document.getElementById('ttl').textContent = fmt(t)+' rows'; document.getElementById('ftr').textContent = fmt(t)+' rows | 7 regions'; }
+  if(t){ document.getElementById('ttl').textContent = fmt(t)+' rows'; document.getElementById('ftr').textContent = fmt(t)+' rows · 7 queries'; }
 }).catch(()=>{});
 
 // ── Init ───────────────────────────────────────────────────────────────────
 buildPanels();
-// Check if a reload is already running (e.g. page refresh mid-reload)
-fetch('/api/reload/status').then(r=>r.json()).then(d=>{
-  if(d.running){
-    reloadStartTs = Date.now();
-    document.getElementById('btn-reload').disabled = true;
-    document.getElementById('btn-abort').disabled  = false;
-    document.getElementById('reload-spinner').classList.add('active');
-    reloadPollTimer = setInterval(pollReload, 1000);
-  } else if(d.log && d.log.length){
-    renderLog(d.log, false);
-  }
-});
+buildCheck();
 </script>
 </body></html>"""
 
@@ -993,13 +705,11 @@ fetch('/api/reload/status').then(r=>r.json()).then(d=>{
 if __name__ == "__main__":
     print(f"""
 ╔══════════════════════════════════════════════════════╗
-║  NetVista × WarehousePG — Network Analytics Demo    ║
+║  NetVista × WarehousePG — Workshop Edition          ║
 ║  DB: {DB['host']}:{DB['port']}/{DB['dbname']}
-║  Queries: {len(QUERIES)} across {len(PANELS)} panels
+║  Queries: {len(QUERIES)} across {len(PANELS)} panels (trimmed)
 ║  Data: Jan 1 – Apr 23 2026  (~50M rows)             ║
 ║  http://0.0.0.0:5001                                ║
 ╚══════════════════════════════════════════════════════╝
     """)
     app.run(host="0.0.0.0", port=5001, debug=False)
-
-
