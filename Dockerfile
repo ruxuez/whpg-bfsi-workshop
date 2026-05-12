@@ -67,7 +67,8 @@ RUN dnf -y install \
   warehouse-pg-7 \
   edb-whpg7-pgvector \
   edb-whpg7-pgfs \
-  edb-whpg7-madlib
+  edb-whpg7-madlib \
+  edb-whpg7-pgaa
 
 
 # (EDB repo cleanup happens after PGAA install below — both repo configs removed together)
@@ -154,9 +155,6 @@ WantedBy=multi-user.target\n' > /etc/systemd/system/whpg-start.service && \
     systemctl enable whpg-init.service && \
     systemctl enable whpg-start.service
 
-
-RUN --mount=type=secret,id=repo_token bash -c 'ls /run/secrets && curl -1Lf https://downloads.enterprisedb.com/$(cat /run/secrets/repo_token)/dev/setup.rpm.sh | sudo bash'
-RUN dnf -y install edb-whpg7-pgaa-1.8.0-13-g7d69b163-0.0snapshot24335726074.763.1.7d69b16-1.el8.x86_64
 
 # Remove EDB repo configs so no token or repo URL leaks into image layers
 RUN rm -f /etc/yum.repos.d/enterprisedb-*.repo \
