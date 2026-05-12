@@ -21,13 +21,10 @@ Each query is optimized to trigger the **DirectScan** vectorized path by using e
 
 | ID | Query | Benchmark Description |
 | :--- | :--- | :--- |
-| **count** | Revenue by Category | Joins `products` × `order_items` to calculate total revenue per category. |
-| **status** | Orders by Status | A straightforward aggregate using `SUM` and `COUNT` on the `orders` table. |
 | **top20** | Top 20 Customers | Joins `customers` × `orders` to rank top spenders by total revenue. |
 | **category** | Revenue by Category v2 | Alternative category revenue view focusing on unit volume and revenue. |
 | **funnel** | Conversion Funnel | Calculates rates for `page_view` → `add_to_cart` → `purchase` from the `events` table. |
 | **daily** | Daily Dashboard | A massive **5-table join** across all fact and dimension tables for a 30-day snapshot. |
-| **cat_funnel** | Funnel by Category | Uses Common Table Expressions (CTEs) to build a category-level funnel across 5 tables. |
 | **summary** | Executive Summary | A single-row KPI snapshot providing total counts across the entire schema. |
 
 ---
@@ -298,3 +295,24 @@ ORDER BY ice DESC;
 * **Data Locality:** While Iceberg data is external (MinIO), PGAA uses **Arrow Flight SQL** and vectorized readers to minimize the "external table tax".
 * **AOCO Advantage:** Native tables benefit from tighter integration with the Greenplum resource manager and local disk I/O, providing a baseline for elite performance.
 
+### 5. Check Understanding
+Two questions to surface what stuck. Talk to the person next to you - compare answers, then click "Reveal" to see what we're listening for.
+
+### 6. Challenge: Find the top 5 products by revenue
+
+You're handed this query but the JOIN condition is missing. Fill in the blank to make it run. Hint: products and order_items share one obvious key.
+
+```sql
+-- Top 5 products by revenue
+SELECT p.product_id,
+       p.name        AS product_name,
+       p.category,
+       SUM(oi.quantity)                                    AS units_sold,
+       ROUND(SUM(oi.quantity * oi.unit_price)::numeric, 2) AS revenue
+FROM   products_iceberg    p
+JOIN   order_items_iceberg oi
+       ON   [ FILL IN ]
+GROUP  BY p.product_id, p.name, p.category
+ORDER  BY revenue DESC
+LIMIT  5
+```

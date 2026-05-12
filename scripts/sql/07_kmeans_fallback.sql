@@ -1,30 +1,48 @@
 -- =============================================================================
--- 07_kmeans_fallback.sql
--- Creates netvista_demo.kmeans_assignments used by query B3.
---
--- Strategy:
---   1. If MADlib's kmeanspp function is present  → run real K-Means clustering
---   2. Otherwise                                 → pure-SQL z-score percentile
---                                                  bucketing (5 pseudo-clusters)
---
--- Both paths produce identical schema:
---   kmeans_assignments(src_ip inet, cluster_id int)
---
--- Run after 06_ai_analytics.sql (netflow_features must already exist).
+-- 07_kmeans_fixed.sql
+-- CORRECTED VERSION: Aggregates per src_ip BEFORE normalization
 -- =============================================================================
 
 SET search_path TO netvista_demo, public;
 
--- Drop existing tables so we always get a clean rebuild
+-- Drop existing tables
 DROP TABLE IF EXISTS netvista_demo.kmeans_assignments;
 DROP TABLE IF EXISTS netvista_demo.netflow_features_norm;
+DROP TABLE IF EXISTS netvista_demo.netflow_features_agg;
 
 DO $$
 BEGIN
 
   -- ══════════════════════════════════════════════════════════════════════════
-  -- PATH A: MADlib available → real kmeanspp
+  -- STEP 1: Aggregate ALL hours per src_ip FIRST
+  -- This is critical! We need ONE row per IP with its aggregate behavior
   -- ══════════════════════════════════════════════════════════════════════════
+
+  RAISE NOTICE 'Step 1: Aggregating features per src_ip (all hours combined)...';
+
+  CREATE TABLE netvista_demo.netflow_features_agg AS
+  SELECT
+      src_ip,
+      SUM(flow_count)                          AS total_flows,
+      AVG(unique_dsts)                         AS avg_unique_dsts,
+      AVG(unique_ports)                        AS avg_unique_ports,
+      SUM(total_bytes)                         AS total_bytes,
+      AVG(dst_entropy)                         AS avg_dst_entropy,
+      AVG(port_spread)                         AS avg_port_spread,
+      AVG(byte_cv)                             AS avg_byte_cv,
+      COUNT(*)                                 AS num_hours  -- how many hours this IP was active
+  FROM netvista_demo.netflow_features
+  GROUP BY src_ip
+  DISTRIBUTED BY (src_ip);
+
+  ANALYZE netvista_demo.netflow_features_agg;
+
+  RAISE NOTICE 'Aggregated % unique IPs', (SELECT COUNT(*) FROM netvista_demo.netflow_features_agg);
+
+  -- ══════════════════════════════════════════════════════════════════════════
+  -- STEP 2: Check if MADlib is available
+  -- ══════════════════════════════════════════════════════════════════════════
+
   IF EXISTS (
       SELECT 1
       FROM   pg_proc     p
@@ -33,51 +51,37 @@ BEGIN
       AND    p.proname = 'kmeanspp'
   ) THEN
 
-    RAISE NOTICE 'MADlib detected — building normalised feature table';
+    -- ════════════════════════════════════════════════════════════════════════
+    -- PATH A: MADlib available → real kmeanspp
+    -- ════════════════════════════════════════════════════════════════════════
 
-    -- Normalise the four behavioural features (z-score)
-    -- CREATE TABLE netvista_demo.netflow_features_norm AS
-    -- SELECT
-    --     src_ip,
-    --     ARRAY[
-    --         (flow_count   - (SELECT AVG(flow_count)   FROM netvista_demo.netflow_features)) /
-    --             NULLIF((SELECT STDDEV(flow_count)   FROM netvista_demo.netflow_features), 0),
-    --         (unique_dsts  - (SELECT AVG(unique_dsts)  FROM netvista_demo.netflow_features)) /
-    --             NULLIF((SELECT STDDEV(unique_dsts)  FROM netvista_demo.netflow_features), 0),
-    --         (unique_ports - (SELECT AVG(unique_ports) FROM netvista_demo.netflow_features)) /
-    --             NULLIF((SELECT STDDEV(unique_ports) FROM netvista_demo.netflow_features), 0),
-    --         (total_bytes  - (SELECT AVG(total_bytes)  FROM netvista_demo.netflow_features)) /
-    --             NULLIF((SELECT STDDEV(total_bytes)  FROM netvista_demo.netflow_features), 0)
-    --     ]::double precision[] AS features
-    -- FROM netvista_demo.netflow_features
-    -- DISTRIBUTED BY (src_ip);
-    -- Normalise the SIX behavioural features for better persona separation
+    RAISE NOTICE 'MADlib detected — normalizing aggregated features...';
+
+    -- Normalize the SIX behavioral features using the aggregated data
     CREATE TABLE netvista_demo.netflow_features_norm AS
     SELECT
         src_ip,
         ARRAY[
-            (flow_count   - (SELECT AVG(flow_count)   FROM netvista_demo.netflow_features)) /
-                NULLIF((SELECT STDDEV(flow_count)   FROM netvista_demo.netflow_features), 0),
-            (unique_dsts  - (SELECT AVG(unique_dsts)  FROM netvista_demo.netflow_features)) /
-                NULLIF((SELECT STDDEV(unique_dsts)  FROM netvista_demo.netflow_features), 0),
-            (unique_ports - (SELECT AVG(unique_ports) FROM netvista_demo.netflow_features)) /
-                NULLIF((SELECT STDDEV(unique_ports) FROM netvista_demo.netflow_features), 0),
-            (total_bytes  - (SELECT AVG(total_bytes)  FROM netvista_demo.netflow_features)) /
-                NULLIF((SELECT STDDEV(total_bytes)  FROM netvista_demo.netflow_features), 0),
-            -- Added for Personas
-            (dst_entropy  - (SELECT AVG(dst_entropy)  FROM netvista_demo.netflow_features)) /
-                NULLIF((SELECT STDDEV(dst_entropy)  FROM netvista_demo.netflow_features), 0),
-            (port_spread  - (SELECT AVG(port_spread)  FROM netvista_demo.netflow_features)) /
-                NULLIF((SELECT STDDEV(port_spread)  FROM netvista_demo.netflow_features), 0)
+            (total_flows     - (SELECT AVG(total_flows)     FROM netvista_demo.netflow_features_agg)) /
+                NULLIF((SELECT STDDEV(total_flows)     FROM netvista_demo.netflow_features_agg), 0),
+            (avg_unique_dsts - (SELECT AVG(avg_unique_dsts) FROM netvista_demo.netflow_features_agg)) /
+                NULLIF((SELECT STDDEV(avg_unique_dsts) FROM netvista_demo.netflow_features_agg), 0),
+            (avg_unique_ports- (SELECT AVG(avg_unique_ports)FROM netvista_demo.netflow_features_agg)) /
+                NULLIF((SELECT STDDEV(avg_unique_ports)FROM netvista_demo.netflow_features_agg), 0),
+            (total_bytes     - (SELECT AVG(total_bytes)     FROM netvista_demo.netflow_features_agg)) /
+                NULLIF((SELECT STDDEV(total_bytes)     FROM netvista_demo.netflow_features_agg), 0),
+            (avg_dst_entropy - (SELECT AVG(avg_dst_entropy) FROM netvista_demo.netflow_features_agg)) /
+                NULLIF((SELECT STDDEV(avg_dst_entropy) FROM netvista_demo.netflow_features_agg), 0),
+            (avg_port_spread - (SELECT AVG(avg_port_spread) FROM netvista_demo.netflow_features_agg)) /
+                NULLIF((SELECT STDDEV(avg_port_spread) FROM netvista_demo.netflow_features_agg), 0)
         ]::double precision[] AS features
-    FROM netvista_demo.netflow_features
+    FROM netvista_demo.netflow_features_agg
     DISTRIBUTED BY (src_ip);
 
-    RAISE NOTICE 'Running madlib.kmeanspp (k=5, max_iter=100) …';
+    RAISE NOTICE 'Running madlib.kmeanspp (k=5, max_iter=100) on % rows...',
+        (SELECT COUNT(*) FROM netvista_demo.netflow_features_norm);
 
-    -- Assign each src_ip to the nearest centroid produced by kmeanspp.
-    -- kmeanspp returns centroids only; we compute assignments with a
-    -- cross-join + ROW_NUMBER window function.
+    -- Run K-Means and assign clusters
     CREATE TABLE netvista_demo.kmeans_assignments AS
     WITH model AS (
         SELECT centroids
@@ -100,7 +104,8 @@ BEGIN
                 m.centroids[i][2],
                 m.centroids[i][3],
                 m.centroids[i][4],
-                m.centroids[i][5], m.centroids[i][6] -- UNPACK ALL 6
+                m.centroids[i][5],
+                m.centroids[i][6]
             ]::double precision[] AS centroid
         FROM model m, generate_series(1, 5) AS i
     ),
@@ -124,62 +129,59 @@ BEGIN
     RAISE NOTICE 'MADlib kmeanspp complete — kmeans_assignments populated';
 
   -- ══════════════════════════════════════════════════════════════════════════
-  -- PATH B: MADlib absent → pure-SQL z-score percentile bucketing
-  -- Produces 5 pseudo-clusters (0 = normal … 4 = extreme outlier) that the
-  -- B3 query consumes in exactly the same way as real K-Means output.
+  -- PATH B: MADlib absent → pure-SQL persona detection
   -- ══════════════════════════════════════════════════════════════════════════
   ELSE
 
-    RAISE NOTICE 'MADlib not found — using SQL z-score fallback for kmeans_assignments';
+    RAISE NOTICE 'MADlib not found — using SQL rule-based persona detection';
 
     CREATE TABLE netvista_demo.kmeans_assignments AS
     WITH stats AS (
-        -- Global mean / stddev for each behavioural feature
+        -- Global mean / stddev for each behavioral feature
         SELECT
-            AVG(flow_count)   AS mu_f,  STDDEV_SAMP(flow_count)   AS sd_f,
-            AVG(total_bytes)  AS mu_b,  STDDEV_SAMP(total_bytes)  AS sd_b,
-            AVG(unique_dsts)  AS mu_d,  STDDEV_SAMP(unique_dsts)  AS sd_d,
-            AVG(unique_ports) AS mu_p,  STDDEV_SAMP(unique_ports) AS sd_p,
-            AVG(dst_entropy)  AS mu_e,  STDDEV_SAMP(dst_entropy)  AS sd_e,
-            AVG(port_spread)  AS mu_s,  STDDEV_SAMP(port_spread)  AS sd_s,
-            AVG(byte_cv)      AS mu_cv, STDDEV_SAMP(byte_cv)      AS sd_cv
-        FROM netvista_demo.netflow_features
+            AVG(total_flows)      AS mu_f,  STDDEV_SAMP(total_flows)      AS sd_f,
+            AVG(total_bytes)      AS mu_b,  STDDEV_SAMP(total_bytes)      AS sd_b,
+            AVG(avg_unique_dsts)  AS mu_d,  STDDEV_SAMP(avg_unique_dsts)  AS sd_d,
+            AVG(avg_unique_ports) AS mu_p,  STDDEV_SAMP(avg_unique_ports) AS sd_p,
+            AVG(avg_dst_entropy)  AS mu_e,  STDDEV_SAMP(avg_dst_entropy)  AS sd_e,
+            AVG(avg_port_spread)  AS mu_s,  STDDEV_SAMP(avg_port_spread)  AS sd_s,
+            AVG(avg_byte_cv)      AS mu_cv, STDDEV_SAMP(avg_byte_cv)      AS sd_cv
+        FROM netvista_demo.netflow_features_agg
     ),
     scored AS (
-        -- Persona-aware scoring: weight the features that distinguish personas
+        -- Persona-aware scoring
         SELECT
             f.src_ip,
             -- Z-scores for each feature
-            ABS(f.flow_count   - s.mu_f)  / NULLIF(s.sd_f, 0)  AS z_flow,
-            ABS(f.total_bytes  - s.mu_b)  / NULLIF(s.sd_b, 0)  AS z_bytes,
-            ABS(f.unique_ports - s.mu_p)  / NULLIF(s.sd_p, 0)  AS z_ports,
-            ABS(f.dst_entropy  - s.mu_e)  / NULLIF(s.sd_e, 0)  AS z_entropy,
-            ABS(f.port_spread  - s.mu_s)  / NULLIF(s.sd_s, 0)  AS z_spread,
-            ABS(f.byte_cv      - s.mu_cv) / NULLIF(s.sd_cv, 0) AS z_cv,
-            -- Composite anomaly score
-            (   ABS(f.flow_count   - s.mu_f)  / NULLIF(s.sd_f, 0)
-            + ABS(f.total_bytes  - s.mu_b)  / NULLIF(s.sd_b, 0) * 2.0  -- weight bytes higher
-            + ABS(f.unique_ports - s.mu_p)  / NULLIF(s.sd_p, 0) * 2.0  -- weight ports higher
-            + ABS(f.dst_entropy  - s.mu_e)  / NULLIF(s.sd_e, 0)
-            + ABS(f.port_spread  - s.mu_s)  / NULLIF(s.sd_s, 0)
-            + ABS(f.byte_cv      - s.mu_cv) / NULLIF(s.sd_cv, 0)
+            ABS(f.total_flows      - s.mu_f)  / NULLIF(s.sd_f, 0)  AS z_flow,
+            ABS(f.total_bytes      - s.mu_b)  / NULLIF(s.sd_b, 0)  AS z_bytes,
+            ABS(f.avg_unique_ports - s.mu_p)  / NULLIF(s.sd_p, 0)  AS z_ports,
+            ABS(f.avg_dst_entropy  - s.mu_e)  / NULLIF(s.sd_e, 0)  AS z_entropy,
+            ABS(f.avg_port_spread  - s.mu_s)  / NULLIF(s.sd_s, 0)  AS z_spread,
+            ABS(f.avg_byte_cv      - s.mu_cv) / NULLIF(s.sd_cv, 0) AS z_cv,
+            -- Composite anomaly score (weighted)
+            (   ABS(f.total_flows      - s.mu_f)  / NULLIF(s.sd_f, 0)
+            + ABS(f.total_bytes      - s.mu_b)  / NULLIF(s.sd_b, 0) * 2.0
+            + ABS(f.avg_unique_ports - s.mu_p)  / NULLIF(s.sd_p, 0) * 2.0
+            + ABS(f.avg_dst_entropy  - s.mu_e)  / NULLIF(s.sd_e, 0)
+            + ABS(f.avg_port_spread  - s.mu_s)  / NULLIF(s.sd_s, 0)
+            + ABS(f.avg_byte_cv      - s.mu_cv) / NULLIF(s.sd_cv, 0)
             ) AS anomaly_score,
             -- Raw features for persona detection
-            f.unique_ports, f.total_bytes, f.dst_entropy, f.byte_cv
-        FROM netvista_demo.netflow_features f, stats s
-    ),
-    -- Persona-based clustering (rule-based for SQL fallback)
-    -- This mirrors the expected K-Means output with clear persona boundaries
+            f.avg_unique_ports, f.total_bytes, f.avg_dst_entropy, f.avg_byte_cv
+        FROM netvista_demo.netflow_features_agg f, stats s
+    )
+    -- Persona-based clustering
     SELECT
         src_ip,
         CASE
             -- RECON: high ports (z > 4) + low bytes
-            WHEN z_ports > 4 AND z_bytes < 2 AND unique_ports > 50 THEN 1
+            WHEN z_ports > 4 AND z_bytes < 2 AND avg_unique_ports > 50 THEN 1
             -- EXFIL: extreme bytes (z > 5) + low entropy
-            WHEN z_bytes > 5 AND dst_entropy < 0.2 AND total_bytes > 50000000 THEN 2
-            -- C2: low byte_cv (constant payload) + moderate flow + low entropy
-            WHEN byte_cv < 0.4 AND dst_entropy < 0.3 AND z_flow BETWEEN 0.5 AND 3 THEN 3
-            -- High anomaly but doesn't fit clear patterns
+            WHEN z_bytes > 5 AND avg_dst_entropy < 0.2 AND total_bytes > 50000000 THEN 2
+            -- C2: low byte_cv (constant payload) + low entropy
+            WHEN avg_byte_cv < 0.4 AND avg_dst_entropy < 0.3 AND z_flow BETWEEN 0.5 AND 3 THEN 3
+            -- High anomaly but doesn't fit patterns
             WHEN anomaly_score > 8 THEN 4
             -- NORMAL: everything else
             ELSE 0
@@ -193,10 +195,11 @@ BEGIN
 
 END$$;
 
--- Refresh planner stats so the JOIN in B3 gets good estimates
+-- Refresh planner stats
 ANALYZE netvista_demo.kmeans_assignments;
 
--- Quick sanity check — printed to psql output / reload log
+-- Show cluster distribution
+RAISE NOTICE 'Cluster distribution:';
 SELECT
     cluster_id,
     COUNT(*)                          AS member_count,
@@ -206,4 +209,29 @@ FROM netvista_demo.kmeans_assignments
 GROUP BY 1
 ORDER BY 1;
 
-
+-- Show cluster characteristics
+SELECT
+    a.cluster_id,
+    COUNT(*) AS member_count,
+    ROUND(AVG(f.total_flows), 1) AS avg_total_flows,
+    ROUND(AVG(f.total_bytes)::numeric / 1e6, 2) AS avg_total_bytes_mb,
+    ROUND(AVG(f.avg_unique_ports), 1) AS avg_ports,
+    ROUND(AVG(f.avg_dst_entropy)::numeric, 4) AS avg_entropy,
+    ROUND(AVG(f.avg_byte_cv)::numeric, 4) AS avg_byte_cv,
+    CASE
+    -- RECON: extreme ports (not just > 100, but > 1000)
+    WHEN AVG(f.avg_unique_ports) > 1000 THEN 'RECON (High Ports)'
+    
+    -- EXFIL: MASSIVE bytes (not 100 MB, but > 10 GB = 10,000 MB)
+    WHEN AVG(f.total_bytes) > 10000000000 THEN 'EXFIL (High Bytes)'  -- 10 GB threshold
+    
+    -- C2: low variance + low entropy (more specific)
+    WHEN AVG(f.avg_byte_cv) < 0.4 AND AVG(f.avg_dst_entropy) < 0.5 THEN 'C2 (Beaconing)'
+    
+    -- NORMAL: everything else
+    ELSE 'NORMAL (Baseline)'
+END AS inferred_persona
+FROM netvista_demo.kmeans_assignments a
+JOIN netvista_demo.netflow_features_agg f ON a.src_ip = f.src_ip
+GROUP BY 1
+ORDER BY member_count DESC;

@@ -1,1 +1,5 @@
-./csv_data/*
+csv_data/
+.DS_Store
+**/.DS_Store
+.env
+entrypoint.sh

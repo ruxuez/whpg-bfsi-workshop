@@ -9,14 +9,14 @@ In this lab, you will explore the power of native **inet** and **cidr** operator
 * **Access Port:** `5001`
 * **Database:** `demo`
 
-### Dashboard Content: 12 Queries Across 4 Panels
+### Dashboard Content: 6 Queries Across 3 Panels
 | ID | Query | Key Demonstration |
 | :--- | :--- | :--- |
 | **1A** | **Threat Intel Match** | `inet <<=` join — 6 LOC vs 52 on Snowflake |
-| **1B** | **Anomaly Detection** | Traffic spikes > $3\sigma$ in last 24h |
 | **1C** | **Top Talkers** | Dynamic `/24` grouping with `set_masklen()` |
-| **2B** | **Suspicious DNS** | Hosts querying bad domains AND being blocked |
+| **2A** | **Cross-Source Correlation** | Catches correlated incidents no single tool sees |
 | **2C** | **Log Volume** | $2M+ potential Splunk savings via log offloading |
+| **3C** | **QoE Scorecard** | Aggregates 151K live metrics |
 | **4B** | **Forensic IP Trace** | Trace a single IP across ALL log sources instantly |
 
 ### Tabs preparation
@@ -116,14 +116,7 @@ analyzedb -d demo -s netvista_demo -a
 ```
 
 > [!NOTE]
-> If you want to recreate Data, first drop extension `pgaa` in `demo` database
-> ```bash
->psql demo
->```
-> ```sql
->DROP EXTENSION pgaa CASCADE
->```
->Then rerun from ***Step 1: Load Schema***
+> If you want to recreate Data, rerun from ***Step 1: Load Schema***
 
 ---
 
@@ -218,4 +211,10 @@ WHERE n.nspname = 'netvista_demo'
   AND c.relkind IN ('r', 'p')
   AND c.relispartition = false;
 ```
-5. Explore the 4 panels and wait for **data Loading Finished** to execute the pre-defined queries to see WarehousePG in action.
+5. Explore the 3 panels and execute the pre-defined queries to see WarehousePG in action.
+
+## 7. Check Understanding (Networks Analytics App)
+
+Go to **Check Understanding Sub Tab** of the application.
+
+Two questions to surface what stuck. Talk to the person next to you - compare answers, then click "Reveal" to see what we're listening for.
