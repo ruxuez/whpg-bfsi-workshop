@@ -4,10 +4,11 @@
 Lab 2: Iceberg Data Generator for WHPG/PGAA Workshop
 ═══════════════════════════════════════════════════════════════════════════════
 
-Generates a BFSI analytics dataset (customers, card_products, txn_archive,
-txn_lines, digital_events) and writes Apache Iceberg tables on a local MinIO
-instance. Mirrors the schema in 05_pgaa_tables.sql so PGAA can read it in place
-and the native AOCO copies (schema bfsi_analytics) give the MPP speed comparison.
+Generates an e-commerce dataset (customers, products, orders, order_items,
+events) and writes to Apache Iceberg tables on a local MinIO instance.
+
+This data is used alongside the native WHPG network analytics tables
+to demonstrate federated queries across both storage tiers.
 
 Prerequisites:
     pip install "pyiceberg[s3fs]" pyarrow --break-system-packages
@@ -91,15 +92,19 @@ CITIES = {
     "India": ["Mumbai", "Delhi", "Bangalore", "Chennai", "Kolkata"],
     "Israel": ["Tel Aviv", "Jerusalem", "Haifa", "Beer Sheva", "Eilat"],
 }
-CARD_CATEGORIES = {
-    "credit":     ["classic", "gold", "platinum", "world"],
-    "debit":      ["classic", "gold", "platinum"],
-    "prepaid":    ["classic", "gold"],
-    "commercial": ["gold", "platinum", "world"],
+CATEGORIES = {
+    "Electronics": ["Smartphones", "Laptops", "Tablets", "Accessories", "Audio"],
+    "Clothing": ["Men's", "Women's", "Kids", "Shoes", "Accessories"],
+    "Home": ["Furniture", "Kitchen", "Bedding", "Decor", "Garden"],
+    "Sports": ["Fitness", "Outdoor", "Team Sports", "Water Sports", "Winter Sports"],
+    "Books": ["Fiction", "Non-Fiction", "Technical", "Children", "Comics"],
 }
-TXN_STATUSES = ["settled", "settled", "settled", "settled", "reversed", "disputed", "refunded"]
-EVENT_TYPES  = ["login", "login", "view_statement", "transfer", "payee_add", "card_freeze"]
-DEVICE_TYPES = ["web", "ios", "android"]
+ORDER_STATUSES = ["pending", "processing", "shipped", "delivered", "cancelled", "returned"]
+EVENT_TYPES = [
+    "page_view", "product_view", "add_to_cart", "remove_from_cart",
+    "checkout_start", "purchase", "search", "login", "logout", "signup",
+]
+DEVICE_TYPES = ["desktop", "mobile", "tablet"]
 
 # ═════════════════════════════════════════════════════════════════════════════
 # ICEBERG SCHEMAS
@@ -117,37 +122,37 @@ SCHEMAS = {
         NestedField(8, "is_active", BooleanType(), required=False),
         NestedField(9, "lifetime_value", DecimalType(38, 2), required=False),
     ),
-    "card_products": Schema(
+    "products": Schema(
         NestedField(1, "product_id", LongType(), required=False),
-        NestedField(2, "product_code", StringType(), required=False),
+        NestedField(2, "sku", StringType(), required=False),
         NestedField(3, "name", StringType(), required=False),
         NestedField(4, "category", StringType(), required=False),
-        NestedField(5, "tier", StringType(), required=False),
-        NestedField(6, "annual_fee", DecimalType(38, 2), required=False),
-        NestedField(7, "issuance_cost", DecimalType(38, 2), required=False),
-        NestedField(8, "active_cards", LongType(), required=False),
+        NestedField(5, "subcategory", StringType(), required=False),
+        NestedField(6, "price", DecimalType(38, 2), required=False),
+        NestedField(7, "cost", DecimalType(38, 2), required=False),
+        NestedField(8, "stock_quantity", LongType(), required=False),
         NestedField(9, "is_available", BooleanType(), required=False),
     ),
-    "txn_archive": Schema(
-        NestedField(1, "archive_id", LongType(), required=False),
+    "orders": Schema(
+        NestedField(1, "order_id", LongType(), required=False),
         NestedField(2, "customer_id", LongType(), required=False),
-        NestedField(3, "post_date", DateType(), required=False),
-        NestedField(4, "txn_timestamp", TimestampType(), required=False),
+        NestedField(3, "order_date", DateType(), required=False),
+        NestedField(4, "order_timestamp", TimestampType(), required=False),
         NestedField(5, "status", StringType(), required=False),
-        NestedField(6, "txn_country", StringType(), required=False),
-        NestedField(7, "txn_city", StringType(), required=False),
+        NestedField(6, "shipping_country", StringType(), required=False),
+        NestedField(7, "shipping_city", StringType(), required=False),
         NestedField(8, "total_amount", DecimalType(38, 2), required=False),
-        NestedField(9, "fee_amount", DecimalType(38, 2), required=False),
+        NestedField(9, "discount_amount", DecimalType(38, 2), required=False),
     ),
-    "txn_lines": Schema(
-        NestedField(1, "line_id", LongType(), required=False),
-        NestedField(2, "archive_id", LongType(), required=False),
+    "order_items": Schema(
+        NestedField(1, "item_id", LongType(), required=False),
+        NestedField(2, "order_id", LongType(), required=False),
         NestedField(3, "product_id", LongType(), required=False),
         NestedField(4, "quantity", LongType(), required=False),
         NestedField(5, "unit_price", DecimalType(38, 2), required=False),
         NestedField(6, "line_total", DecimalType(38, 2), required=False),
     ),
-    "digital_events": Schema(
+    "events": Schema(
         NestedField(1, "event_id", LongType(), required=False),
         NestedField(2, "event_timestamp", TimestampType(), required=False),
         NestedField(3, "event_date", DateType(), required=False),
@@ -162,10 +167,10 @@ SCHEMAS = {
 }
 
 PARTITION_SPECS = {
-    "txn_archive": PartitionSpec(
-        PartitionField(source_id=3, field_id=1000, transform=DayTransform(), name="post_date_day")
+    "orders": PartitionSpec(
+        PartitionField(source_id=3, field_id=1000, transform=DayTransform(), name="order_date_day")
     ),
-    "digital_events": PartitionSpec(
+    "events": PartitionSpec(
         PartitionField(source_id=3, field_id=1000, transform=DayTransform(), name="event_date_day")
     ),
 }
@@ -224,14 +229,14 @@ def generate_customers(n):
         first, last = random.choice(FIRST_NAMES), random.choice(LAST_NAMES)
         country = random.choice(COUNTRIES)
         records["customer_id"].append(i)
-        records["email"].append(f"{first.lower()}.{last.lower()}{i}@meridianbank.example")
+        records["email"].append(f"{first.lower()}.{last.lower()}{i}@example.com")
         records["first_name"].append(first)
         records["last_name"].append(last)
         records["country"].append(country)
         records["city"].append(random.choice(CITIES[country]))
-        records["signup_date"].append(_rand_date(2018, 2024))
-        records["is_active"].append(random.random() > 0.12)
-        records["lifetime_value"].append(Decimal(str(round(random.uniform(0, 250000), 2))))
+        records["signup_date"].append(_rand_date(2020, 2024))
+        records["is_active"].append(random.random() > 0.15)
+        records["lifetime_value"].append(Decimal(str(round(random.uniform(0, 10000), 2))))
 
     return pa.table(records, schema=pa.schema([
         ("customer_id", pa.int64()), ("email", pa.string()),
@@ -242,95 +247,96 @@ def generate_customers(n):
     ]))
 
 
-def generate_card_products(n):
-    names = ["Everyday", "Rewards", "Travel", "Cashback", "Business", "Student",
-             "Signature", "Infinite", "Secured", "Premier"]
-    records = {k: [] for k in ["product_id", "product_code", "name", "category",
-                                "tier", "annual_fee", "issuance_cost", "active_cards", "is_available"]}
+def generate_products(n):
+    adj = ["Premium", "Basic", "Pro", "Ultra", "Lite", "Max", "Mini", "Plus"]
+    nouns = ["Widget", "Gadget", "Device", "Tool", "Item", "Product", "Unit", "System"]
+    records = {k: [] for k in ["product_id", "sku", "name", "category",
+                                "subcategory", "price", "cost", "stock_quantity", "is_available"]}
     for i in range(1, n + 1):
-        cat = random.choice(list(CARD_CATEGORIES.keys()))
-        tier = random.choice(CARD_CATEGORIES[cat])
-        fee = {"classic": 0, "gold": 95, "platinum": 250, "world": 550}[tier]
+        cat = random.choice(list(CATEGORIES.keys()))
+        sub = random.choice(CATEGORIES[cat])
+        price = round(random.uniform(9.99, 999.99), 2)
         records["product_id"].append(i)
-        records["product_code"].append(f"{cat[:3].upper()}-{tier[:1].upper()}-{i:05d}")
-        records["name"].append(f"Meridian {random.choice(names)} {tier.title()}")
+        records["sku"].append(f"SKU-{cat[:3].upper()}-{i:05d}")
+        records["name"].append(f"{random.choice(adj)} {random.choice(nouns)} {sub}")
         records["category"].append(cat)
-        records["tier"].append(tier)
-        records["annual_fee"].append(Decimal(str(round(fee * random.uniform(0.8, 1.2), 2))))
-        records["issuance_cost"].append(Decimal(str(round(random.uniform(2.5, 18.0), 2))))
-        records["active_cards"].append(random.randint(0, 500000))
+        records["subcategory"].append(sub)
+        records["price"].append(Decimal(str(price)))
+        records["cost"].append(Decimal(str(round(price * random.uniform(0.3, 0.7), 2))))
+        records["stock_quantity"].append(random.randint(0, 1000))
         records["is_available"].append(random.random() > 0.1)
 
     return pa.table(records, schema=pa.schema([
-        ("product_id", pa.int64()), ("product_code", pa.string()), ("name", pa.string()),
-        ("category", pa.string()), ("tier", pa.string()),
-        ("annual_fee", pa.decimal128(38, 2)), ("issuance_cost", pa.decimal128(38, 2)),
-        ("active_cards", pa.int64()), ("is_available", pa.bool_()),
+        ("product_id", pa.int64()), ("sku", pa.string()), ("name", pa.string()),
+        ("category", pa.string()), ("subcategory", pa.string()),
+        ("price", pa.decimal128(38, 2)), ("cost", pa.decimal128(38, 2)),
+        ("stock_quantity", pa.int64()), ("is_available", pa.bool_()),
     ]))
 
 
-def generate_txn_archive(n, num_customers):
-    records = {k: [] for k in ["archive_id", "customer_id", "post_date", "txn_timestamp",
-                                "status", "txn_country", "txn_city", "total_amount", "fee_amount"]}
+def generate_orders(n, num_customers):
+    records = {k: [] for k in ["order_id", "customer_id", "order_date", "order_timestamp",
+                                "status", "shipping_country", "shipping_city",
+                                "total_amount", "discount_amount"]}
     for i in range(1, n + 1):
         od = _rand_date(2023, 2024)
         country = random.choice(COUNTRIES)
-        total = round(random.uniform(5, 5000), 2)
-        records["archive_id"].append(i)
+        total = round(random.uniform(25, 2500), 2)
+        records["order_id"].append(i)
         records["customer_id"].append(random.randint(1, num_customers))
-        records["post_date"].append(od)
-        records["txn_timestamp"].append(_rand_ts(od))
-        records["status"].append(random.choice(TXN_STATUSES))
-        records["txn_country"].append(country)
-        records["txn_city"].append(random.choice(CITIES[country]))
+        records["order_date"].append(od)
+        records["order_timestamp"].append(_rand_ts(od))
+        records["status"].append(random.choice(ORDER_STATUSES))
+        records["shipping_country"].append(country)
+        records["shipping_city"].append(random.choice(CITIES[country]))
         records["total_amount"].append(Decimal(str(total)))
-        records["fee_amount"].append(Decimal(str(round(total * random.uniform(0, 0.03), 2))))
+        records["discount_amount"].append(Decimal(str(round(total * random.uniform(0, 0.2), 2))))
 
     return pa.table(records, schema=pa.schema([
-        ("archive_id", pa.int64()), ("customer_id", pa.int64()),
-        ("post_date", pa.date32()), ("txn_timestamp", pa.timestamp("us")),
-        ("status", pa.string()), ("txn_country", pa.string()),
-        ("txn_city", pa.string()), ("total_amount", pa.decimal128(38, 2)),
-        ("fee_amount", pa.decimal128(38, 2)),
+        ("order_id", pa.int64()), ("customer_id", pa.int64()),
+        ("order_date", pa.date32()), ("order_timestamp", pa.timestamp("us")),
+        ("status", pa.string()), ("shipping_country", pa.string()),
+        ("shipping_city", pa.string()), ("total_amount", pa.decimal128(38, 2)),
+        ("discount_amount", pa.decimal128(38, 2)),
     ]))
 
 
-def generate_txn_lines(n, num_archive, num_products):
-    records = {k: [] for k in ["line_id", "archive_id", "product_id",
+def generate_order_items(n, num_orders, num_products):
+    records = {k: [] for k in ["item_id", "order_id", "product_id",
                                 "quantity", "unit_price", "line_total"]}
     for i in range(1, n + 1):
-        qty = random.randint(1, 6)
-        price = round(random.uniform(1.99, 899.99), 2)
-        records["line_id"].append(i)
-        records["archive_id"].append(random.randint(1, num_archive))
+        qty = random.randint(1, 10)
+        price = round(random.uniform(9.99, 499.99), 2)
+        records["item_id"].append(i)
+        records["order_id"].append(random.randint(1, num_orders))
         records["product_id"].append(random.randint(1, num_products))
         records["quantity"].append(qty)
         records["unit_price"].append(Decimal(str(price)))
         records["line_total"].append(Decimal(str(round(qty * price, 2))))
 
     return pa.table(records, schema=pa.schema([
-        ("line_id", pa.int64()), ("archive_id", pa.int64()), ("product_id", pa.int64()),
+        ("item_id", pa.int64()), ("order_id", pa.int64()), ("product_id", pa.int64()),
         ("quantity", pa.int64()), ("unit_price", pa.decimal128(38, 2)),
         ("line_total", pa.decimal128(38, 2)),
     ]))
 
 
-def generate_digital_events(n, num_customers, num_products):
-    pages = ["/", "/accounts", "/statements", "/transfer", "/payees", "/cards", "/settings", "/support"]
+def generate_events(n, num_customers, num_products):
+    pages = ["/", "/products", "/category", "/cart", "/checkout", "/account", "/search", "/about"]
     records = {k: [] for k in ["event_id", "event_timestamp", "event_date", "customer_id",
                                 "event_type", "page_url", "product_id", "session_id",
                                 "device_type", "country"]}
     for i in range(1, n + 1):
         ed = _rand_date(2024, 2024)
         et = random.choice(EVENT_TYPES)
-        cid = random.randint(1, num_customers) if random.random() > 0.2 else None
-        pid = random.randint(1, num_products) if et in ("transfer", "card_freeze") else None
+        cid = random.randint(1, num_customers) if random.random() > 0.3 else None
+        pid = random.randint(1, num_products) if et in ("product_view", "add_to_cart", "purchase") else None
         records["event_id"].append(i)
         records["event_timestamp"].append(_rand_ts(ed))
         records["event_date"].append(ed)
         records["customer_id"].append(cid)
         records["event_type"].append(et)
-        records["page_url"].append(f"https://app.meridianbank.example{random.choice(pages)}")
+        records["page_url"].append(f"https://shop.example.com{random.choice(pages)}")
         records["product_id"].append(pid)
         records["session_id"].append(f"sess_{random.randint(100000, 999999)}")
         records["device_type"].append(random.choice(DEVICE_TYPES))
@@ -344,7 +350,8 @@ def generate_digital_events(n, num_customers, num_products):
         ("device_type", pa.string()), ("country", pa.string()),
     ]))
 
-
+# ═════════════════════════════════════════════════════════════════════════════
+# PGAA SQL GENERATOR
 # ═════════════════════════════════════════════════════════════════════════════
 
 def generate_pgaa_sql(table_locations):
@@ -386,55 +393,55 @@ CREATE FOREIGN TABLE customers_iceberg (
     lifetime_value NUMERIC(38,2)
 ) SERVER iceberg_minio OPTIONS (table_location '{table_locations["customers"]}');
 
-DROP FOREIGN TABLE IF EXISTS card_products_iceberg;
-CREATE FOREIGN TABLE card_products_iceberg (
-    product_id BIGINT, product_code TEXT, name TEXT, category TEXT, tier TEXT,
-    annual_fee NUMERIC(38,2), issuance_cost NUMERIC(38,2), active_cards BIGINT, is_available BOOLEAN
-) SERVER iceberg_minio OPTIONS (table_location '{table_locations["card_products"]}');
+DROP FOREIGN TABLE IF EXISTS products_iceberg;
+CREATE FOREIGN TABLE products_iceberg (
+    product_id BIGINT, sku TEXT, name TEXT, category TEXT, subcategory TEXT,
+    price NUMERIC(38,2), cost NUMERIC(38,2), stock_quantity BIGINT, is_available BOOLEAN
+) SERVER iceberg_minio OPTIONS (table_location '{table_locations["products"]}');
 
-DROP FOREIGN TABLE IF EXISTS txn_archive_iceberg;
-CREATE FOREIGN TABLE txn_archive_iceberg (
-    archive_id BIGINT, customer_id BIGINT, post_date DATE,
-    txn_timestamp TIMESTAMP, status TEXT, txn_country TEXT,
-    txn_city TEXT, total_amount NUMERIC(38,2), fee_amount NUMERIC(38,2)
-) SERVER iceberg_minio OPTIONS (table_location '{table_locations["txn_archive"]}');
+DROP FOREIGN TABLE IF EXISTS orders_iceberg;
+CREATE FOREIGN TABLE orders_iceberg (
+    order_id BIGINT, customer_id BIGINT, order_date DATE,
+    order_timestamp TIMESTAMP, status TEXT, shipping_country TEXT,
+    shipping_city TEXT, total_amount NUMERIC(38,2), discount_amount NUMERIC(38,2)
+) SERVER iceberg_minio OPTIONS (table_location '{table_locations["orders"]}');
 
-DROP FOREIGN TABLE IF EXISTS txn_lines_iceberg;
-CREATE FOREIGN TABLE txn_lines_iceberg (
-    line_id BIGINT, archive_id BIGINT, product_id BIGINT,
+DROP FOREIGN TABLE IF EXISTS order_items_iceberg;
+CREATE FOREIGN TABLE order_items_iceberg (
+    item_id BIGINT, order_id BIGINT, product_id BIGINT,
     quantity BIGINT, unit_price NUMERIC(38,2), line_total NUMERIC(38,2)
-) SERVER iceberg_minio OPTIONS (table_location '{table_locations["txn_lines"]}');
+) SERVER iceberg_minio OPTIONS (table_location '{table_locations["order_items"]}');
 
-DROP FOREIGN TABLE IF EXISTS digital_events_iceberg;
-CREATE FOREIGN TABLE digital_events_iceberg (
+DROP FOREIGN TABLE IF EXISTS events_iceberg;
+CREATE FOREIGN TABLE events_iceberg (
     event_id BIGINT, event_timestamp TIMESTAMP, event_date DATE,
     customer_id BIGINT, event_type TEXT, page_url TEXT,
     product_id BIGINT, session_id TEXT, device_type TEXT, country TEXT
-) SERVER iceberg_minio OPTIONS (table_location '{table_locations["digital_events"]}');
+) SERVER iceberg_minio OPTIONS (table_location '{table_locations["events"]}');
 
 -- ═══════════════════════════════════════════════════════════════════════════════
 -- Also create native copies for performance comparison (Lab 2 demo)
 -- ═══════════════════════════════════════════════════════════════════════════════
 
-CREATE SCHEMA IF NOT EXISTS bfsi_analytics;
+CREATE SCHEMA IF NOT EXISTS demo;
 
-DROP TABLE IF EXISTS bfsi_analytics.customers CASCADE;
-CREATE TABLE bfsi_analytics.customers AS SELECT * FROM customers_iceberg DISTRIBUTED BY (customer_id);
+DROP TABLE IF EXISTS demo.customers CASCADE;
+CREATE TABLE demo.customers AS SELECT * FROM customers_iceberg DISTRIBUTED BY (customer_id);
 
-DROP TABLE IF EXISTS bfsi_analytics.card_products CASCADE;
-CREATE TABLE bfsi_analytics.card_products AS SELECT * FROM card_products_iceberg DISTRIBUTED BY (product_id);
+DROP TABLE IF EXISTS demo.products CASCADE;
+CREATE TABLE demo.products AS SELECT * FROM products_iceberg DISTRIBUTED BY (product_id);
 
-DROP TABLE IF EXISTS bfsi_analytics.txn_archive CASCADE;
-CREATE TABLE bfsi_analytics.txn_archive AS SELECT * FROM txn_archive_iceberg DISTRIBUTED BY (archive_id);
+DROP TABLE IF EXISTS demo.orders CASCADE;
+CREATE TABLE demo.orders AS SELECT * FROM orders_iceberg DISTRIBUTED BY (order_id);
 
-DROP TABLE IF EXISTS bfsi_analytics.txn_lines CASCADE;
-CREATE TABLE bfsi_analytics.txn_lines AS SELECT * FROM txn_lines_iceberg DISTRIBUTED BY (line_id);
+DROP TABLE IF EXISTS demo.order_items CASCADE;
+CREATE TABLE demo.order_items AS SELECT * FROM order_items_iceberg DISTRIBUTED BY (item_id);
 
-DROP TABLE IF EXISTS bfsi_analytics.digital_events CASCADE;
-CREATE TABLE bfsi_analytics.digital_events AS SELECT * FROM digital_events_iceberg DISTRIBUTED BY (event_id);
+DROP TABLE IF EXISTS demo.events CASCADE;
+CREATE TABLE demo.events AS SELECT * FROM events_iceberg DISTRIBUTED BY (event_id);
 
-ANALYZE bfsi_analytics.customers; ANALYZE bfsi_analytics.card_products; ANALYZE bfsi_analytics.txn_archive;
-ANALYZE bfsi_analytics.txn_lines; ANALYZE bfsi_analytics.digital_events;
+ANALYZE demo.customers; ANALYZE demo.products; ANALYZE demo.orders;
+ANALYZE demo.order_items; ANALYZE demo.events;
 
 -- ═══════════════════════════════════════════════════════════════════════════════
 -- Test Queries
@@ -442,10 +449,10 @@ ANALYZE bfsi_analytics.txn_lines; ANALYZE bfsi_analytics.digital_events;
 
 -- Verify row counts
 SELECT 'customers' AS tbl, COUNT(*) FROM customers_iceberg
-UNION ALL SELECT 'card_products', COUNT(*) FROM card_products_iceberg
-UNION ALL SELECT 'txn_archive', COUNT(*) FROM txn_archive_iceberg
-UNION ALL SELECT 'txn_lines', COUNT(*) FROM txn_lines_iceberg
-UNION ALL SELECT 'digital_events', COUNT(*) FROM digital_events_iceberg
+UNION ALL SELECT 'products', COUNT(*) FROM products_iceberg
+UNION ALL SELECT 'orders', COUNT(*) FROM orders_iceberg
+UNION ALL SELECT 'order_items', COUNT(*) FROM order_items_iceberg
+UNION ALL SELECT 'events', COUNT(*) FROM events_iceberg
 ORDER BY 2 DESC;
 """
 
@@ -455,23 +462,23 @@ ORDER BY 2 DESC;
 # ═════════════════════════════════════════════════════════════════════════════
 
 def main():
-    parser = argparse.ArgumentParser(description="Generate Iceberg BFSI lakehouse data on MinIO")
+    parser = argparse.ArgumentParser(description="Generate Iceberg e-commerce data on MinIO")
     parser.add_argument("--scale", type=int, default=300,
                         help="Scale factor (300=default, 10=10x rows)")
     args = parser.parse_args()
 
     s = args.scale
     counts = {
-        "customers":      1_000 * s,
-        "card_products":     50 * s,
-        "txn_archive":    5_000 * s,
-        "txn_lines":     15_000 * s,
-        "digital_events":50_000 * s,
+        "customers":   1_000 * s,
+        "products":      500 * s,
+        "orders":      5_000 * s,
+        "order_items": 15_000 * s,
+        "events":      50_000 * s,
     }
     total = sum(counts.values())
 
     print("=" * 70)
-    print("  Iceberg Data Generator — Meridian Bank BFSI Lakehouse")
+    print("  Iceberg Data Generator — E-Commerce Dataset")
     print("=" * 70)
     print(f"  MinIO:     {MINIO_ENDPOINT}/{MINIO_BUCKET}")
     print(f"  Warehouse: {WAREHOUSE}")
@@ -493,11 +500,11 @@ def main():
     t_start = time.perf_counter()
 
     generators = [
-        ("customers",      generate_customers,      [counts["customers"]]),
-        ("card_products",  generate_card_products,  [counts["card_products"]]),
-        ("txn_archive",    generate_txn_archive,    [counts["txn_archive"], counts["customers"]]),
-        ("txn_lines",      generate_txn_lines,      [counts["txn_lines"], counts["txn_archive"], counts["card_products"]]),
-        ("digital_events", generate_digital_events, [counts["digital_events"], counts["customers"], counts["card_products"]]),
+        ("customers",   generate_customers,   [counts["customers"]]),
+        ("products",    generate_products,     [counts["products"]]),
+        ("orders",      generate_orders,       [counts["orders"], counts["customers"]]),
+        ("order_items", generate_order_items,  [counts["order_items"], counts["orders"], counts["products"]]),
+        ("events",      generate_events,       [counts["events"], counts["customers"], counts["products"]]),
     ]
 
     for name, gen_fn, gen_args in generators:
@@ -533,7 +540,7 @@ def main():
 
     # Verify
     print(f"\n[3/4] Verifying tables...\n")
-    for name in ["customers", "card_products", "txn_archive", "txn_lines", "digital_events"]:
+    for name in ["customers", "products", "orders", "order_items", "events"]:
         try:
             t = catalog.load_table(f"{NAMESPACE}.{name}")
             count = t.scan().to_arrow().num_rows
@@ -557,7 +564,7 @@ def main():
     
     # Optimization
     # print(f"\n[5/5] Generating PGAA SQL...")
-    # table_list = ["customers", "card_products", "txn_archive", "txn_lines", "digital_events"]
+    # table_list = ["customers", "products", "orders", "order_items", "events"]
     # optimize_tables(catalog, table_list)
 
     print(f"""
@@ -569,7 +576,7 @@ def main():
 ║                                                                  ║
 ║  Next steps:                                                     ║
 ║    1. Run on WHPG:  psql -f {sql_path:<35}║
-║    2. Start dashboard: python3 app2.py                           ║
+║    2. Start dashboard: python3 pgaa_dashboard_app.py             ║
 ║    3. Open: http://localhost:5000                                 ║
 ╚══════════════════════════════════════════════════════════════════╝
 """)
