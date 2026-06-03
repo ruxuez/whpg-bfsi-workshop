@@ -54,7 +54,7 @@ SELECT ('2026-06-10'::timestamp + random()*interval '20 days'), account_id, NULL
        queue, severity, narrative, (1+(random()*6)::int)
 FROM _curated;
 
--- Embed ONLY the curated rows into narrative_embeddings, using the SAME 32-dim layout
+-- Embed ONLY the curated rows into case_embeddings, using the SAME 32-dim layout
 -- as Lab 3 Step 1.3 so cosine distance is comparable across all notes.
 INSERT INTO case_embeddings (note_id, account_id, card_bin, analyst, queue, severity, narrative, persona, embedding)
 SELECT

@@ -22,7 +22,7 @@ import dash_bootstrap_components as dbc
 DB_CONFIG = {
     "host":     os.getenv("WPGHOST",   "localhost"),
     "port":     int(os.getenv("WPGPORT",   "5432")),
-    "dbname":   os.getenv("WPGDB",     "bank"),
+    "dbname":   os.getenv("WPGDB",     "demo"),
     "user":     os.getenv("WPGUSER",   "gpadmin"),
     "password": os.getenv("WPGPASS",   ""),
 }
@@ -51,12 +51,12 @@ def load_cluster_points() -> pd.DataFrame:
             a.account_id,
             a.cluster_id,
             f.txn_count          AS txns,
-            f.distinct_mcc       AS mccs,
+            f.distinct_mccs      AS mccs,
             f.distinct_merchants AS merchants,
             ROUND(f.total_amount::numeric, 2)                              AS spend,
-            ROUND((f.total_amount / NULLIF(f.txn_count, 0))::numeric, 2)   AS avg_ticket,
-            ROUND(f.merchant_entropy::numeric, 4)                          AS merch_entropy,
-            ROUND(f.mcc_spread::numeric, 4)                                AS mcc_spread,
+            ROUND(f.avg_amount::numeric, 2)                                AS avg_ticket,
+            ROUND(f.merchant_concentration::numeric, 4)                    AS merch_concentration,
+            ROUND(f.stddev_amount::numeric, 2)                             AS stddev_amount,
             ROUND(f.amount_cv::numeric, 4)                                 AS amount_cv
         FROM bfsi_demo.kmeans_assignments  a
         JOIN bfsi_demo.account_features    f USING (account_id)
@@ -72,11 +72,11 @@ def load_cluster_summary() -> pd.DataFrame:
             a.cluster_id,
             COUNT(*)                                       AS acct_count,
             ROUND(AVG(f.txn_count)::numeric, 1)           AS avg_txns,
-            ROUND(AVG(f.distinct_mcc)::numeric, 1)        AS avg_mccs,
+            ROUND(AVG(f.distinct_mccs)::numeric, 1)       AS avg_mccs,
             ROUND(AVG(f.distinct_merchants)::numeric, 1)  AS avg_merchants,
             ROUND(AVG(f.total_amount)::numeric, 2)        AS avg_spend,
-            ROUND(AVG(f.merchant_entropy)::numeric, 4)    AS avg_entropy,
-            ROUND(AVG(f.mcc_spread)::numeric, 4)          AS avg_mcc_spread,
+            ROUND(AVG(f.merchant_concentration)::numeric, 4) AS avg_concentration,
+            ROUND(AVG(f.stddev_amount)::numeric, 2)       AS avg_stddev,
             ROUND(AVG(f.amount_cv)::numeric, 4)           AS avg_cv,
             CASE
                 WHEN AVG(f.amount_cv) < 0.1          THEN 'STRUCTURING'
@@ -126,8 +126,9 @@ AXIS_OPTIONS = [
     {"label": "Distinct MCCs",  "value": "mccs"},
     {"label": "Distinct merchants", "value": "merchants"},
     {"label": "Total spend",    "value": "spend"},
-    {"label": "Merchant entropy", "value": "merch_entropy"},
-    {"label": "MCC spread",     "value": "mcc_spread"},
+    {"label": "Avg ticket",     "value": "avg_ticket"},
+    {"label": "Merchant concentration", "value": "merch_concentration"},
+    {"label": "Stddev amount",  "value": "stddev_amount"},
     {"label": "Amount CV (variance)", "value": "amount_cv"},
 ]
 
@@ -262,7 +263,7 @@ def update_metrics(summ_json):
     return [
         card("Total Accounts", f"{int(summ['acct_count'].sum()):,}"),
         card("Avg Txns", f"{summ['avg_txns'].mean():.1f}"),
-        card("Max Merchant Entropy", f"{summ['avg_entropy'].max():.3f}"),
+        card("Max Merchant Concentration", f"{summ['avg_concentration'].max():.3f}"),
         card("Largest Cluster", f"C{int(summ.loc[summ['acct_count'].idxmax(), 'cluster_id'])}")
     ]
 
@@ -288,23 +289,23 @@ def update_charts(pts_json, summ_json, x_col, y_col):
 
     # Distribution
     summ["label"] = summ["cluster_id"].map(CLUSTER_LABELS)
-    fig_d = px.bar(summ, x="ip_count", y="label", orientation="h", color="label", color_discrete_sequence=COLORS)
+    fig_d = px.bar(summ, x="acct_count", y="label", orientation="h", color="label", color_discrete_sequence=COLORS)
     fig_d.update_layout(**_layout(height=250), showlegend=False)
 
     # Radar
     fig_r = go.Figure()
-    dims = ["avg_txns", "avg_mccs", "avg_merchants", "avg_spend", "avg_entropy", "avg_mcc_spread"]
+    dims = ["avg_txns", "avg_mccs", "avg_merchants", "avg_spend", "avg_concentration", "avg_cv"]
     for i, row in summ.iterrows():
         # normalize for radar
         norm_vals = [row[d]/summ[d].max() if summ[d].max() > 0 else 0 for d in dims]
-        fig_r.add_trace(go.Scatterpolar(r=norm_vals + [norm_vals[0]], 
-                                       theta=["Txns", "MCCs", "Merchants", "Spend", "Entropy", "Spread", "Txns"],
+        fig_r.add_trace(go.Scatterpolar(r=norm_vals + [norm_vals[0]],
+                                       theta=["Txns", "MCCs", "Merchants", "Spend", "Concentration", "CV", "Txns"],
                                        fill='toself', name=f"C{int(row['cluster_id'])}", line_color=COLORS[i%5]))
     fig_r.update_layout(**_layout(height=300))
 
     # Heatmap
     z = summ[dims].values.astype(float)
-    fig_h = px.imshow(z, x=["Txns", "MCCs", "Merchants", "Spend", "Entropy", "Spread"], 
+    fig_h = px.imshow(z, x=["Txns", "MCCs", "Merchants", "Spend", "Concentration", "CV"],
                       y=[f"C{int(i)}" for i in summ['cluster_id']], color_continuous_scale="RdBu_r")
     fig_h.update_layout(**_layout(height=300))
 
