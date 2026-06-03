@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-PGAA Lab 2 Dashboard - Iceberg vs Native WHPG (Workshop Edition)
+PGAA Lab 2 Dashboard - Iceberg vs Native WHPG (BFSI Analytics, Workshop Edition)
 
 Trimmed from 8 queries / benchmark-heavy to 5 queries / 4 lab-aligned tabs:
   1. Same SQL, Two Engines  - side-by-side runner, one click each
@@ -28,11 +28,11 @@ app = Flask(__name__)
 DB_CONFIG = {
     'host':     os.environ.get('WHPG_HOST', 'localhost'),
     'port':     int(os.environ.get('WHPG_PORT', 5432)),
-    'database': os.environ.get('WHPG_DB',   'demo'),
+    'database': os.environ.get('WHPG_DB',   'bank'),
     'user':     os.environ.get('WHPG_USER', 'gpadmin'),
     'password': os.environ.get('WHPG_PASS', ''),
 }
-NATIVE_SCHEMA = os.environ.get('WHPG_NATIVE_SCHEMA', 'demo')
+NATIVE_SCHEMA = os.environ.get('WHPG_NATIVE_SCHEMA', 'bfsi_analytics')
 
 
 def query(sql):
@@ -49,84 +49,84 @@ def query(sql):
 
 def to_native(sql):
     return (sql
-            .replace('customers_iceberg',   f'{NATIVE_SCHEMA}.customers')
-            .replace('products_iceberg',    f'{NATIVE_SCHEMA}.products')
-            .replace('orders_iceberg',      f'{NATIVE_SCHEMA}.orders')
-            .replace('order_items_iceberg', f'{NATIVE_SCHEMA}.order_items')
-            .replace('events_iceberg',      f'{NATIVE_SCHEMA}.events'))
+            .replace('customers_iceberg',      f'{NATIVE_SCHEMA}.customers')
+            .replace('card_products_iceberg',  f'{NATIVE_SCHEMA}.card_products')
+            .replace('txn_archive_iceberg',    f'{NATIVE_SCHEMA}.txn_archive')
+            .replace('txn_lines_iceberg',      f'{NATIVE_SCHEMA}.txn_lines')
+            .replace('digital_events_iceberg', f'{NATIVE_SCHEMA}.digital_events'))
 
 
 QUERIES = {
-    'revenue': {
-        'name': 'Revenue by Category',
+    'spend': {
+        'name': 'Spend by Card Category',
         'desc': 'Simple JOIN - sets the baseline',
         'sql': '''SELECT p.category,
-       COUNT(DISTINCT oi.order_id)             AS orders,
-       SUM(oi.quantity)                        AS units_sold,
-       ROUND(SUM(oi.quantity * oi.unit_price)::numeric, 2) AS revenue
-FROM   products_iceberg    p
-JOIN   order_items_iceberg oi ON p.product_id = oi.product_id
+       COUNT(DISTINCT oi.archive_id)                       AS transactions,
+       SUM(oi.quantity)                                    AS items,
+       ROUND(SUM(oi.quantity * oi.unit_price)::numeric, 2) AS spend
+FROM   card_products_iceberg p
+JOIN   txn_lines_iceberg     oi ON p.product_id = oi.product_id
 GROUP  BY p.category
-ORDER  BY revenue DESC''',
+ORDER  BY spend DESC''',
     },
     'top20': {
-        'name': 'Top 20 Customers',
+        'name': 'Top 20 Customers by Spend',
         'desc': 'Multi-table JOIN - ranked by spend',
         'sql': '''SELECT c.customer_id,
        c.first_name || ' ' || c.last_name      AS customer,
-       COUNT(o.order_id)                       AS orders,
-       ROUND(SUM(o.total_amount)::numeric, 2)  AS lifetime_value
-FROM   customers_iceberg c
-JOIN   orders_iceberg    o ON c.customer_id = o.customer_id
+       COUNT(o.archive_id)                      AS transactions,
+       ROUND(SUM(o.total_amount)::numeric, 2)   AS lifetime_value
+FROM   customers_iceberg   c
+JOIN   txn_archive_iceberg o ON c.customer_id = o.customer_id
 GROUP  BY 1, 2
 ORDER  BY lifetime_value DESC
 LIMIT  20''',
     },
     'funnel': {
-        'name': 'Conversion Funnel',
-        'desc': 'CTE on events - view -> cart -> purchase',
+        'name': 'Digital Banking Funnel',
+        'desc': 'CTE on events - login -> view statement -> transfer',
         'sql': '''WITH funnel AS (
     SELECT customer_id,
-           MAX(CASE WHEN event_type = 'page_view'   THEN 1 ELSE 0 END) AS viewed,
-           MAX(CASE WHEN event_type = 'add_to_cart' THEN 1 ELSE 0 END) AS carted,
-           MAX(CASE WHEN event_type = 'purchase'    THEN 1 ELSE 0 END) AS purchased
-    FROM   events_iceberg
+           MAX(CASE WHEN event_type = 'login'          THEN 1 ELSE 0 END) AS logged_in,
+           MAX(CASE WHEN event_type = 'view_statement' THEN 1 ELSE 0 END) AS viewed,
+           MAX(CASE WHEN event_type = 'transfer'       THEN 1 ELSE 0 END) AS transferred
+    FROM   digital_events_iceberg
     GROUP  BY customer_id
 )
-SELECT SUM(viewed)       AS viewers,
-       SUM(carted)       AS cart_adds,
-       SUM(purchased)    AS purchases,
-       ROUND(100.0 * SUM(carted)    / NULLIF(SUM(viewed), 0), 2) AS view_to_cart_pct,
-       ROUND(100.0 * SUM(purchased) / NULLIF(SUM(carted), 0), 2) AS cart_to_buy_pct
+SELECT SUM(logged_in)   AS logins,
+       SUM(viewed)      AS statement_views,
+       SUM(transferred) AS transfers,
+       ROUND(100.0 * SUM(viewed)      / NULLIF(SUM(logged_in), 0), 2) AS login_to_view_pct,
+       ROUND(100.0 * SUM(transferred) / NULLIF(SUM(viewed), 0), 2)    AS view_to_transfer_pct
 FROM   funnel''',
     },
     'summary': {
         'name': 'Executive Summary',
         'desc': '5 parallel COUNT(*) - quick scan-cost check',
-        'sql': '''SELECT (SELECT COUNT(*) FROM customers_iceberg)   AS customers,
-       (SELECT COUNT(*) FROM products_iceberg)    AS products,
-       (SELECT COUNT(*) FROM orders_iceberg)      AS orders,
-       (SELECT COUNT(*) FROM order_items_iceberg) AS order_items,
-       (SELECT COUNT(*) FROM events_iceberg)      AS events''',
+        'sql': '''SELECT (SELECT COUNT(*) FROM customers_iceberg)      AS customers,
+       (SELECT COUNT(*) FROM card_products_iceberg)  AS card_products,
+       (SELECT COUNT(*) FROM txn_archive_iceberg)    AS txn_archive,
+       (SELECT COUNT(*) FROM txn_lines_iceberg)      AS txn_lines,
+       (SELECT COUNT(*) FROM digital_events_iceberg) AS digital_events''',
     },
     'daily': {
         'name': 'Daily Dashboard (5-table JOIN)',
         'desc': 'The complex query - biggest perf gap between engines',
-        'sql': '''SELECT o.order_date,
-       COUNT(DISTINCT o.order_id)                     AS orders,
-       ROUND(SUM(o.total_amount)::numeric, 2)         AS revenue,
-       COUNT(DISTINCT o.customer_id)                  AS unique_customers,
-       SUM(oi.quantity)                               AS units_sold,
-       COUNT(*) FILTER (WHERE o.status = 'delivered') AS delivered,
-       COUNT(DISTINCT e.session_id)                   AS sessions
-FROM   orders_iceberg      o
-JOIN   order_items_iceberg oi ON o.order_id    = oi.order_id
-JOIN   products_iceberg    p  ON oi.product_id = p.product_id
+        'sql': '''SELECT o.post_date,
+       COUNT(DISTINCT o.archive_id)                  AS transactions,
+       ROUND(SUM(o.total_amount)::numeric, 2)        AS volume,
+       COUNT(DISTINCT o.customer_id)                 AS unique_customers,
+       SUM(oi.quantity)                              AS items,
+       COUNT(*) FILTER (WHERE o.status = 'settled')  AS settled,
+       COUNT(DISTINCT e.session_id)                  AS sessions
+FROM   txn_archive_iceberg o
+JOIN   txn_lines_iceberg   oi ON o.archive_id  = oi.archive_id
+JOIN   card_products_iceberg p ON oi.product_id = p.product_id
 JOIN   customers_iceberg   c  ON o.customer_id = c.customer_id
-LEFT JOIN events_iceberg   e  ON c.customer_id = e.customer_id
-                              AND e.event_date = o.order_date
-GROUP  BY o.order_date
-ORDER  BY o.order_date DESC
+LEFT JOIN digital_events_iceberg e ON c.customer_id = e.customer_id
+                                   AND e.event_date = o.post_date
+GROUP  BY o.post_date
+ORDER  BY o.post_date DESC
 LIMIT  30''',
     },
 }
@@ -156,23 +156,23 @@ CHECK_QUESTIONS = [
 
 
 CHALLENGE = {
-    'title': 'Find the top 5 products by revenue',
+    'title': 'Find the top 5 card products by spend',
     'context': "You're handed this query but the JOIN condition is missing. "
-               "Fill in the blank to make it run. Hint: products and order_items share one obvious key.",
-    'template': '''-- Top 5 products by revenue
+               "Fill in the blank to make it run. Hint: card_products and txn_lines share one obvious key.",
+    'template': '''-- Top 5 card products by spend
 SELECT p.product_id,
        p.name        AS product_name,
        p.category,
-       SUM(oi.quantity)                                    AS units_sold,
-       ROUND(SUM(oi.quantity * oi.unit_price)::numeric, 2) AS revenue
-FROM   products_iceberg    p
-JOIN   order_items_iceberg oi
+       SUM(oi.quantity)                                    AS items,
+       ROUND(SUM(oi.quantity * oi.unit_price)::numeric, 2) AS spend
+FROM   card_products_iceberg p
+JOIN   txn_lines_iceberg     oi
        ON   /* FILL IN THE JOIN CONDITION */
 GROUP  BY p.product_id, p.name, p.category
-ORDER  BY revenue DESC
+ORDER  BY spend DESC
 LIMIT  5''',
     'solution': 'p.product_id = oi.product_id',
-    'why_it_matters': "products and order_items share product_id - that's the natural join key. "
+    'why_it_matters': "card_products and txn_lines share product_id - that's the natural join key. "
                       "On native AOCO, if both tables are DISTRIBUTED BY (product_id), the join runs locally on each "
                       "segment with no Motion. On Iceberg, the same join still works - but data has to come back from "
                       "object storage before the segments can match rows.",
@@ -273,7 +273,7 @@ def run_all():
 def diag():
     out = {'native_schema': NATIVE_SCHEMA, 'iceberg_tables': [],
            'native_tables': [], 'errors': []}
-    for t in ['customers', 'products', 'orders', 'order_items', 'events']:
+    for t in ['customers', 'card_products', 'txn_archive', 'txn_lines', 'digital_events']:
         for label, name in [('iceberg', f'{t}_iceberg'),
                             ('native',  f'{NATIVE_SCHEMA}.{t}')]:
             try:
@@ -307,7 +307,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-<title>Lab 2 - Iceberg vs Native WHPG</title>
+<title>Lab 2 - Lakehouse: Iceberg vs Native (BFSI)</title>
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet"/>
 <style>
 :root{
@@ -475,7 +475,7 @@ tr:last-child td{border-bottom:none}
 <nav class="nav">
   <span class="nav-brand">EDB <span>WHPG</span></span>
   <div class="nav-div"></div>
-  <span class="nav-title">Lab 2 - Iceberg vs Native WHPG</span>
+  <span class="nav-title">Lab 2 - Lakehouse Federation: Iceberg vs Native AOCO (BFSI analytics)</span>
   <div class="nav-sp"></div>
   <div class="nav-pill">
     <span class="sdot" id="sdot"></span>

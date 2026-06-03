@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-NetVista K-Means Cluster Explorer — EDB Postgres AI Branded
+Meridian Bank K-Means Fraud Cluster Explorer — EDB Postgres AI Branded
 Light Theme Version (Aligned with PGAA Dashboard)
 Run: python3 dashboard.py
 Access: http://localhost:5003
@@ -22,17 +22,17 @@ import dash_bootstrap_components as dbc
 DB_CONFIG = {
     "host":     os.getenv("WPGHOST",   "localhost"),
     "port":     int(os.getenv("WPGPORT",   "5432")),
-    "dbname":   os.getenv("WPGDB",     "demo"),
+    "dbname":   os.getenv("WPGDB",     "bank"),
     "user":     os.getenv("WPGUSER",   "gpadmin"),
     "password": os.getenv("WPGPASS",   ""),
 }
 
 CLUSTER_LABELS = {
-    0: "Normal traffic",
-    1: "Port scan / recon",
-    2: "Data exfil candidate",
-    3: "C2 beaconing",
-    4: "DDoS amplifier",
+    0: "Normal activity",
+    1: "Card testing",
+    2: "Bust-out",
+    3: "Structuring",
+    4: "Velocity abuse",
 }
 
 # EDB Corporate Palette (Light Theme)
@@ -48,19 +48,19 @@ def get_connection():
 def load_cluster_points() -> pd.DataFrame:
     sql = textwrap.dedent("""
         SELECT
-            a.src_ip,
+            a.account_id,
             a.cluster_id,
-            f.total_flows AS flow_count,
-            f.avg_unique_dsts AS unique_dsts,
-            f.avg_unique_ports AS unique_ports,
-            ROUND((f.total_bytes / 1e6)::numeric, 2)   AS bytes_mb,
-            ROUND((f.total_bytes / NULLIF(f.total_flows, 0))::numeric, 1) AS avg_bytes,
-            ROUND(f.avg_dst_entropy::numeric, 4)        AS dst_entropy,
-            ROUND(f.avg_port_spread::numeric, 4)        AS port_spread,
-            ROUND(f.avg_byte_cv::numeric, 4)            AS byte_cv
-        FROM netvista_demo.kmeans_assignments  a
-        JOIN netvista_demo.netflow_features_agg f USING (src_ip)
-        ORDER BY a.cluster_id, f.total_bytes DESC
+            f.txn_count          AS txns,
+            f.distinct_mcc       AS mccs,
+            f.distinct_merchants AS merchants,
+            ROUND(f.total_amount::numeric, 2)                              AS spend,
+            ROUND((f.total_amount / NULLIF(f.txn_count, 0))::numeric, 2)   AS avg_ticket,
+            ROUND(f.merchant_entropy::numeric, 4)                          AS merch_entropy,
+            ROUND(f.mcc_spread::numeric, 4)                                AS mcc_spread,
+            ROUND(f.amount_cv::numeric, 4)                                 AS amount_cv
+        FROM bfsi_demo.kmeans_assignments  a
+        JOIN bfsi_demo.account_features    f USING (account_id)
+        ORDER BY a.cluster_id, f.total_amount DESC
         LIMIT 2000
     """)
     with get_connection() as conn:
@@ -70,24 +70,24 @@ def load_cluster_summary() -> pd.DataFrame:
     sql = textwrap.dedent("""
         SELECT
             a.cluster_id,
-            COUNT(*)                                          AS ip_count,
-            ROUND(AVG(f.total_flows)::numeric, 1)            AS avg_flows,
-            ROUND(AVG(f.avg_unique_dsts)::numeric, 1)        AS avg_dsts,
-            ROUND(AVG(f.avg_unique_ports)::numeric, 1)       AS avg_ports,
-            ROUND((AVG(f.total_bytes)/1e6)::numeric, 2)      AS avg_bytes_mb,
-            ROUND(AVG(f.avg_dst_entropy)::numeric, 4)        AS avg_entropy,
-            ROUND(AVG(f.avg_port_spread)::numeric, 4)        AS avg_port_spread,
-            ROUND(AVG(f.avg_byte_cv)::numeric, 4)            AS avg_byte_cv,
+            COUNT(*)                                       AS acct_count,
+            ROUND(AVG(f.txn_count)::numeric, 1)           AS avg_txns,
+            ROUND(AVG(f.distinct_mcc)::numeric, 1)        AS avg_mccs,
+            ROUND(AVG(f.distinct_merchants)::numeric, 1)  AS avg_merchants,
+            ROUND(AVG(f.total_amount)::numeric, 2)        AS avg_spend,
+            ROUND(AVG(f.merchant_entropy)::numeric, 4)    AS avg_entropy,
+            ROUND(AVG(f.mcc_spread)::numeric, 4)          AS avg_mcc_spread,
+            ROUND(AVG(f.amount_cv)::numeric, 4)           AS avg_cv,
             CASE
-                WHEN AVG(f.avg_unique_ports) > 1000 THEN 'RECON'
-                WHEN AVG(f.total_bytes) > 10000000000 THEN 'EXFIL'
-                WHEN AVG(f.avg_byte_cv) < 0.4 AND AVG(f.avg_dst_entropy) < 0.5 THEN 'C2'
+                WHEN AVG(f.amount_cv) < 0.1          THEN 'STRUCTURING'
+                WHEN AVG(f.distinct_merchants) > 50  THEN 'CARD-TESTING'
+                WHEN AVG(f.total_amount) > 100000    THEN 'BUST-OUT'
                 ELSE 'NORMAL'
             END AS persona
-        FROM netvista_demo.kmeans_assignments a
-        JOIN netvista_demo.netflow_features_agg f USING (src_ip)
+        FROM bfsi_demo.kmeans_assignments a
+        JOIN bfsi_demo.account_features   f USING (account_id)
         GROUP BY a.cluster_id
-        ORDER BY ip_count DESC
+        ORDER BY acct_count DESC
     """)
     with get_connection() as conn:
         return pd.read_sql(sql, conn)
@@ -118,17 +118,17 @@ app = dash.Dash(
         dbc.themes.BOOTSTRAP,
         "https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@300;400;500;600;700&family=IBM+Plex+Mono&display=swap"
     ],
-    title="NetVista — Cluster Explorer",
+    title="Meridian Bank — Fraud Cluster Explorer",
 )
 
 AXIS_OPTIONS = [
-    {"label": "Flow count",    "value": "flow_count"},
-    {"label": "Unique dsts",   "value": "unique_dsts"},
-    {"label": "Unique ports",  "value": "unique_ports"},
-    {"label": "Bytes (MB)",    "value": "bytes_mb"},
-    {"label": "Dst entropy",   "value": "dst_entropy"},
-    {"label": "Port spread",   "value": "port_spread"},
-    {"label": "Byte CV (variance)", "value": "byte_cv"},
+    {"label": "Txn count",      "value": "txns"},
+    {"label": "Distinct MCCs",  "value": "mccs"},
+    {"label": "Distinct merchants", "value": "merchants"},
+    {"label": "Total spend",    "value": "spend"},
+    {"label": "Merchant entropy", "value": "merch_entropy"},
+    {"label": "MCC spread",     "value": "mcc_spread"},
+    {"label": "Amount CV (variance)", "value": "amount_cv"},
 ]
 
 # Light Theme Header
@@ -161,10 +161,10 @@ app.layout = html.Div(style={"background": "#F5F5F5", "minHeight": "100vh"}, chi
                 dbc.Card(style={"borderRadius": "12px", "border": "1px solid #E2E2E2", "boxShadow": "0 1px 3px rgba(0,0,0,.06)"}, children=[
                     dbc.CardHeader([
                         html.Span("Scatter: ", style={"fontSize": "11px", "fontWeight": "600", "textTransform": "uppercase"}),
-                        dcc.Dropdown(id="x-axis", options=AXIS_OPTIONS, value="flow_count", clearable=False,
+                        dcc.Dropdown(id="x-axis", options=AXIS_OPTIONS, value="txns", clearable=False,
                                      style={"width": "150px", "display": "inline-block", "fontSize": "12px"}),
                         html.Span(" vs ", style={"margin": "0 10px"}),
-                        dcc.Dropdown(id="y-axis", options=AXIS_OPTIONS, value="unique_ports", clearable=False,
+                        dcc.Dropdown(id="y-axis", options=AXIS_OPTIONS, value="merchants", clearable=False,
                                      style={"width": "150px", "display": "inline-block", "fontSize": "12px"}),
                     ], style={"background": "#FAFAFA", "borderBottom": "1px solid #E2E2E2", "padding": "10px 20px"}),
                     dbc.CardBody(dcc.Graph(id="scatter-plot", config={"displayModeBar": False}))
@@ -236,7 +236,7 @@ def load_data(_):
         summ = load_cluster_summary()
         msg = html.Div([
             html.Span("● ", style={"color": "#27A67A"}),
-            html.Span(f"Connected: {len(pts):,} IPs loaded")
+            html.Span(f"Connected: {len(pts):,} accounts loaded")
         ])
         return pts.to_json(date_format="iso", orient="split"), summ.to_json(date_format="iso", orient="split"), msg
     except Exception as exc:
@@ -260,10 +260,10 @@ def update_metrics(summ_json):
         ]))
 
     return [
-        card("Total IPs", f"{int(summ['ip_count'].sum()):,}"),
-        card("Avg Flows", f"{summ['avg_flows'].mean():.1f}"),
-        card("Max Entropy", f"{summ['avg_entropy'].max():.3f}"),
-        card("Largest Cluster", f"C{int(summ.loc[summ['ip_count'].idxmax(), 'cluster_id'])}")
+        card("Total Accounts", f"{int(summ['acct_count'].sum()):,}"),
+        card("Avg Txns", f"{summ['avg_txns'].mean():.1f}"),
+        card("Max Merchant Entropy", f"{summ['avg_entropy'].max():.3f}"),
+        card("Largest Cluster", f"C{int(summ.loc[summ['acct_count'].idxmax(), 'cluster_id'])}")
     ]
 
 @app.callback(
@@ -293,18 +293,18 @@ def update_charts(pts_json, summ_json, x_col, y_col):
 
     # Radar
     fig_r = go.Figure()
-    dims = ["avg_flows", "avg_dsts", "avg_ports", "avg_bytes_mb", "avg_entropy", "avg_port_spread"]
+    dims = ["avg_txns", "avg_mccs", "avg_merchants", "avg_spend", "avg_entropy", "avg_mcc_spread"]
     for i, row in summ.iterrows():
         # normalize for radar
         norm_vals = [row[d]/summ[d].max() if summ[d].max() > 0 else 0 for d in dims]
         fig_r.add_trace(go.Scatterpolar(r=norm_vals + [norm_vals[0]], 
-                                       theta=["Flows", "Dsts", "Ports", "Bytes", "Entropy", "Spread", "Flows"],
+                                       theta=["Txns", "MCCs", "Merchants", "Spend", "Entropy", "Spread", "Txns"],
                                        fill='toself', name=f"C{int(row['cluster_id'])}", line_color=COLORS[i%5]))
     fig_r.update_layout(**_layout(height=300))
 
     # Heatmap
     z = summ[dims].values.astype(float)
-    fig_h = px.imshow(z, x=["Flows", "Dsts", "Ports", "Bytes", "Entropy", "Spread"], 
+    fig_h = px.imshow(z, x=["Txns", "MCCs", "Merchants", "Spend", "Entropy", "Spread"], 
                       y=[f"C{int(i)}" for i in summ['cluster_id']], color_continuous_scale="RdBu_r")
     fig_h.update_layout(**_layout(height=300))
 

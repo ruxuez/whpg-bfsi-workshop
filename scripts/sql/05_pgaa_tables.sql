@@ -1,8 +1,14 @@
 -- ═══════════════════════════════════════════════════════════════════════════════
--- Lab 2: PGAA Iceberg Tables on MinIO + Native WHPG Comparison Tables
+-- Lab 2: PGAA Iceberg Tables on MinIO + Native WHPG Comparison (BFSI analytics)
 -- ═══════════════════════════════════════════════════════════════════════════════
+-- Demonstrates EDB WarehousePG reading open-format Iceberg data in place (PGAA over
+-- pgfs/MinIO), then materialising it into native AO-columnar tables for MPP speed.
+-- The dataset is a banking analytics mart that complements the fraud/AML model:
+--   customers · card_products · txn_archive · txn_lines · digital_events
 --
--- Run AFTER iceberg_data_generator.py has populated MinIO.
+-- Run AFTER the companion data generator has populated MinIO. The generator must
+-- emit Iceberg datasets at the paths below with the column order shown in STEP 3
+-- (PGAA infers the Iceberg schema; the native INSERT ... SELECT * is positional).
 --
 -- Adjust the S3 URL, endpoint, and credentials below to match your environment.
 -- ═══════════════════════════════════════════════════════════════════════════════
@@ -24,7 +30,7 @@ SELECT * FROM pgfs.list_storage_locations();
 
 
 -- ╔══════════════════════════════════════════════════════════════════════════════╗
--- ║  STEP 2: PGAA Iceberg Tables                                               ║
+-- ║  STEP 2: PGAA Iceberg Tables (read open-format data in place)              ║
 -- ╚══════════════════════════════════════════════════════════════════════════════╝
 
 DROP TABLE IF EXISTS customers_iceberg;
@@ -35,44 +41,44 @@ USING PGAA WITH (
     pgaa.format           = 'iceberg'
 );
 
-DROP TABLE IF EXISTS products_iceberg;
-CREATE TABLE products_iceberg ()
+DROP TABLE IF EXISTS card_products_iceberg;
+CREATE TABLE card_products_iceberg ()
 USING PGAA WITH (
     pgaa.storage_location = 'minio_iceberg',
-    pgaa.path             = 'analytics/products',
+    pgaa.path             = 'analytics/card_products',
     pgaa.format           = 'iceberg'
 );
 
-DROP TABLE IF EXISTS orders_iceberg;
-CREATE TABLE orders_iceberg ()
+DROP TABLE IF EXISTS txn_archive_iceberg;
+CREATE TABLE txn_archive_iceberg ()
 USING PGAA WITH (
     pgaa.storage_location = 'minio_iceberg',
-    pgaa.path             = 'analytics/orders',
+    pgaa.path             = 'analytics/txn_archive',
     pgaa.format           = 'iceberg'
 );
 
-DROP TABLE IF EXISTS order_items_iceberg;
-CREATE TABLE order_items_iceberg ()
+DROP TABLE IF EXISTS txn_lines_iceberg;
+CREATE TABLE txn_lines_iceberg ()
 USING PGAA WITH (
     pgaa.storage_location = 'minio_iceberg',
-    pgaa.path             = 'analytics/order_items',
+    pgaa.path             = 'analytics/txn_lines',
     pgaa.format           = 'iceberg'
 );
 
-DROP TABLE IF EXISTS events_iceberg;
-CREATE TABLE events_iceberg ()
+DROP TABLE IF EXISTS digital_events_iceberg;
+CREATE TABLE digital_events_iceberg ()
 USING PGAA WITH (
     pgaa.storage_location = 'minio_iceberg',
-    pgaa.path             = 'analytics/events',
+    pgaa.path             = 'analytics/digital_events',
     pgaa.format           = 'iceberg'
 );
 
 -- Quick check
-SELECT 'customers_iceberg' AS tbl, COUNT(*) FROM customers_iceberg
-UNION ALL SELECT 'products_iceberg',    COUNT(*) FROM products_iceberg
-UNION ALL SELECT 'orders_iceberg',      COUNT(*) FROM orders_iceberg
-UNION ALL SELECT 'order_items_iceberg', COUNT(*) FROM order_items_iceberg
-UNION ALL SELECT 'events_iceberg',      COUNT(*) FROM events_iceberg
+SELECT 'customers_iceberg'      AS tbl, COUNT(*) FROM customers_iceberg
+UNION ALL SELECT 'card_products_iceberg',  COUNT(*) FROM card_products_iceberg
+UNION ALL SELECT 'txn_archive_iceberg',    COUNT(*) FROM txn_archive_iceberg
+UNION ALL SELECT 'txn_lines_iceberg',      COUNT(*) FROM txn_lines_iceberg
+UNION ALL SELECT 'digital_events_iceberg', COUNT(*) FROM digital_events_iceberg
 ORDER BY 2 DESC;
 
 
@@ -80,11 +86,11 @@ ORDER BY 2 DESC;
 -- ║  STEP 3: Native WHPG Tables (AO Columnar + ZSTD)                          ║
 -- ╚══════════════════════════════════════════════════════════════════════════════╝
 
-CREATE SCHEMA IF NOT EXISTS demo;
+CREATE SCHEMA IF NOT EXISTS bfsi_analytics;
 
--- Customers
-DROP TABLE IF EXISTS demo.customers CASCADE;
-CREATE TABLE demo.customers (
+-- Customers (analytical copy of the bank's customer base)
+DROP TABLE IF EXISTS bfsi_analytics.customers CASCADE;
+CREATE TABLE bfsi_analytics.customers (
     customer_id     BIGINT,
     email           TEXT,
     first_name      TEXT,
@@ -96,65 +102,65 @@ CREATE TABLE demo.customers (
     lifetime_value  NUMERIC(38,2)
 ) WITH (appendonly=true, orientation=column, compresstype=zstd)
 DISTRIBUTED BY (customer_id);
-INSERT INTO demo.customers SELECT * FROM customers_iceberg;
-ANALYZE demo.customers;
+INSERT INTO bfsi_analytics.customers SELECT * FROM customers_iceberg;
+ANALYZE bfsi_analytics.customers;
 
--- Products
-DROP TABLE IF EXISTS demo.products CASCADE;
-CREATE TABLE demo.products (
+-- Card Products (credit / debit / prepaid programs)
+DROP TABLE IF EXISTS bfsi_analytics.card_products CASCADE;
+CREATE TABLE bfsi_analytics.card_products (
     product_id      BIGINT,
-    sku             TEXT,
+    product_code    TEXT,
     name            TEXT,
-    category        TEXT,
-    subcategory     TEXT,
-    price           NUMERIC(38,2),
-    cost            NUMERIC(38,2),
-    stock_quantity  BIGINT,
+    category        TEXT,          -- credit | debit | prepaid | commercial
+    tier            TEXT,          -- classic | gold | platinum | world
+    annual_fee      NUMERIC(38,2),
+    issuance_cost   NUMERIC(38,2),
+    active_cards    BIGINT,
     is_available    BOOLEAN
 ) WITH (appendonly=true, orientation=column, compresstype=zstd)
 DISTRIBUTED BY (product_id);
-INSERT INTO demo.products SELECT * FROM products_iceberg;
-ANALYZE demo.products;
+INSERT INTO bfsi_analytics.card_products SELECT * FROM card_products_iceberg;
+ANALYZE bfsi_analytics.card_products;
 
--- Orders
-DROP TABLE IF EXISTS demo.orders CASCADE;
-CREATE TABLE demo.orders (
-    order_id        BIGINT,
+-- Transaction Archive (historical settled transactions for analytics)
+DROP TABLE IF EXISTS bfsi_analytics.txn_archive CASCADE;
+CREATE TABLE bfsi_analytics.txn_archive (
+    archive_id      BIGINT,
     customer_id     BIGINT,
-    order_date      DATE,
-    order_timestamp TIMESTAMP,
-    status          TEXT,
-    shipping_country TEXT,
-    shipping_city   TEXT,
+    post_date       DATE,
+    txn_timestamp   TIMESTAMP,
+    status          TEXT,          -- settled | reversed | disputed | refunded
+    txn_country     TEXT,
+    txn_city        TEXT,
     total_amount    NUMERIC(38,2),
-    discount_amount NUMERIC(38,2)
+    fee_amount      NUMERIC(38,2)
 ) WITH (appendonly=true, orientation=column, compresstype=zstd)
-DISTRIBUTED BY (order_id);
-INSERT INTO demo.orders SELECT * FROM orders_iceberg;
-ANALYZE demo.orders;
+DISTRIBUTED BY (archive_id);
+INSERT INTO bfsi_analytics.txn_archive SELECT * FROM txn_archive_iceberg;
+ANALYZE bfsi_analytics.txn_archive;
 
--- Order Items
-DROP TABLE IF EXISTS demo.order_items CASCADE;
-CREATE TABLE demo.order_items (
-    item_id         BIGINT,
-    order_id        BIGINT,
+-- Transaction Lines (itemised charges / instalments)
+DROP TABLE IF EXISTS bfsi_analytics.txn_lines CASCADE;
+CREATE TABLE bfsi_analytics.txn_lines (
+    line_id         BIGINT,
+    archive_id      BIGINT,
     product_id      BIGINT,
     quantity        BIGINT,
     unit_price      NUMERIC(38,2),
     line_total      NUMERIC(38,2)
 ) WITH (appendonly=true, orientation=column, compresstype=zstd)
-DISTRIBUTED BY (item_id);
-INSERT INTO demo.order_items SELECT * FROM order_items_iceberg;
-ANALYZE demo.order_items;
+DISTRIBUTED BY (line_id);
+INSERT INTO bfsi_analytics.txn_lines SELECT * FROM txn_lines_iceberg;
+ANALYZE bfsi_analytics.txn_lines;
 
--- Events
-DROP TABLE IF EXISTS demo.events CASCADE;
-CREATE TABLE demo.events (
+-- Digital Events (mobile / web banking clickstream)
+DROP TABLE IF EXISTS bfsi_analytics.digital_events CASCADE;
+CREATE TABLE bfsi_analytics.digital_events (
     event_id        BIGINT,
     event_timestamp TIMESTAMP,
     event_date      DATE,
     customer_id     BIGINT,
-    event_type      TEXT,
+    event_type      TEXT,          -- login | view_statement | transfer | payee_add | card_freeze
     page_url        TEXT,
     product_id      BIGINT,
     session_id      TEXT,
@@ -162,12 +168,12 @@ CREATE TABLE demo.events (
     country         TEXT
 ) WITH (appendonly=true, orientation=column, compresstype=zstd)
 DISTRIBUTED BY (event_id);
-INSERT INTO demo.events SELECT * FROM events_iceberg;
-ANALYZE demo.events;
+INSERT INTO bfsi_analytics.digital_events SELECT * FROM digital_events_iceberg;
+ANALYZE bfsi_analytics.digital_events;
 
 
 -- ╔══════════════════════════════════════════════════════════════════════════════╗
--- ║  STEP 4: Verify Row Counts                                                 ║
+-- ║  STEP 4: Verify Row Counts (Iceberg-in-place vs native AOCO)              ║
 -- ╚══════════════════════════════════════════════════════════════════════════════╝
 
 DO $$
@@ -175,24 +181,24 @@ DECLARE r RECORD;
 BEGIN
     RAISE NOTICE '';
     RAISE NOTICE '╔══════════════════════════════════════════════════════════════╗';
-    RAISE NOTICE '║  PGAA Lab 2 — Setup Complete                               ║';
+    RAISE NOTICE '║  PGAA Lab 2 (BFSI) — Setup Complete                        ║';
     RAISE NOTICE '╠══════════════════════════════════════════════════════════════╣';
     FOR r IN
         SELECT 'customers'   AS tbl,
-               (SELECT COUNT(*) FROM customers_iceberg)  AS ice,
-               (SELECT COUNT(*) FROM demo.customers)     AS nat
-        UNION ALL SELECT 'products',
-               (SELECT COUNT(*) FROM products_iceberg),
-               (SELECT COUNT(*) FROM demo.products)
-        UNION ALL SELECT 'orders',
-               (SELECT COUNT(*) FROM orders_iceberg),
-               (SELECT COUNT(*) FROM demo.orders)
-        UNION ALL SELECT 'order_items',
-               (SELECT COUNT(*) FROM order_items_iceberg),
-               (SELECT COUNT(*) FROM demo.order_items)
-        UNION ALL SELECT 'events',
-               (SELECT COUNT(*) FROM events_iceberg),
-               (SELECT COUNT(*) FROM demo.events)
+               (SELECT COUNT(*) FROM customers_iceberg)        AS ice,
+               (SELECT COUNT(*) FROM bfsi_analytics.customers) AS nat
+        UNION ALL SELECT 'card_products',
+               (SELECT COUNT(*) FROM card_products_iceberg),
+               (SELECT COUNT(*) FROM bfsi_analytics.card_products)
+        UNION ALL SELECT 'txn_archive',
+               (SELECT COUNT(*) FROM txn_archive_iceberg),
+               (SELECT COUNT(*) FROM bfsi_analytics.txn_archive)
+        UNION ALL SELECT 'txn_lines',
+               (SELECT COUNT(*) FROM txn_lines_iceberg),
+               (SELECT COUNT(*) FROM bfsi_analytics.txn_lines)
+        UNION ALL SELECT 'digital_events',
+               (SELECT COUNT(*) FROM digital_events_iceberg),
+               (SELECT COUNT(*) FROM bfsi_analytics.digital_events)
         ORDER BY 2 DESC
     LOOP
         RAISE NOTICE '║  %  iceberg=% native=% %',
@@ -203,5 +209,5 @@ BEGIN
     END LOOP;
     RAISE NOTICE '╚══════════════════════════════════════════════════════════════╝';
     RAISE NOTICE '';
-    RAISE NOTICE 'Next: python3 pgaa_dashboard_app.py  →  http://localhost:5000';
+    RAISE NOTICE 'Iceberg tables are queryable in place; native AOCO copies give MPP speed.';
 END $$;

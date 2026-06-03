@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Lab 3 - AI-Powered Analytics: STREAMLINED Dashboard
+Lab 3 - AI-Powered Fraud Analytics: STREAMLINED Dashboard (BFSI)
 Focus: pgvector value, MADlib value, and their combination
 
-Connects to WarehousePG (demo database, port 5432)
+Connects to WarehousePG (bfsi schema, port 5432)
 """
 
 import os, time, decimal
@@ -16,7 +16,7 @@ app = Flask(__name__)
 DB = {
     "host":     os.environ.get("WHPG_HOST", "localhost"),
     "port":     int(os.environ.get("WHPG_PORT", 5432)),
-    "dbname":   os.environ.get("WHPG_DB",   "demo"),
+    "dbname":   os.environ.get("WHPG_DB",   "bank"),
     "user":     os.environ.get("WHPG_USER", "gpadmin"),
     "password": os.environ.get("WHPG_PASS", ""),
 }
@@ -27,7 +27,7 @@ def run(sql, params=None):
     try:
         cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
         t0 = time.perf_counter()
-        cur.execute("SET search_path TO netvista_demo, public;")
+        cur.execute("SET search_path TO bfsi_demo, public;")
         cur.execute(sql, params)
         ms = round((time.perf_counter() - t0) * 1000, 1)
         rows = []
@@ -54,130 +54,120 @@ QUERIES = [
     {
         "id": "a1", "panel": 0,
         "name": "A1 - The Keyword Search Problem",
-        "desc": "LIKE '%brute force%' finds 25K logs, but LIKE '%port scan%' finds ZERO — same threat type, different words!",
+        "desc": "LIKE '%structuring%' finds almost nothing, yet the structuring persona is everywhere - same behaviour, different words!",
         "sql": """SELECT
-    'Keyword Search Results' as search_method,
-    COUNT(*) AS total_syslogs,
-    COUNT(*) FILTER (WHERE message ILIKE '%port scan%') AS found_port_scan,
-    COUNT(*) FILTER (WHERE message ILIKE '%brute force%') AS found_brute_force,
-    COUNT(*) FILTER (WHERE message ILIKE '%reconnaissance%') AS found_reconnaissance,
-    COUNT(*) FILTER (WHERE message ILIKE '%nmap%') AS found_nmap,
-    '❌ Misses: "REJECT TCP", "Connection refused", "SYN flood"' as limitation,
-    COUNT(*) FILTER (WHERE persona = 'recon') AS actual_recon_logs
-FROM netvista_demo.syslog_embeddings
+    'Keyword Search Results' AS search_method,
+    COUNT(*) AS total_notes,
+    COUNT(*) FILTER (WHERE narrative ILIKE '%structuring%')      AS found_structuring,
+    COUNT(*) FILTER (WHERE narrative ILIKE '%money laundering%') AS found_laundering,
+    COUNT(*) FILTER (WHERE narrative ILIKE '%smurfing%')         AS found_smurfing,
+    '\u274c Misses: "just below the limit", "split deposits", "layering"' AS limitation,
+    COUNT(*) FILTER (WHERE persona = 'structuring') AS actual_structuring_notes
+FROM bfsi_demo.case_embeddings
 
 UNION ALL
 
 SELECT
-    'What We Actually Have' as search_method,
-    COUNT(*) AS total_syslogs,
-    NULL, NULL, NULL, NULL,
-    'Logs describing scanning behavior using different words' as limitation,
-    COUNT(*) FILTER (WHERE persona = 'recon') AS actual_recon_logs
-FROM netvista_demo.syslog_embeddings"""
+    'What We Actually Have' AS search_method,
+    COUNT(*) AS total_notes,
+    NULL, NULL, NULL,
+    'Notes describing the same behaviour using different words' AS limitation,
+    COUNT(*) FILTER (WHERE persona = 'structuring') AS actual_structuring_notes
+FROM bfsi_demo.case_embeddings"""
     },
     {
         "id": "a2", "panel": 0,
-        "name": "A2 - pgvector Finds Threats by MEANING",
-        "desc": "Find logs similar to port scanning patterns — semantic search discovers related logs WITHOUT exact keywords!",
-        "sql": """WITH reference_log AS (
-    SELECT
-        event_id,
-        LEFT(message, 80) as ref_message,
-        embedding
-    FROM netvista_demo.syslog_embeddings
-    WHERE persona = 'recon'
-    AND event_id >= 900000  -- Prioritize our diverse manually-added logs
-    AND program IN ('firewalld', 'snort', 'iptables')
-    ORDER BY event_id
+        "name": "A2 - pgvector Finds Fraud by MEANING",
+        "desc": "Find case notes similar to a known structuring narrative - semantic search surfaces related cases WITHOUT exact keywords!",
+        "sql": """WITH reference_note AS (
+    SELECT note_id, LEFT(narrative, 80) AS ref_note, embedding
+    FROM bfsi_demo.case_embeddings
+    WHERE persona = 'structuring' AND queue = 'aml-tm'
+    ORDER BY note_id
     LIMIT 1
 )
 SELECT
-    rl.ref_message AS reference_log,
-    se.hostname,
-    se.program,
-    LEFT(se.message, 90) AS similar_message,
-    se.persona AS ground_truth,
-    ROUND((1 - (se.embedding <=> rl.embedding))::numeric, 4) AS similarity
-FROM netvista_demo.syslog_embeddings se
-CROSS JOIN reference_log rl
-WHERE se.event_id != rl.event_id
-AND se.message NOT ILIKE '%brute force%'  -- Exclude repetitive brute force logs
-AND se.program NOT IN ('ntpd', 'systemd', 'kernel')  -- Exclude misclassified normal services
-AND se.persona = 'recon'  -- Only show recon logs for clarity
-ORDER BY se.embedding <=> rl.embedding
+    r.ref_note               AS reference_note,
+    e.account_id,
+    e.queue,
+    LEFT(e.narrative, 90)    AS similar_note,
+    e.persona                AS ground_truth,
+    ROUND((1 - (e.embedding <=> r.embedding))::numeric, 4) AS similarity
+FROM bfsi_demo.case_embeddings e
+CROSS JOIN reference_note r
+WHERE e.note_id != r.note_id
+  AND e.persona = 'structuring'
+ORDER BY e.embedding <=> r.embedding
 LIMIT 15"""
     },
 
     # ══════════════════════════════════════════════════════════════════════════
-    # Panel B: MADlib — Unsupervised Threat Discovery
+    # Panel B: MADlib — Unsupervised Fraud Discovery
     # ══════════════════════════════════════════════════════════════════════════
     {
         "id": "b1", "panel": 1,
-        "name": "B1 - MADlib Discovered 4 Threat Personas",
-        "desc": "K-Means clustering on 6 features — NO LABELS, finds threats automatically",
+        "name": "B1 - MADlib Discovered the Fraud Personas",
+        "desc": "K-Means clustering on 6 behavioural features - NO LABELS, finds fraud rings automatically",
         "sql": """SELECT
     a.cluster_id,
-    COUNT(*) AS ips,
+    COUNT(*) AS accounts,
     ROUND(COUNT(*) * 100.0 / SUM(COUNT(*)) OVER (), 1) AS pct,
-    ROUND(AVG(f.total_flows), 0) AS avg_flows,
-    ROUND(AVG(f.total_bytes)::numeric / 1e6, 2) AS avg_mb,
-    ROUND(AVG(f.avg_unique_ports), 0) AS avg_ports,
-    ROUND(AVG(f.avg_byte_cv)::numeric, 4) AS avg_cv,
+    ROUND(AVG(f.txn_count), 0)              AS avg_txns,
+    ROUND(AVG(f.total_amount)::numeric, 2)  AS avg_spend,
+    ROUND(AVG(f.distinct_merchants), 0)     AS avg_merchants,
+    ROUND(AVG(f.amount_cv)::numeric, 4)     AS avg_cv,
     CASE
-        WHEN AVG(f.avg_unique_ports) > 1000 THEN '🔍 RECON'
-        WHEN AVG(f.total_bytes) > 10000000000 THEN '📤 EXFIL'
-        WHEN AVG(f.avg_byte_cv) < 0.4 THEN '🤖 C2'
-        ELSE '✅ NORMAL'
+        WHEN AVG(f.amount_cv) < 0.1          THEN '\U0001f916 STRUCTURING'
+        WHEN AVG(f.distinct_merchants) > 50  THEN '\U0001f50d CARD-TESTING'
+        WHEN AVG(f.total_amount) > 100000    THEN '\U0001f4e4 BUST-OUT'
+        ELSE '\u2705 NORMAL'
     END AS persona
-FROM netvista_demo.kmeans_assignments a
-JOIN netvista_demo.netflow_features_agg f ON a.src_ip = f.src_ip
+FROM bfsi_demo.kmeans_assignments a
+JOIN bfsi_demo.account_features f ON a.account_id = f.account_id
 GROUP BY 1
-ORDER BY ips DESC"""
+ORDER BY accounts DESC"""
     },
     {
         "id": "b2", "panel": 1,
         "name": "B2 - The Dramatic Differences",
-        "desc": "RECON: 3,678× more ports | EXFIL: 35,000,000× more bytes",
+        "desc": "CARD-TESTING: many more merchants | BUST-OUT: far higher spend than a normal account",
         "sql": """WITH cluster_agg AS (
     SELECT
         a.cluster_id,
-        COUNT(*) AS ips,
-        ROUND(AVG(f.avg_unique_ports), 0) AS ports,
-        ROUND(AVG(f.total_bytes)::numeric / 1e6, 2) AS bytes_mb,
-        ROUND(AVG(f.avg_byte_cv)::numeric, 4) AS byte_cv
-    FROM netvista_demo.kmeans_assignments a
-    JOIN netvista_demo.netflow_features_agg f ON a.src_ip = f.src_ip
+        COUNT(*) AS accounts,
+        ROUND(AVG(f.distinct_merchants), 0)     AS merchants,
+        ROUND(AVG(f.total_amount)::numeric, 2)  AS spend,
+        ROUND(AVG(f.amount_cv)::numeric, 4)     AS amount_cv
+    FROM bfsi_demo.kmeans_assignments a
+    JOIN bfsi_demo.account_features f ON a.account_id = f.account_id
     GROUP BY a.cluster_id
 ),
 cluster_stats AS (
     SELECT
         CASE
-            WHEN ports > 1000 THEN 'RECON'
-            WHEN bytes_mb > 10000000 THEN 'EXFIL'
-            WHEN byte_cv < 0.4 THEN 'C2'
+            WHEN amount_cv < 0.1   THEN 'STRUCTURING'
+            WHEN merchants > 50    THEN 'CARD-TESTING'
+            WHEN spend > 100000    THEN 'BUST-OUT'
             ELSE 'NORMAL'
         END AS persona,
-        ips,
-        ports,
-        bytes_mb,
-        byte_cv
+        accounts, merchants, spend, amount_cv
     FROM cluster_agg
 ),
 normal AS (
-    SELECT ports AS n_ports, bytes_mb AS n_bytes
+    SELECT merchants AS n_merch, spend AS n_spend
     FROM cluster_stats WHERE persona = 'NORMAL' LIMIT 1
 )
 SELECT
     cs.persona,
-    cs.ips,
-    cs.ports,
-    cs.bytes_mb,
-    cs.byte_cv,
-    ROUND(cs.ports::numeric / NULLIF(n.n_ports, 0), 0) AS ports_vs_normal,
-    ROUND(cs.bytes_mb::numeric / NULLIF(n.n_bytes, 0), 0) AS bytes_vs_normal
-FROM cluster_stats cs, normal n
-ORDER BY cs.ips DESC"""
+    cs.accounts,
+    cs.merchants,
+    cs.spend,
+    cs.amount_cv,
+    ROUND(cs.merchants::numeric / NULLIF(n.n_merch, 0), 0) AS merchants_vs_normal,
+    ROUND(cs.spend::numeric    / NULLIF(n.n_spend, 0), 0) AS spend_vs_normal
+FROM cluster_stats cs
+LEFT JOIN normal n ON TRUE
+ORDER BY cs.accounts DESC"""
     },
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -185,132 +175,62 @@ ORDER BY cs.ips DESC"""
     # ══════════════════════════════════════════════════════════════════════════
     {
         "id": "c1", "panel": 2,
-        "name": "C1 - The AI Factory: Threat Pattern Correlation",
-        "desc": "MADlib finds behavioral clusters → pgvector finds semantic patterns → BOTH detect SAME threat types in ONE query!",
-        "sql": """WITH
--- MADlib: Behavioral threat patterns - auto-detect which cluster is which
-cluster_stats AS (
+        "name": "C1 - The AI Factory: Fraud Pattern Correlation",
+        "desc": "MADlib finds behavioural clusters \u2192 pgvector finds semantic patterns \u2192 BOTH detect the SAME fraud types in ONE query!",
+        "sql": """WITH cluster_stats AS (
     SELECT
         a.cluster_id,
-        COUNT(*) as ips_found,
-        ROUND(AVG(f.avg_unique_ports), 0) as avg_ports,
-        ROUND(AVG(f.total_bytes)::numeric / 1e9, 2) as avg_gb,
-        ROUND(AVG(f.avg_byte_cv)::numeric, 4) as avg_cv
-    FROM netvista_demo.kmeans_assignments a
-    JOIN netvista_demo.netflow_features_agg f ON a.src_ip = f.src_ip
-    WHERE a.cluster_id != 0  -- Exclude normal cluster
+        COUNT(*) AS accts,
+        ROUND(AVG(f.distinct_merchants), 0)     AS avg_merchants,
+        ROUND(AVG(f.total_amount)::numeric, 2)  AS avg_spend,
+        ROUND(AVG(f.amount_cv)::numeric, 4)     AS avg_cv
+    FROM bfsi_demo.kmeans_assignments a
+    JOIN bfsi_demo.account_features f ON a.account_id = f.account_id
     GROUP BY a.cluster_id
 ),
 madlib_patterns AS (
     SELECT
         CASE
-            -- RECON: cluster with highest avg ports
-            WHEN avg_ports = (SELECT MAX(avg_ports) FROM cluster_stats) THEN '🔍 RECON'
-            -- EXFIL: cluster with highest avg bytes
-            WHEN avg_gb = (SELECT MAX(avg_gb) FROM cluster_stats) THEN '📤 EXFIL'
-            -- C2: largest remaining cluster (most IPs)
-            WHEN ips_found = (
-                SELECT MAX(ips_found) FROM cluster_stats
-                WHERE avg_ports != (SELECT MAX(avg_ports) FROM cluster_stats)
-                AND avg_gb != (SELECT MAX(avg_gb) FROM cluster_stats)
-            ) THEN '🤖 C2'
-        END as threat_type,
-        ips_found,
-        avg_ports,
-        avg_gb,
-        avg_cv,
-        'MADlib K-Means unsupervised clustering' as detection_method
+            WHEN avg_cv < 0.1          THEN '\U0001f916 STRUCTURING'
+            WHEN avg_merchants > 50    THEN '\U0001f50d CARD-TESTING'
+            WHEN avg_spend > 100000    THEN '\U0001f4e4 BUST-OUT'
+        END AS fraud_type,
+        accts, avg_merchants, avg_spend, avg_cv
     FROM cluster_stats
-    WHERE CASE
-            WHEN avg_ports = (SELECT MAX(avg_ports) FROM cluster_stats) THEN 1
-            WHEN avg_gb = (SELECT MAX(avg_gb) FROM cluster_stats) THEN 1
-            WHEN ips_found = (
-                SELECT MAX(ips_found) FROM cluster_stats
-                WHERE avg_ports != (SELECT MAX(avg_ports) FROM cluster_stats)
-                AND avg_gb != (SELECT MAX(avg_gb) FROM cluster_stats)
-            ) THEN 1
-            ELSE 0
-        END = 1
 ),
--- pgvector: Semantic threat patterns from syslog embeddings
 pgvector_patterns AS (
     SELECT
         CASE
-            WHEN persona = 'recon' THEN '🔍 RECON'
-            WHEN persona = 'exfil' THEN '📤 EXFIL'
-            WHEN persona = 'c2' THEN '🤖 C2'
-        END as threat_type,
-        COUNT(*) as logs_found,
-        string_agg(DISTINCT program, ', ') as programs_seen,
-        COUNT(DISTINCT src_ip) as unique_ips,
-        'pgvector semantic similarity search' as detection_method
-    FROM netvista_demo.syslog_embeddings
-    WHERE persona IN ('recon', 'exfil', 'c2')
+            WHEN persona = 'card_testing' THEN '\U0001f50d CARD-TESTING'
+            WHEN persona = 'bust_out'     THEN '\U0001f4e4 BUST-OUT'
+            WHEN persona = 'structuring'  THEN '\U0001f916 STRUCTURING'
+        END AS fraud_type,
+        COUNT(*)                       AS notes,
+        COUNT(DISTINCT account_id)     AS accounts,
+        string_agg(DISTINCT queue, ', ') AS queues_seen
+    FROM bfsi_demo.case_embeddings
+    WHERE persona IN ('card_testing', 'bust_out', 'structuring')
     GROUP BY persona
-),
--- Sample logs for each threat type (prioritize actual threat programs and keywords)
-sample_logs AS (
-    SELECT
-        CASE
-            WHEN persona = 'recon' THEN '🔍 RECON'
-            WHEN persona = 'exfil' THEN '📤 EXFIL'
-            WHEN persona = 'c2' THEN '🤖 C2'
-        END as threat_type,
-        src_ip::text as example_ip,
-        program,
-        LEFT(message, 60) as example_message,
-        ROW_NUMBER() OVER (
-            PARTITION BY persona
-            ORDER BY
-                CASE
-                    -- RECON: prioritize firewall/IDS logs
-                    WHEN persona = 'recon' AND program IN ('firewalld', 'snort', 'iptables') THEN 1
-                    -- EXFIL: prioritize data transfer tools with transfer keywords (exclude ntpd!)
-                    WHEN persona = 'exfil' AND program IN ('rsync', 'rclone', 'backup-svc', 'openvpn')
-                         AND (message ILIKE '%transfer%' OR message ILIKE '%archive%' OR message ILIKE '%backup%' OR message ILIKE '%export%') THEN 1
-                    WHEN persona = 'exfil' AND program = 'audit' AND message ILIKE '%backup%' THEN 2
-                    WHEN persona = 'exfil' AND program = 'curl' AND message ILIKE '%upload%' THEN 2
-                    -- C2: prioritize beacon tools
-                    WHEN persona = 'c2' AND program IN ('beacon', 'svchost') THEN 1
-                    WHEN persona = 'c2' AND program = 'cron' AND message ILIKE '%heartbeat%' THEN 2
-                    -- Exclude ntpd and generic cron from exfil
-                    WHEN persona = 'exfil' AND program IN ('ntpd', 'systemd', 'kernel') THEN 99
-                    ELSE 50
-                END,
-                random()
-        ) as rn
-    FROM netvista_demo.syslog_embeddings
-    WHERE persona IN ('recon', 'exfil', 'c2')
 )
--- Combine: MADlib behavioral + pgvector semantic for each threat type
 SELECT
-    mp.threat_type,
-    mp.ips_found::text || ' IPs (MADlib)' as behavioral_evidence,
-    mp.avg_ports::text || ' avg ports' as behavior_metric_1,
-    mp.avg_gb::text || ' GB avg' as behavior_metric_2,
-    pv.logs_found::text || ' logs (pgvector)' as semantic_evidence,
-    pv.programs_seen as semantic_programs,
-    CASE
-        -- If sample exists and is good, use it
-        WHEN sl.example_message IS NOT NULL AND sl.program NOT IN ('ntpd', 'systemd') THEN sl.example_message
-        -- Otherwise provide a descriptive fallback
-        WHEN mp.threat_type = '📤 EXFIL' THEN 'Large data transfers detected (32+ TB average bytes)'
-        WHEN mp.threat_type = '🔍 RECON' THEN 'Port scanning activity detected'
-        WHEN mp.threat_type = '🤖 C2' THEN 'Beaconing behavior detected'
-        ELSE 'Anomalous behavior detected'
-    END as sample_threat_log
+    mp.fraud_type,
+    mp.accts::text || ' accounts (MADlib)'      AS behavioral_evidence,
+    mp.avg_merchants::text || ' avg merchants'  AS behavior_metric_1,
+    '$' || mp.avg_spend::text || ' avg spend'   AS behavior_metric_2,
+    pv.notes::text || ' notes (pgvector)'       AS semantic_evidence,
+    pv.queues_seen                              AS semantic_queues
 FROM madlib_patterns mp
-JOIN pgvector_patterns pv ON mp.threat_type = pv.threat_type
-LEFT JOIN sample_logs sl ON mp.threat_type = sl.threat_type AND sl.rn = 1
-ORDER BY mp.ips_found DESC"""
+JOIN pgvector_patterns pv ON mp.fraud_type = pv.fraud_type
+WHERE mp.fraud_type IS NOT NULL
+ORDER BY mp.accts DESC"""
     },
     {
         "id": "c2", "panel": 2,
         "name": "C2 - Why This Matters",
-        "desc": "In traditional warehouses: export → train → join (hours). Here: ONE SQL query (<5 sec)",
+        "desc": "In traditional warehouses: export \u2192 train \u2192 join (hours). Here: ONE SQL query (<5 sec)",
         "sql": """SELECT
     'Traditional Warehouse (Snowflake/BigQuery)' AS approach,
-    'Export 16M rows → Python → train model → upload results → JOIN' AS workflow,
+    'Export 13M rows \u2192 Python \u2192 train model \u2192 upload results \u2192 JOIN' AS workflow,
     '2-4 hours' AS time,
     'Requires data movement, external tools, model versioning' AS complexity
 UNION ALL
@@ -323,8 +243,8 @@ SELECT
 ]
 
 PANELS = [
-    {"name": "pgvector",    "icon": "A", "desc": "Semantic search finds threats by MEANING, not keywords"},
-    {"name": "MADlib",      "icon": "B", "desc": "Unsupervised clustering discovers 4 personas automatically"},
+    {"name": "pgvector",    "icon": "A", "desc": "Semantic search finds fraud by MEANING, not keywords"},
+    {"name": "MADlib",      "icon": "B", "desc": "Unsupervised clustering discovers fraud personas automatically"},
     {"name": "AI Factory",  "icon": "C", "desc": "Combine both in ONE query — impossible in traditional warehouses"},
 ]
 
@@ -515,7 +435,7 @@ tr:last-child td{border-bottom:none}
     </svg>
     <div>
       <h1>WarehousePG <span>AI Analytics</span></h1>
-      <div class="hdr-sub">Lab 3 — pgvector + MADlib + AI Factory · Jan–Apr 2026</div>
+      <div class="hdr-sub">Lab 3 — pgvector + MADlib + AI Factory · Meridian Bank · last 28 days</div>
     </div>
   </div>
   <div class="hdr-right">
@@ -543,9 +463,9 @@ tr:last-child td{border-bottom:none}
       <span class="n">Q</span><h2>SQL Editor</h2>
       <div class="d">Run any SELECT against the live dataset</div>
     </div>
-    <textarea class="sqled" id="sqlin" spellcheck="false">SELECT event_id, hostname, program,
-    LEFT(message, 80) AS message, severity
-FROM netvista_demo.syslog_embeddings
+    <textarea class="sqled" id="sqlin" spellcheck="false">SELECT note_id, account_id, queue,
+    LEFT(narrative, 80) AS narrative, persona, severity
+FROM bfsi_demo.case_embeddings
 LIMIT 20;</textarea>
     <button class="runbtn" onclick="runSQL()">▶ Run Query</button>
     <span id="sqlt" style="margin-left:12px"></span>

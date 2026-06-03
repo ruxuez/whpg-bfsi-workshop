@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-NetVista × EDB WarehousePG — Network Analytics Demo (Workshop Edition)
+Meridian Retail Bank × EDB WarehousePG — Card-Fraud & AML Demo (Workshop Edition)
 TRIMMED: 7 queries across 3 panels (was 12/4) — paced for a 45-min lab slot.
 
 What changed vs the original:
@@ -12,7 +12,7 @@ What changed vs the original:
 
 SETUP:
     pip3 install flask psycopg2-binary
-    export WHPG_HOST=localhost WHPG_PORT=5432 WHPG_DB=gpadmin WHPG_USER=gpadmin
+    export WHPG_HOST=localhost WHPG_PORT=5432 WHPG_DB=bank WHPG_USER=gpadmin
     python3 app.py
 
 Then:  ssh -L 5001:localhost:5001 ec2-user@<ec2-ip>  →  http://localhost:5001
@@ -28,23 +28,23 @@ app = Flask(__name__)
 DB = {
     "host":     os.environ.get("WHPG_HOST", "localhost"),
     "port":     int(os.environ.get("WHPG_PORT", 5432)),
-    "dbname":   os.environ.get("WHPG_DB",   "demo"),
+    "dbname":   os.environ.get("WHPG_DB",   "bank"),
     "user":     os.environ.get("WHPG_USER", "gpadmin"),
     "password": os.environ.get("WHPG_PASS", ""),
 }
 
 # Schema where the workshop tables live. Override with WHPG_SCHEMA=...
 # if the lab loaded into a different schema name.
-SCHEMA = os.environ.get("WHPG_SCHEMA", "netvista_demo")
+SCHEMA = os.environ.get("WHPG_SCHEMA", "bfsi_demo")
 
 # ── Reload scripts (in order) ───────────────────────────────────────────────
 WORKSHOP_DIR = os.environ.get("WORKSHOP_DIR", "/scripts/sql/")
 RELOAD_SCRIPTS = [
-    ("01_schema.sql",            "Drop & recreate schema"),
-    ("02_seed_reference.sql",    "Seed reference tables"),
-    ("03_load_external.sql",     "Seed traffic data (~50M rows, Jan-Apr 2026)"),
-    ("06_ai_analytics.sql",      "Build AI / pgvector analytics"),
-    ("07_kmeans_fallback.sql",   "K-Means assignments (MADlib or SQL fallback)"),
+    ("01_schema.sql",                      "Drop & recreate BFSI schema"),
+    ("02_seed_reference.sql",              "Seed reference tables (BINs, watchlists, country risk)"),
+    ("03_seed_traffic_with_personas.sql",  "Seed transactions (~13M rows, last 28 days) + personas"),
+    ("06_lab3_ai_analytics.sql",           "Build AI / pgvector analytics"),
+    ("07_kmeans_fallback.sql",             "K-Means assignments (MADlib or SQL fallback)"),
 ]
 
 
@@ -117,128 +117,140 @@ def diagnose_schema():
 
 # ── 7 curated queries (trimmed from 12) ──────────────────────────────────────
 QUERIES = [
-    # ── Panel 1: Network Traffic ─────────────────────────────────────────────
+    # ── Panel 1: Card Transactions ───────────────────────────────────────────
     {
         "id": "1a", "panel": 0,
-        "name": "1A · Threat Intel Match",
-        "desc": "Native inet <<= join — 6 LOC vs 52 on Snowflake",
-        "sql": """SELECT n.src_ip::text, t.feed_name, t.category, t.confidence,
-    COUNT(*) AS hit_count, SUM(n.bytes) AS total_bytes,
-    MIN(n.ts) AS first_seen, MAX(n.ts) AS last_seen
-FROM netflow_logs n
-JOIN threat_intel_feeds t ON n.src_ip <<= t.ip_range
-WHERE n.ts BETWEEN '2026-04-01' AND '2026-04-23 23:59:59'
-  AND t.active = TRUE AND t.confidence >= 80
+        "name": "1A \u00b7 Watchlist BIN Match",
+        "desc": "Expand watchlist int8range bands \u2192 equality hash join (no nested-loop GiST probe per row)",
+        "sql": """WITH watch_bins AS (
+    SELECT w.feed_name, w.category, w.confidence,
+           generate_series(lower(w.bin_range), upper(w.bin_range) - 1) AS card_bin
+    FROM fraud_watchlists w
+    WHERE w.active = TRUE
+      AND w.confidence >= 80
+      AND w.bin_range IS NOT NULL
+      AND NOT isempty(w.bin_range)
+)
+SELECT t.card_bin, wb.feed_name, wb.category, wb.confidence,
+    COUNT(*) AS hit_count, ROUND(SUM(t.amount),2) AS total_amount,
+    MIN(t.ts) AS first_seen, MAX(t.ts) AS last_seen
+FROM transactions t
+JOIN watch_bins wb ON t.card_bin = wb.card_bin
+WHERE t.ts >= '2026-06-01'::timestamp
 GROUP BY 1, 2, 3, 4
 ORDER BY hit_count DESC LIMIT 20"""
     },
     {
         "id": "1c", "panel": 0,
-        "name": "1C · Top Talkers by Subnet",
-        "desc": "Dynamic /24 grouping with set_masklen() — impossible on Snowflake",
-        "sql": """SELECT network(set_masklen(src_ip, 24)) AS src_subnet,
-    COUNT(*) AS flows, SUM(bytes) AS total_bytes,
-    COUNT(DISTINCT dst_ip) AS unique_destinations
-FROM netflow_logs WHERE ts BETWEEN '2026-04-01' AND '2026-04-23 23:59:59'
-GROUP BY 1 ORDER BY total_bytes DESC LIMIT 15"""
+        "name": "1C \u00b7 High-Value Instant Payments (JSONB + GIN)",
+        "desc": "ISO 20022 message filter via @> + jsonpath @? \u2014 hits the GIN index, impossible on VARIANT",
+        "sql": """SELECT t.account_id, t.amount,
+    COALESCE(t.iso_msg #>> '{Cdtr,CtryOfRes}', t.beneficiary_country) AS bene_ctry,
+    t.iso_msg #>> '{PmtTpInf,SvcLvl,Cd}'   AS svc_level,
+    t.iso_msg #>> '{PmtTpInf,LclInstrm,Cd}' AS local_instr
+FROM transactions t
+WHERE t.iso_msg @> '{"PmtTpInf":{"SvcLvl":{"Cd":"SEPA"},"LclInstrm":{"Cd":"INST"}}}'
+  AND t.iso_msg @? '$.IntrBkSttlmAmt ? (@.value > 9000)'
+  AND t.ts >= '2026-06-01'::timestamp
+ORDER BY t.amount DESC LIMIT 20"""
     },
 
-    # ── Panel 2: Log Analytics ────────────────────────────────────────────────
+    # ── Panel 2: Case & Auth Analytics ───────────────────────────────────────
     {
         "id": "2a", "panel": 1,
-        "name": "2A · Cross-Source Correlation",
-        "desc": "syslog + firewall + DNS in one query — replaces Splunk",
-        "sql": """SELECT s.ts AS event_time, s.src_ip::text, s.hostname, s.program,
-    LEFT(s.message, 80) AS syslog_msg,
-    f.action AS fw_action, f.dst_port AS fw_port,
-    d.query_name AS dns_query, d.response_code AS dns_rcode
-FROM syslog_events s
-JOIN firewall_logs f ON s.src_ip = f.src_ip
-    AND f.ts BETWEEN s.ts - interval '5 seconds' AND s.ts + interval '5 seconds'
-LEFT JOIN dns_logs d ON s.src_ip = d.client_ip
-    AND d.ts BETWEEN s.ts - interval '10 seconds' AND s.ts + interval '10 seconds'
-WHERE s.severity <= 2 AND s.ts BETWEEN '2026-04-01' AND '2026-04-23 23:59:59'
-ORDER BY s.ts DESC LIMIT 30"""
+        "name": "2A \u00b7 Case \u00d7 Auth Correlation",
+        "desc": "Join case narratives to same-day authorization declines \u2014 replaces a SIEM",
+        "sql": """SELECT c.account_id, c.queue, c.severity,
+    LEFT(c.narrative, 80) AS case_note,
+    COUNT(*) FILTER (WHERE a.decision = 'DECLINE') AS declines_same_day,
+    COUNT(*) FILTER (WHERE a.decision = 'STEP_UP') AS step_ups_same_day
+FROM case_narratives c
+JOIN auth_decisions a ON a.account_id = c.account_id
+    AND a.ts::date = c.ts::date
+    AND a.card_bin = c.card_bin
+WHERE c.ts >= '2026-06-01'::timestamp
+GROUP BY 1, 2, 3, 4
+ORDER BY declines_same_day DESC LIMIT 30"""
     },
     {
         "id": "2c", "panel": 1,
-        "name": "2C · Log Volume Dashboard",
-        "desc": "All 5 sources — $2M+ Splunk savings",
-        "sql": """SELECT 'netflow' AS source, COUNT(*) AS events
-    FROM netflow_logs WHERE ts BETWEEN '2026-04-01' AND '2026-04-23 23:59:59'
-UNION ALL SELECT 'dns', COUNT(*)
-    FROM dns_logs WHERE ts BETWEEN '2026-04-01' AND '2026-04-23 23:59:59'
-UNION ALL SELECT 'firewall', COUNT(*)
-    FROM firewall_logs WHERE ts BETWEEN '2026-04-01' AND '2026-04-23 23:59:59'
-UNION ALL SELECT 'syslog', COUNT(*)
-    FROM syslog_events WHERE ts BETWEEN '2026-04-01' AND '2026-04-23 23:59:59'
-UNION ALL SELECT 'bgp', COUNT(*)
-    FROM bgp_events WHERE ts BETWEEN '2026-04-01' AND '2026-04-23 23:59:59'
+        "name": "2C \u00b7 Event Volume Dashboard",
+        "desc": "All 5 fact sources in one UNION \u2014 one engine, no Splunk",
+        "sql": """SELECT 'transactions' AS source, COUNT(*) AS events
+    FROM transactions WHERE ts >= '2026-06-01'::timestamp
+UNION ALL SELECT 'device_events', COUNT(*)
+    FROM device_events WHERE ts >= '2026-06-01'::timestamp
+UNION ALL SELECT 'auth_decisions', COUNT(*)
+    FROM auth_decisions WHERE ts >= '2026-06-01'::timestamp
+UNION ALL SELECT 'case_narratives', COUNT(*)
+    FROM case_narratives WHERE ts >= '2026-06-01'::timestamp
+UNION ALL SELECT 'wire_events', COUNT(*)
+    FROM wire_events WHERE ts >= '2026-06-01'::timestamp
 ORDER BY events DESC"""
     },
 
-    # ── Panel 3: IPAM, SLA & Forensic Bonus ──────────────────────────────────
+    # ── Panel 3: BIN Inventory, Limits & Forensic Bonus ──────────────────────
     {
         "id": "3c", "panel": 2,
-        "name": "3C · QoE Scorecard",
-        "desc": "Per-customer quality scoring — worst-first for churn prevention",
-        "sql": """SELECT c.customer_name, c.tier, r.region_code,
-    ROUND(AVG(m.latency_ms), 1) AS avg_latency,
-    ROUND(AVG(m.jitter_ms), 1) AS avg_jitter,
-    ROUND(AVG(m.packet_loss_pct), 2) AS avg_loss,
-    ROUND(AVG(m.mos_score), 1) AS avg_mos,
-    netvista_demo.calc_qoe_score(AVG(m.latency_ms), AVG(m.jitter_ms), AVG(m.packet_loss_pct)) AS qoe_score,
-    sc.latency_sla_ms
+        "name": "3C \u00b7 Customer Risk Scorecard",
+        "desc": "Per-customer risk scoring via fraud_risk_score() \u2014 worst-first for review",
+        "sql": """SELECT c.customer_name, c.segment, r.region_code,
+    ROUND(AVG(k.decline_rate_pct), 2) AS avg_decline_pct,
+    ROUND(AVG(k.fraud_bps), 1)        AS avg_fraud_bps,
+    ROUND(AVG(k.txn_velocity), 1)     AS avg_velocity,
+    ROUND(fraud_risk_score(AVG(k.avg_ticket), AVG(k.decline_rate_pct), AVG(k.fraud_bps)), 1) AS risk_score,
+    rp.max_decline_rate
 FROM customers c
-JOIN sla_contracts sc ON c.customer_id = sc.customer_id AND sc.effective_to IS NULL
+JOIN risk_profiles rp ON c.customer_id = rp.customer_id AND rp.effective_to IS NULL
 JOIN regions r ON c.region_id = r.region_id
-JOIN network_metrics m ON c.customer_id = m.customer_id AND m.ts BETWEEN '2026-04-01' AND '2026-04-23 23:59:59'
-GROUP BY 1, 2, 3, 9
-ORDER BY qoe_score ASC"""
+JOIN account_kpis k ON c.customer_id = k.customer_id AND k.ts >= '2026-06-01'::timestamp
+GROUP BY 1, 2, 3, 8
+ORDER BY risk_score DESC"""
     },
     {
         "id": "4b", "panel": 2,
-        "name": "★ BONUS · Forensic IP Trace",
-        "desc": "Trace 185.220.101.34 across ALL log sources in one query",
+        "name": "\u2605 BONUS \u00b7 Forensic Account Trace",
+        "desc": "Trace account 105900001 across transactions, auth, device & wires in one query",
         "sql": """SELECT * FROM (
-    (SELECT 'netflow' AS source, ts, 'src→' || host(dst_ip) || ':' || dst_port AS detail, bytes::text AS extra
-        FROM netflow_logs WHERE src_ip = '185.220.101.34'::inet AND ts BETWEEN '2026-04-01' AND '2026-04-23 23:59:59'
+    (SELECT 'transaction' AS source, ts,
+        'amt ' || amount || ' ' || merchant_country AS detail, channel AS extra
+        FROM transactions WHERE account_id = 105900001 AND ts >= '2026-06-01'::timestamp
         ORDER BY ts DESC LIMIT 15)
     UNION ALL
-    (SELECT 'firewall', ts, action || ' ' || host(dst_ip) || ':' || dst_port, zone_src || '→' || zone_dst
-        FROM firewall_logs WHERE src_ip = '185.220.101.34'::inet AND ts BETWEEN '2026-04-01' AND '2026-04-23 23:59:59'
+    (SELECT 'auth', ts, decision || ' mcc ' || mcc, channel
+        FROM auth_decisions WHERE account_id = 105900001 AND ts >= '2026-06-01'::timestamp
         ORDER BY ts DESC LIMIT 15)
     UNION ALL
-    (SELECT 'dns', ts, query_name || ' (' || query_type || ')', response_code
-        FROM dns_logs WHERE client_ip = '185.220.101.34'::inet AND ts BETWEEN '2026-04-01' AND '2026-04-23 23:59:59'
+    (SELECT 'device', ts, event_type || ' ' || result, channel
+        FROM device_events WHERE account_id = 105900001 AND ts >= '2026-06-01'::timestamp
         ORDER BY ts DESC LIMIT 15)
     UNION ALL
-    (SELECT 'syslog', ts, LEFT(message, 80), hostname
-        FROM syslog_events WHERE src_ip = '185.220.101.34'::inet AND ts BETWEEN '2026-04-01' AND '2026-04-23 23:59:59'
+    (SELECT 'wire', ts, event_type || ' ' || amount || ' ' || beneficiary_country, rail
+        FROM wire_events WHERE ordering_account = 105900001 AND ts >= '2026-06-01'::timestamp
         ORDER BY ts DESC LIMIT 15)
 ) forensic ORDER BY ts DESC LIMIT 40"""
     },
 ]
 
 PANELS = [
-    {"name": "Network Traffic", "icon": "1", "desc": "Native inet operators on 31M+ netflow rows"},
-    {"name": "Log Analytics",   "icon": "2", "desc": "Cross-source correlation — replace Splunk"},
-    {"name": "IPAM/SLA + Forensic Bonus", "icon": "3", "desc": "Customer QoE scoring + multi-source IP trace"},
+    {"name": "Card Transactions", "icon": "1", "desc": "Native JSONB & int8range operators on 31M+ transaction rows"},
+    {"name": "Case & Auth Analytics", "icon": "2", "desc": "Cross-source correlation \u2014 replace your SIEM"},
+    {"name": "BIN Inventory, Limits + Forensic Bonus", "icon": "3", "desc": "Customer risk scoring + multi-source account trace"},
 ]
 
-# ── Comprehension check questions (rendered as a tab in the dashboard) ──────
+# \u2500\u2500 Comprehension check questions (rendered as a tab in the dashboard) \u2500\u2500
 CHECK_QUESTIONS = [
     {
         "kind": "concept",
-        "title": "Why was src_ip <<= ip_range fast on 33M flows?",
-        "ask": "You ran the threat-intel join in roughly 1 second. Name three things that made that fast — that wouldn't be true on single-node Postgres or on Snowflake.",
-        "listen": "Native inet/cidr type (no string parsing) · MPP parallelism across all segments · no UDF overhead — the operator is built into the planner",
+        "title": "Why was card_bin <@ bin_range fast on 33M transactions?",
+        "ask": "You ran the watchlist join in roughly 1 second. Name three things that made that fast \u2014 that wouldn't be true on single-node Postgres or on Snowflake.",
+        "listen": "Native int8range type with a GiST index (no string parsing) \u00b7 MPP parallelism across all segments \u00b7 no UDF overhead \u2014 the containment operator is built into the planner",
     },
     {
         "kind": "practical",
-        "title": "If we changed netflow_logs' distribution key…",
-        "ask": "Today netflow_logs is DISTRIBUTED BY (region_id). If we re-distributed it by src_ip instead, which Lab 1 query gets faster, and which gets slower?",
-        "listen": "Faster: 1A threat-intel join — rows now co-located by src_ip, no Motion needed. Slower: 1C top talkers by subnet — the GROUP BY no longer aligns with distribution, forcing a Redistribute.",
+        "title": "If we changed transactions' distribution key\u2026",
+        "ask": "Today transactions is DISTRIBUTED BY (region_id). If we re-distributed it by card_bin instead, which Lab 1 query gets faster, and which gets slower?",
+        "listen": "Faster: 1A watchlist join \u2014 rows now co-located by card_bin, no Motion needed. Slower: any region rollup \u2014 the GROUP BY no longer aligns with distribution, forcing a Redistribute.",
     },
 ]
 
@@ -301,7 +313,7 @@ def index():
 HTML = r"""<!DOCTYPE html>
 <html lang="en"><head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>NetVista × WarehousePG</title>
+<title>Meridian Bank × WarehousePG</title>
 <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 256 256'%3E%3Cg transform='translate(-862,18)'%3E%3Cpath fill='%232a9993' d='M1060.7,2.12c-30.98,2.37-56.03,27.09-58.74,58.06-2.88,33.35,19.98,61.96,50.96,68.22v61.62c0,2.54-2.03,4.4-4.4,4.4h-16.76c-2.54,0-4.4-2.03-4.4-4.4v-44.35c0-7.28-5.92-13.37-13.37-13.37h-49.94c-7.28,0-13.37,5.92-13.37,13.37v44.35c0,2.54-2.03,4.4-4.4,4.4h-16.76c-2.37,0-4.4-2.03-4.4-4.4v-97.17l73.47-73.47c1.69-1.69,1.69-4.57,0-6.26l-11.85-11.85c-1.69-1.69-4.57-1.69-6.26,0l-125.27,125.27c-1.69,1.69-1.69,4.57,0,6.26l11.85,11.85c1.69,1.69,4.57,1.69,6.26,0l26.07-26.24v88.37c0,7.28,5.92,13.37,13.37,13.37h50.11c7.28,0,13.37-5.92,13.37-13.37v-44.35c0-2.54,2.03-4.4,4.4-4.4h16.76c2.37,0,4.4,2.03,4.4,4.4v44.35c0,7.28,5.92,13.37,13.37,13.37h50.11c7.28,0,13.37-5.92,13.37-13.37v-98.19c0-2.54-2.03-4.4-4.4-4.4h-7.45c-20.99,0-38.77-16.59-39.27-37.58-.51-21.67,17.44-39.61,39.11-39.1,20.99.34,37.58,18.28,37.58,39.27v123.41c0,2.54,2.03,4.4,4.4,4.4h16.76c2.54,0,4.4-2.03,4.4-4.4v-124.26c-.17-36.9-31.49-66.53-69.07-63.82Z'/%3E%3Ccircle fill='%232a9993' cx='1065.61' cy='65.94' r='12.7'/%3E%3C/g%3E%3C/svg%3E">
 <style>
 :root{
@@ -460,8 +472,8 @@ tr:last-child td{border-bottom:none}
       </g>
     </svg>
     <div>
-      <h1>WarehousePG <span>Network Analytics</span></h1>
-      <div class="hdr-sub">NetVista × EDB — Live on WHPG · ~50M rows · Jan–Apr 2026</div>
+      <h1>WarehousePG <span>Fraud & AML Analytics</span></h1>
+      <div class="hdr-sub">Meridian Retail Bank × EDB — Live on WHPG · ~50M rows · last 28 days</div>
     </div>
   </div>
   <div class="hdr-right">
@@ -473,9 +485,9 @@ tr:last-child td{border-bottom:none}
 
 <!-- TABS -->
 <div class="tabs" id="tabs">
-  <button class="tab on" onclick="switchTab(0)">Network Traffic</button>
-  <button class="tab"    onclick="switchTab(1)">Log Analytics</button>
-  <button class="tab"    onclick="switchTab(2)">IPAM/SLA + Bonus</button>
+  <button class="tab on" onclick="switchTab(0)">Card Transactions</button>
+  <button class="tab"    onclick="switchTab(1)">Case & Auth Analytics</button>
+  <button class="tab"    onclick="switchTab(2)">BIN, Limits + Bonus</button>
   <button class="tab check-tab" onclick="switchTab(3)">✓ Check Understanding</button>
   <button class="tab"    onclick="switchTab(4)" style="margin-left:4px;border-color:rgba(167,139,250,.3);color:var(--purple)">SQL Editor</button>
 </div>
@@ -506,7 +518,7 @@ SELECT
     CASE WHEN c.relkind = 'p' THEN 'Partitioned Root' ELSE 'Standard Table' END as type
 FROM pg_class c
 JOIN pg_namespace n ON n.oid = c.relnamespace
-WHERE n.nspname = 'netvista_demo'
+WHERE n.nspname = 'bfsi_demo'
   AND c.relkind IN ('r', 'p')
   AND c.relispartition = false;
   </textarea>
@@ -689,7 +701,7 @@ async function runSQL(){
 
 // ── Row count ──────────────────────────────────────────────────────────────
 fetch('/api/sql',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sql:
-  "SELECT SUM(c)::bigint AS total FROM (SELECT COUNT(*) AS c FROM netflow_logs WHERE ts BETWEEN '2026-04-01' AND '2026-04-23 23:59:59' UNION ALL SELECT COUNT(*) FROM dns_logs WHERE ts BETWEEN '2026-04-01' AND '2026-04-23 23:59:59' UNION ALL SELECT COUNT(*) FROM firewall_logs WHERE ts BETWEEN '2026-04-01' AND '2026-04-23 23:59:59' UNION ALL SELECT COUNT(*) FROM syslog_events WHERE ts BETWEEN '2026-04-01' AND '2026-04-23 23:59:59' UNION ALL SELECT COUNT(*) FROM bgp_events WHERE ts BETWEEN '2026-04-01' AND '2026-04-23 23:59:59' UNION ALL SELECT COUNT(*) FROM network_metrics) x"
+  "SELECT SUM(c)::bigint AS total FROM (SELECT COUNT(*) AS c FROM transactions WHERE ts >= '2026-06-01'::timestamp UNION ALL SELECT COUNT(*) FROM device_events WHERE ts >= '2026-06-01'::timestamp UNION ALL SELECT COUNT(*) FROM auth_decisions WHERE ts >= '2026-06-01'::timestamp UNION ALL SELECT COUNT(*) FROM case_narratives WHERE ts >= '2026-06-01'::timestamp UNION ALL SELECT COUNT(*) FROM wire_events WHERE ts >= '2026-06-01'::timestamp) x"
 })}).then(r=>r.json()).then(d=>{
   const t = d.data?.[0]?.total;
   if(t){ document.getElementById('ttl').textContent = fmt(t)+' rows'; document.getElementById('ftr').textContent = fmt(t)+' rows · 7 queries'; }
@@ -705,10 +717,10 @@ buildCheck();
 if __name__ == "__main__":
     print(f"""
 ╔══════════════════════════════════════════════════════╗
-║  NetVista × WarehousePG — Workshop Edition          ║
+║  Meridian Bank × WarehousePG — Fraud & AML        ║
 ║  DB: {DB['host']}:{DB['port']}/{DB['dbname']}
 ║  Queries: {len(QUERIES)} across {len(PANELS)} panels (trimmed)
-║  Data: Jan 1 – Apr 23 2026  (~50M rows)             ║
+║  Data: rolling last 28 days  (~13M rows)            ║
 ║  http://0.0.0.0:5001                                ║
 ╚══════════════════════════════════════════════════════╝
     """)

@@ -1,110 +1,113 @@
 #!/usr/bin/env python3
 """
-NetVista × WarehousePG — CSV Data Generator for External Table Loading
+Meridian Retail Bank × WarehousePG — CSV Data Generator (June 2026, ~50M rows)
 
-Generates CSV files for all 6 major fact tables that can be served via gpfdist
-and loaded through WHPG READABLE EXTERNAL TABLEs.
+Generates CSV files for the 6 major BFSI fact tables that can be served via
+gpfdist and loaded through WHPG READABLE EXTERNAL TABLEs. This is the bulk-load
+alternative to the in-database seed (03_seed_traffic_with_personas.sql); the
+column order matches 01_schema.sql (minus the auto-generated serial PK on each
+table, exactly like the original network generator).
 
 Usage:
-    python3 data_generator.py [--output-dir /path/to/csv] [--scale 1]
+    python3 data_generator_updated.py [--output-dir /path/to/csv] [--scale 1]
 
 Scale factor:
-    1 (default) → ~100M rows  (production demo)
-    0.1         → ~10M rows   (quick test)
-    0.01        → ~1M rows    (dev / smoke test)
+    1 (default) -> ~50M rows   (workshop dataset, June 2026)
+    2           -> ~100M rows  (stress)
+    0.1         -> ~5M rows    (quick test)
+    0.01        -> ~0.5M rows  (dev / smoke test)
 
-Output:
-    <output-dir>/netflow_logs.csv       (~33M rows at scale=1)
-    <output-dir>/dns_logs.csv           (~25M rows)
-    <output-dir>/firewall_logs.csv      (~22.5M rows)
-    <output-dir>/syslog_events.csv      (~15M rows)
-    <output-dir>/bgp_events.csv         (~1.5M rows)
-    <output-dir>/network_metrics.csv    (~150K rows)
+Output (no header row -- gpfdist CSV external tables don't expect one):
+    <output-dir>/transactions.csv      (~16.7M rows at scale=1)
+    <output-dir>/device_events.csv     (~13M rows)
+    <output-dir>/auth_decisions.csv    (~11.7M rows)
+    <output-dir>/case_narratives.csv   (~7.8M rows)
+    <output-dir>/wire_events.csv        (~0.8M rows)
+    <output-dir>/account_kpis.csv      (customers x hours)
 
 Then:
     gpfdist -d <output-dir> -p 8081 &
-    psql -f 03_load_external.sql
+    psql -f 03_load_external_bfsi.sql
 """
 
 import argparse
 import csv
+import json
 import math
 import os
 import random
-import sys
 from datetime import datetime, timedelta
 
-# ── Configuration ────────────────────────────────────────────────────────────
-INTERNAL_PREFIXES = [
-    "10.10", "10.20", "10.21", "10.22", "10.128", "10.129",
-    "172.16", "172.17", "172.20", "172.21",
-    "192.168", "10.200", "10.201", "10.50", "10.51",
-]
+# -- Persona pools (mirror 03_seed_traffic_with_personas.sql) -------------------
+# CARD-TESTING : small accounts, Visa BIN 41010100-199, tiny auth amounts
+# BUST-OUT     : tiny pool,      MC BIN 52020200-299,   high-value spend-up
+# STRUCTURING  : small pool,     BIN 53030300-399,      sub-$10k wires to BR/NG/RU
+CARD_TESTING_ACCT = (100900001, 39)
+BUST_OUT_ACCT     = (101900001, 29)
+STRUCTURING_ACCT  = (105900001, 39)
+NORMAL_ACCT       = (100000000, 50000)
 
-DST_PREFIXES = [
-    "10.10", "10.20", "10.128", "172.16", "172.17",
-    "192.168", "10.200", "10.50", "10.129", "172.20",
-]
+BICS        = ["CHASUS33", "BARCGB22", "DEUTDEFF", "BNPAFRPP"]
+CURRENCIES  = ["USD", "USD", "USD", "EUR", "GBP"]
+MCCS        = [5411, 5812, 5942, 5999, 6011, 4829, 7995, 5734, 4111, 5651]
+MERCHANTS   = ["Retail Merchant", "Corner Grocer", "Fuel Stop", "Online Bazaar",
+               "City Pharmacy", "Transit Authority", "Electronics Hub", "Cafe Central"]
+COUNTRIES   = ["US", "US", "US", "GB", "DE", "FR"]
+HIGH_RISK   = ["BR", "NG", "RU"]
+CHANNELS    = ["POS", "ECOM", "ATM"]
+DECISIONS   = ["APPROVE", "APPROVE", "APPROVE", "APPROVE", "DECLINE", "STEP_UP", "BLOCK"]
+QUEUES      = ["cards-fraud", "aml-tm", "disputes", "sanctions"]
+ANALYSTS    = ["a.okafor", "l.nguyen", "m.silva", "r.haddad", "t.olsen", "s.kapoor"]
+RESULTS     = ["OK", "OK", "OK", "FAIL", "STEP_UP"]
+EVENT_TYPES = ["login", "login", "payee_add", "new_device"]
+RAILS       = ["SWIFT", "SEPA", "ACH"]
 
-THREAT_IPS = [
-    "185.220.101.34", "91.219.236.222", "45.155.205.99",
-    "23.129.64.130", "104.244.76.13", "198.98.56.78",
-    "5.188.86.172", "209.141.33.21", "103.224.82.15",
-    "58.218.198.100", "222.186.42.7", "218.92.0.31",
-]
+NARRATIVES = {
+    "card_testing": [
+        "Repeated penny authorisations checking which card numbers are still live",
+        "Burst of small declines followed by one larger successful charge",
+        "Dozens of sub-dollar auth attempts across many unrelated merchants",
+    ],
+    "bust_out": [
+        "Newly raised limit consumed almost entirely within two days",
+        "Balance ramped to the ceiling on resaleable goods then account went dark",
+        "Sudden burst of big-value transactions exhausting available credit",
+    ],
+    "structuring": [
+        "Steady stream of payments each landing a few hundred below the reporting line",
+        "Dozens of similar-sized outbound wires to the same overseas counterparty",
+        "Just-below-limit disbursements suggesting deliberate threshold avoidance",
+    ],
+    "normal": [
+        "Routine dispute over a duplicate point-of-sale charge, refunded",
+        "Customer confirmed travel; temporary geo block lifted after verification",
+        "Standard chargeback for an undelivered online order, resolved",
+    ],
+}
 
-DST_PORTS = [
-    80, 443, 443, 443, 22, 53, 53, 8080, 3306, 5432, 8443, 25, 110,
-    143, 993, 389, 636, 3389, 8888, 9200, 9300, 5601, 6379, 27017,
-]
-
-DNS_INTERNAL = ["api", "portal", "mail", "vpn", "sso", "cdn", "static", "ws", "auth", "billing"]
-DNS_EXTERNAL = ["google.com", "youtube.com", "facebook.com", "microsoft.com", "apple.com",
-                "amazon.com", "twitter.com", "linkedin.com", "github.com", "stackoverflow.com"]
-DNS_CLOUD = ["s3.amazonaws.com", "blob.core.windows.net", "storage.googleapis.com",
-             "cdn.cloudflare.com", "fastly.net"]
-DNS_SAAS = ["zoom.us", "slack.com", "teams.microsoft.com", "webex.com", "office365.com",
-            "salesforce.com", "servicenow.com", "jira.atlassian.com"]
-DNS_BAD = ["evil.com", "malware.xyz", "exfil-data.evil.cc", "c2-callback.evil.com",
-           "drop.evil.net", "beacon.xyz", "payload.evil.org"]
-DNS_TYPES = ["A", "A", "A", "A", "AAAA", "AAAA", "MX", "MX", "CNAME", "TXT", "PTR"]
-DNS_RCODES = ["NOERROR", "NOERROR", "NOERROR", "NOERROR", "NOERROR",
-              "NOERROR", "NOERROR", "NXDOMAIN", "NXDOMAIN", "SERVFAIL"]
-
-FW_ACTIONS = ["ALLOW", "ALLOW", "ALLOW", "ALLOW", "ALLOW", "ALLOW", "DENY", "DENY", "DROP", "REJECT"]
-FW_ZONES_SRC = ["external", "internal", "dmz", "mgmt", "transit"]
-FW_ZONES_DST = ["internal", "external", "dmz", "mgmt", "transit"]
-
-SYSLOG_HOSTNAMES = [
-    "us-east-rtr-01", "us-east-fw-01", "us-east-sw-01", "us-west-rtr-01",
-    "us-west-fw-01", "eu-west-rtr-01", "eu-west-fw-01", "eu-east-rtr-01",
-    "jp-rtr-01", "jp-fw-01", "sg-rtr-01", "sg-fw-01", "br-rtr-01",
-]
-SYSLOG_PROGRAMS = [
-    "sshd", "pam_unix", "sudo", "kernel", "bgpd", "ospfd", "snmpd",
-    "nginx", "haproxy", "docker", "kubelet", "iptables", "postfix",
-    "named", "systemd", "conntrackd",
-]
-
-BGP_ORIGINS = ["IGP", "IGP", "IGP", "EGP", "INCOMPLETE"]
-
-NOW = datetime.now()
+# All data lives in JUNE 2026 (2026-06-01 00:00 .. 2026-07-01 00:00)
+WINDOW_START = datetime(2026, 6, 1)
+WINDOW_END   = datetime(2026, 7, 1)
+_WINDOW_SECS = (WINDOW_END - WINDOW_START).total_seconds()
 
 
-def rand_ip(prefixes):
-    p = random.choice(prefixes)
-    return f"{p}.{random.randint(1,254)}.{random.randint(1,254)}"
+def rand_ts(days_back=None):
+    """Random timestamp uniformly within June 2026."""
+    return (WINDOW_START + timedelta(seconds=random.random() * _WINDOW_SECS)).strftime("%Y-%m-%d %H:%M:%S.%f")[:23]
 
 
-def rand_ext_ip():
-    return f"{random.randint(1,222)}.{random.randint(0,255)}.{random.randint(0,255)}.{random.randint(1,254)}"
+def acct(pool):
+    base, span = pool
+    return base + random.randint(0, span)
 
 
-def rand_ts(days_back=7):
-    return (NOW - timedelta(seconds=random.random() * days_back * 86400)).strftime("%Y-%m-%d %H:%M:%S.%f")[:23]
+def pan4():
+    return f"{random.randint(0, 9999):04d}"
 
 
 def progress(label, current, total):
+    if total <= 0:
+        return
     if current % max(1, total // 20) == 0 or current == total:
         pct = current * 100 // total
         print(f"\r  {label}: {pct:3d}% ({current:,}/{total:,})", end="", flush=True)
@@ -112,303 +115,221 @@ def progress(label, current, total):
         print()
 
 
-# ── Generators ───────────────────────────────────────────────────────────────
-
-def gen_netflow(writer, count):
-    """Generate netflow_logs rows."""
-    # Base traffic
-    base = int(count * 0.947)  # ~30M of 31.68M
-    ddos = int(count * 0.047)  # ~1.5M
-    scan = int(count * 0.005)  # ~150K
-    exfil = count - base - ddos - scan  # ~30K
-
-    row_num = 0
-    total = count
-
-    # Base
-    for i in range(1, base + 1):
-        src = random.choice(THREAT_IPS) if random.random() < 0.15 else rand_ip(INTERNAL_PREFIXES)
-        dst = rand_ip(DST_PREFIXES) if random.random() < 0.6 else rand_ext_ip()
-        proto = 6 if random.random() < 0.70 else (17 if random.random() < 0.83 else 1)
-        byt = max(64, int(math.exp(random.random() * 7.5 + 5)))
-        pkt = max(1, int(math.exp(random.random() * 4.5 + 1.5)))
-        flags = random.choice([2, 2, 18, 16, 16, 16, 17, 24, 24, 25]) if random.random() < 0.7 else ""
-        dur = max(1, int(math.exp(random.random() * 6 + 2)))
-        writer.writerow([rand_ts(), src, dst, random.randint(1024, 65534), random.choice(DST_PORTS),
-                         proto, byt, pkt, flags, dur, "", "", "", "", "", random.randint(1, 7)])
-        row_num += 1
-        progress("netflow (base)", row_num, total)
-
-    # DDoS
-    ddos_start = NOW - timedelta(hours=18)
-    for i in range(ddos):
-        ts = (ddos_start + timedelta(seconds=random.random() * 7200)).strftime("%Y-%m-%d %H:%M:%S.%f")[:23]
-        src = f"{random.choice([31,45,62,77,89,103,118,141,156,178,185,191,203,211,223])}.{random.randint(0,255)}.{random.randint(0,255)}.{random.randint(1,254)}"
-        dst = random.choice(["10.20.1.100", "10.20.1.101", "10.20.1.102"])
-        writer.writerow([ts, src, dst, random.randint(1024, 65534), 80, 6,
-                         random.randint(40, 120), 1, 2, 0, "", "", "", "", "", 1])
-        row_num += 1
-        progress("netflow (ddos)", row_num, total)
-
-    # Port scan
-    scan_start = NOW - timedelta(hours=6)
-    scanners = ["45.155.205.99", "198.98.56.78", "222.186.42.7"]
-    for i in range(scan):
-        ts = (scan_start + timedelta(milliseconds=i * 15)).strftime("%Y-%m-%d %H:%M:%S.%f")[:23]
-        src = scanners[i % 3]
-        dst = f"10.10.1.{1 + (i % 254)}"
-        writer.writerow([ts, src, dst, random.randint(40000, 65000), 1 + (i % 65535), 6,
-                         44, 1, 2, 0, "", "", "", "", "", [3, 1, 2][i % 3]])
-        row_num += 1
-        progress("netflow (scan)", row_num, total)
-
-    # Exfil
-    for i in range(exfil):
-        ts = rand_ts(3)
-        src = f"10.20.1.{50 + random.randint(0, 10)}"
-        dst = random.choice(["103.224.82.15", "58.218.198.100"])
-        writer.writerow([ts, src, dst, random.randint(40000, 65000),
-                         random.choice([443, 8443, 53, 993]), 6,
-                         random.randint(1000000, 51000000), random.randint(1000, 51000),
-                         24, random.randint(30000, 330000), "", "", "", "", "", 1])
-        row_num += 1
-        progress("netflow (exfil)", row_num, total)
+def _iso_msg(svc, instr, value, ccy, cdtr_ctry, bic=None):
+    msg = {
+        "GrpHdr": {"MsgId": f"MSG{random.randint(1, 10**9)}", "SttlmInf": {"SttlmMtd": "CLRG"}},
+        "PmtTpInf": {"SvcLvl": {"Cd": svc}, "LclInstrm": {"Cd": instr}},
+        "IntrBkSttlmAmt": {"Ccy": ccy, "value": value},
+        "Dbtr": {"Nm": "Meridian Cardholder", "CtryOfRes": "US"},
+        "Cdtr": {"Nm": "Retail Merchant", "CtryOfRes": cdtr_ctry},
+        "RmtInf": {"Ustrd": "Card purchase"},
+    }
+    if bic:
+        msg["CdtrAgt"] = {"FinInstnId": {"BICFI": bic}}
+    return json.dumps(msg, separators=(",", ":"))
 
 
-def gen_dns(writer, count):
-    for i in range(1, count + 1):
-        client = rand_ip(DST_PREFIXES)
-        r = random.random()
-        if r < 0.20:
-            qname = f"{random.choice(DNS_INTERNAL)}.netvista.com"
-        elif r < 0.40:
-            qname = random.choice(DNS_EXTERNAL)
-        elif r < 0.55:
-            qname = random.choice(DNS_CLOUD)
-        elif r < 0.70:
-            qname = random.choice(DNS_SAAS)
-        elif r < 0.80:
-            qname = f"host-{random.randint(1,9999)}.internal.netvista.local"
-        elif r < 0.95:
-            qname = f"{''.join(random.choices('abcdefghijklmnopqrstuvwxyz0123456789', k=random.randint(8,20)))}.{''.join(random.choices('abcdefghijklmnopqrstuvwxyz', k=random.randint(3,8)))}.com"
-        else:
-            qname = random.choice(DNS_BAD)
-        resp_ip = rand_ext_ip() if random.random() < 0.8 else ""
-        writer.writerow([rand_ts(), client, qname, random.choice(DNS_TYPES),
-                         random.choice(DNS_RCODES), resp_ip,
-                         random.randint(50, 50000), "t" if random.random() < 0.9 else "f",
+# -- Generators -----------------------------------------------------------------
+
+def gen_transactions(writer, count):
+    """transactions: ts,account_id,card_bin,pan_last4,amount,currency,mcc,merchant_id,
+    merchant_name,merchant_country,channel,txn_type,auth_response,beneficiary_account,
+    beneficiary_country,iso_msg,region_id"""
+    base   = int(count * 0.947)
+    ctest  = int(count * 0.030)
+    bust   = int(count * 0.013)
+    struct = count - base - ctest - bust
+    n = 0
+
+    for _ in range(base):
+        a = acct(NORMAL_ACCT)
+        amt = round(3 + random.random() * 800, 2)
+        ccy = random.choice(CURRENCIES)
+        ctry = random.choice(COUNTRIES)
+        svc = random.choice(["CARD", "CARD", "SEPA", "NURG"])
+        instr = random.choice(["POS", "ECOM", "ATM"])
+        writer.writerow([rand_ts(), a, random.randint(40000000, 49999999), pan4(), amt, ccy,
+                         random.choice(MCCS), random.randint(1, 9_000_000), random.choice(MERCHANTS),
+                         ctry, random.choice(CHANNELS), "PURCHASE", random.choice(["A", "A", "A", "D"]),
+                         "", "", _iso_msg(svc, instr, amt, ccy, ctry, random.choice(BICS)),
                          random.randint(1, 7)])
-        progress("dns_logs", i, count)
+        n += 1; progress("transactions (normal)", n, count)
 
+    for _ in range(ctest):
+        a = acct(CARD_TESTING_ACCT)
+        amt = round(0.40 + random.random() * 3.60, 2)
+        writer.writerow([rand_ts(), a, 41010100 + random.randint(0, 99), pan4(), amt, "USD",
+                         5999, random.randint(1, 9_000_000), "TEST-MERCHANT", "US", "ECOM",
+                         "PURCHASE", random.choice(["A", "D", "D"]), "", "",
+                         _iso_msg("CARD", "ECOM", amt, "USD", "US"), random.randint(1, 7)])
+        n += 1; progress("transactions (card-testing)", n, count)
 
-def gen_firewall(writer, count):
-    for i in range(1, count + 1):
-        src = random.choice(THREAT_IPS) if random.random() < 0.12 else rand_ip(INTERNAL_PREFIXES)
-        dst = rand_ip(DST_PREFIXES) if random.random() < 0.5 else rand_ext_ip()
-        proto = 6 if random.random() < 0.7 else (17 if random.random() < 0.85 else 1)
-        action = random.choice(FW_ACTIONS)
-        byt = max(0, int(math.exp(random.random() * 7 + 4))) if action == "ALLOW" else 0
-        writer.writerow([rand_ts(), src, dst, random.randint(1024, 65534), random.choice(DST_PORTS),
-                         proto, action, random.randint(1, 9999), byt,
-                         random.choice(FW_ZONES_SRC), random.choice(FW_ZONES_DST),
+    for _ in range(bust):
+        a = acct(BUST_OUT_ACCT)
+        amt = round(800 + random.random() * 4200, 2)
+        writer.writerow([rand_ts(), a, 52020200 + random.randint(0, 99), pan4(), amt, "USD",
+                         5944, random.randint(1, 9_000_000), "LUXURY-GOODS", "US", "POS",
+                         "PURCHASE", "A", "", "", _iso_msg("CARD", "POS", amt, "USD", "US"),
                          random.randint(1, 7)])
-        progress("firewall_logs", i, count)
+        n += 1; progress("transactions (bust-out)", n, count)
+
+    for _ in range(struct):
+        a = acct(STRUCTURING_ACCT)
+        amt = round(9000 + random.random() * 900, 2)
+        ctry = random.choice(HIGH_RISK)
+        ben = 700000000 + random.randint(0, 999999)
+        writer.writerow([rand_ts(), a, 53030300 + random.randint(0, 99), pan4(), amt, "USD",
+                         6011, random.randint(1, 9_000_000), "Beneficiary Co", ctry,
+                         random.choice(["WIRE", "INST", "P2P"]), "PAYMENT", "A", ben, ctry,
+                         _iso_msg("SEPA", "INST", amt, "USD", ctry, random.choice(BICS)),
+                         random.randint(1, 7)])
+        n += 1; progress("transactions (structuring)", n, count)
 
 
-def gen_syslog(writer, count):
+def gen_device_events(writer, count):
+    """device_events: ts,account_id,device_fingerprint,ip_country,channel,event_type,result,region_id"""
+    pools = [NORMAL_ACCT, CARD_TESTING_ACCT, BUST_OUT_ACCT, STRUCTURING_ACCT]
     for i in range(1, count + 1):
-        src = rand_ip(INTERNAL_PREFIXES)
-        hostname = random.choice(SYSLOG_HOSTNAMES) + f"-{random.randint(1,50):02d}"
-        program = random.choice(SYSLOG_PROGRAMS)
-        severity = random.choices([0, 1, 2, 3, 4, 5, 6, 7],
-                                  weights=[1, 2, 5, 10, 15, 25, 30, 12])[0]
-        # Generate realistic message based on program
-        msg = _syslog_message(program, severity)
-        writer.writerow([rand_ts(), src, hostname, random.randint(0, 23), severity,
-                         program, msg, random.randint(1, 7)])
-        progress("syslog_events", i, count)
+        a = acct(random.choice(pools))
+        ctry = random.choice(COUNTRIES + HIGH_RISK)
+        writer.writerow([rand_ts(), a, f"fp{random.randint(0, 999999)}", ctry,
+                         random.choice(["POS", "ECOM", "MOBILE"]), random.choice(EVENT_TYPES),
+                         random.choice(RESULTS), random.randint(1, 7)])
+        progress("device_events", i, count)
 
 
-def _syslog_message(program, severity):
-    if program == "sshd":
-        return random.choice([
-            f"Failed password for root from {rand_ext_ip()} port {random.randint(30000,65000)} ssh2",
-            f"Accepted publickey for admin from {rand_ip(INTERNAL_PREFIXES)} port {random.randint(30000,65000)} ssh2",
-            f"Connection closed by {rand_ext_ip()} port {random.randint(30000,65000)} [preauth]",
-            f"Invalid user {random.choice(['admin','test','oracle','postgres'])} from {rand_ext_ip()} port {random.randint(30000,65000)}",
-        ])
-    elif program == "kernel":
-        return random.choice([
-            f"possible SYN flooding on port {random.choice([80,443,8080])}. Sending cookies.",
-            f"nf_conntrack: table full, dropping packet.",
-            f"TCP: out of memory -- consider tuning tcp_mem",
-            f"NMI watchdog: BUG: soft lockup - CPU#{random.randint(0,63)} stuck for {random.randint(22,62)}s!",
-            f"OOM killer: Kill process {random.randint(1000,50000)} (java) score {random.randint(500,999)}",
-        ])
-    elif program == "bgpd":
-        return random.choice([
-            f"BGP peer {rand_ip(['172.16','172.17','172.20'])} state changed from Established to Idle",
-            f"Prefix limit reached for peer {rand_ip(['172.16','172.17'])} (max: 100000)",
-            f"Received UPDATE from {rand_ip(['172.16','172.17'])}: WITHDRAW {random.randint(1,222)}.0.0.0/{random.choice([16,20,24])}",
-        ])
-    elif program == "nginx":
-        return random.choice([
-            f"502 Bad Gateway upstream={rand_ip(INTERNAL_PREFIXES)}:{random.choice([8080,8443,9090])}",
-            f"503 Service Unavailable upstream={rand_ip(INTERNAL_PREFIXES)}:{random.choice([8080,8443])}",
-            f"504 Gateway Timeout upstream={rand_ip(INTERNAL_PREFIXES)}:8080",
-        ])
-    elif program == "docker":
-        cid = ''.join(random.choices('0123456789abcdef', k=12))
-        return f"container {cid} {random.choice(['started','stopped','killed','OOMKilled','restarting'])} (image: {random.choice(['nginx:latest','redis:7','postgres:16','node:20'])})"
-    elif program == "kubelet":
-        pod = f"{random.choice(['frontend','backend','worker','scheduler','api-gateway'])}-{''.join(random.choices('0123456789abcdef', k=8))}"
-        return f"Pod {pod} {random.choice(['evicted due to memory pressure','failed readiness probe','CrashLoopBackOff','completed successfully'])}"
-    else:
-        return f"{program}: {random.choice(['connection','event','status','alert','warning'])} from {rand_ip(INTERNAL_PREFIXES)}"
+def gen_auth_decisions(writer, count):
+    """auth_decisions: ts,account_id,card_bin,mcc,amount,decision,rule_id,channel,merchant_country,region_id"""
+    pools = [CARD_TESTING_ACCT, BUST_OUT_ACCT, STRUCTURING_ACCT, NORMAL_ACCT]
+    bins = [41010100, 52020200, 53030300, 40000000]
+    for i in range(1, count + 1):
+        idx = random.randint(0, 3)
+        a = acct(pools[idx])
+        writer.writerow([rand_ts(), a, bins[idx] + random.randint(0, 99), random.choice(MCCS),
+                         round(random.random() * 900, 2), random.choice(DECISIONS),
+                         random.randint(0, 40), random.choice(CHANNELS),
+                         random.choice(COUNTRIES + HIGH_RISK), random.randint(1, 7)])
+        progress("auth_decisions", i, count)
 
 
-def gen_bgp(writer, count):
-    base = count - 2000  # reserve 2000 for flapping
-    for i in range(1, base + 1):
-        peer = f"172.{random.randint(16,30)}.{random.randint(0,255)}.{random.randint(1,254)}"
-        mask = random.choice([16, 16, 20, 20, 22, 24, 24, 24])
-        o1 = random.randint(1, 222)
-        o2 = random.randint(0, 255)
-        o3 = random.randint(0, 255)
-        # Zero out host bits to make valid CIDR
-        if mask <= 8:
-            o2, o3 = 0, 0
-        elif mask <= 16:
-            o2 = (o2 >> (16 - mask)) << (16 - mask) if mask > 8 else 0
-            o3 = 0
-        elif mask <= 24:
-            o3 = (o3 >> (24 - mask)) << (24 - mask) if mask > 16 else 0
-        prefix_ip = f"{o1}.{o2}.{o3}.0"
-        event = random.choice(["ANNOUNCE"] * 5 + ["WITHDRAW"] * 2 + ["UPDATE"] * 2)
-        as_path = f"2914 {random.randint(1,65534)}"
-        if random.random() < 0.6:
-            as_path += f" {random.randint(1,65534)}"
-        if random.random() < 0.3:
-            as_path += f" {random.randint(1,65534)}"
-        nh = f"172.{random.randint(16,30)}.{random.randint(0,255)}.{random.randint(1,254)}"
-        origin = random.choice(BGP_ORIGINS)
-        lp = random.choice([100, 100, 150, 200, 250, 300])
-        med = random.randint(0, 1000)
-        comm = f"2914:{random.choice([100,200,300,400,500,1000,2000,3000])} 2914:{random.choice([100,200,300,400,500,1000,2000,3000])}" if random.random() < 0.5 else ""
-        writer.writerow([rand_ts(), peer, f"{prefix_ip}/{mask}", event, as_path,
-                         nh, origin, lp, med, comm, random.randint(1, 7)])
-        progress("bgp_events", i, count)
-
-    # Flapping
-    flap_start = NOW - timedelta(hours=12)
-    for g in range(1, 2001):
-        ts = (flap_start + timedelta(seconds=g * 3)).strftime("%Y-%m-%d %H:%M:%S.%f")[:23]
-        event = "WITHDRAW" if g % 2 == 0 else "ANNOUNCE"
-        writer.writerow([ts, "172.16.0.1", "10.20.0.0/16", event,
-                         "2914 65001", "172.16.0.1", "IGP", 100, 0, "", 3])
-        progress("bgp_events", base + g, count)
+def gen_case_narratives(writer, count):
+    """case_narratives: ts,account_id,card_bin,analyst,queue,severity,narrative,region_id"""
+    personas = [("card_testing", CARD_TESTING_ACCT, 41010100),
+                ("bust_out", BUST_OUT_ACCT, 52020200),
+                ("structuring", STRUCTURING_ACCT, 53030300),
+                ("normal", NORMAL_ACCT, 40000000)]
+    weights = [3, 3, 3, 1]
+    for i in range(1, count + 1):
+        persona, pool, binbase = random.choices(personas, weights=weights)[0]
+        a = acct(pool)
+        q = "aml-tm" if persona == "structuring" else ("cards-fraud" if persona in ("card_testing", "bust_out") else random.choice(QUEUES))
+        writer.writerow([rand_ts(), a, binbase + random.randint(0, 99), random.choice(ANALYSTS),
+                         q, random.randint(1, 3), random.choice(NARRATIVES[persona]),
+                         random.randint(1, 7)])
+        progress("case_narratives", i, count)
 
 
-def gen_metrics(writer, num_customers=15, days=7):
-    """Generate network_metrics — one row per customer per minute."""
-    region_base = {1: 12, 2: 18, 3: 25, 4: 35, 5: 45, 6: 55, 7: 65}
-    # customer_id -> (region_id, tier)
-    customers = [
-        (1, 1, "enterprise"), (2, 1, "enterprise"), (3, 2, "premium"),
-        (4, 3, "enterprise"), (5, 4, "standard"), (6, 5, "enterprise"),
-        (7, 5, "premium"), (8, 6, "enterprise"), (9, 7, "premium"),
-        (10, 5, "enterprise"), (11, 1, "enterprise"), (12, 3, "enterprise"),
-        (13, 7, "standard"), (14, 2, "enterprise"), (15, 3, "enterprise"),
-    ]
-    minutes = days * 24 * 60
-    total = len(customers) * minutes
+def gen_wire_events(writer, count):
+    """wire_events: ts,ordering_account,beneficiary_bic,beneficiary_country,event_type,rail,amount,region_id"""
+    for i in range(1, count + 1):
+        # structuring-heavy: most wires originate from the structuring pool
+        a = acct(STRUCTURING_ACCT) if random.random() < 0.7 else acct(NORMAL_ACCT)
+        ctry = random.choice(HIGH_RISK + ["US", "GB"])
+        amt = round(9000 + random.random() * 900, 2) if a >= STRUCTURING_ACCT[0] else round(random.random() * 50000, 2)
+        writer.writerow([rand_ts(), a, random.choice(BICS), ctry,
+                         random.choice(["outbound", "outbound", "inbound"]),
+                         random.choice(RAILS), amt, random.randint(1, 7)])
+        progress("wire_events", i, count)
+
+
+def gen_account_kpis(writer, num_customers=10, days=28):
+    """account_kpis: ts,customer_id,region_id,txn_velocity,avg_ticket,decline_rate_pct,fraud_bps,chargeback_rate_pct
+    One row per customer per hour over the window."""
+    hours = days * 24
+    total = num_customers * hours
     count = 0
-    for cid, rid, tier in customers:
-        base_lat = region_base.get(rid, 30)
-        tier_adj = -5 if tier == "enterprise" else (-2 if tier == "premium" else 0)
-        for m in range(minutes):
-            ts = (NOW - timedelta(minutes=minutes - m)).strftime("%Y-%m-%d %H:%M:%S")
-            probe = f"10.{random.randint(0,255)}.{random.randint(0,255)}.{random.randint(1,254)}"
-            lat = round(base_lat + random.random() * 15 + tier_adj +
-                        (50 + random.random() * 150 if random.random() < 0.03 else 0), 2)
-            jit = round(random.random() * 6 + 0.5 + (random.random() * 25 if random.random() < 0.05 else 0), 2)
-            loss = round(random.random() * 0.08 if random.random() < 0.82 else
-                         (random.random() * 0.3 if random.random() < 0.55 else
-                          (random.random() * 1.5 if random.random() < 0.7 else random.random() * 5.0)), 2)
-            tp = round(random.random() * 900 + 100, 2)
-            mos = round(max(1.0, min(5.0, 4.5 - lat * 0.02 - jit * 0.04 - loss * 0.5)), 1)
-            writer.writerow([ts, cid, rid, probe, lat, jit, loss, tp, mos])
+    for cid in range(1, num_customers + 1):
+        rid = 1 + (cid % 7)
+        for h in range(hours):
+            ts = (WINDOW_END - timedelta(hours=hours - h)).strftime("%Y-%m-%d %H:%M:%S")
+            writer.writerow([ts, cid, rid,
+                             round(5 + random.random() * 60, 1),
+                             round(20 + random.random() * 300, 2),
+                             round(random.random() * 25, 2),
+                             round(random.random() * 120, 1),
+                             round(random.random() * 3, 2)])
             count += 1
-            progress("network_metrics", count, total)
+            progress("account_kpis", count, total)
 
 
-# ── Main ─────────────────────────────────────────────────────────────────────
+# -- Main -----------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="NetVista CSV Data Generator")
+    parser = argparse.ArgumentParser(description="Meridian Bank BFSI CSV Data Generator")
     parser.add_argument("--output-dir", default="./csv_data", help="Output directory for CSV files")
-    parser.add_argument("--scale", type=float, default=1.0, help="Scale factor (1.0 = ~100M rows)")
+    parser.add_argument("--scale", type=float, default=1.0,
+                        help="Scale factor (1.0 = ~50M rows total; 2.0 = ~100M, 0.1 = ~5M)")
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
     s = args.scale
 
+    # Base counts sum to ~50,000,000 rows at scale=1.0 (June 2026 dataset).
     targets = {
-        "netflow_logs":    int(31680000 * s),
-        "dns_logs":        int(25000000 * s),
-        "firewall_logs":   int(22500000 * s),
-        "syslog_events":   int(15000000 * s),
-        "bgp_events":      int(1502000 * s),
-        "network_metrics": 0,  # special: driven by customer count × days
+        "transactions":    int(16700000 * s),
+        "device_events":   int(13000000 * s),
+        "auth_decisions":  int(11700000 * s),
+        "case_narratives": int(7800000 * s),
+        "wire_events":     int(800000 * s),
+        "account_kpis":    0,  # special: customers x hours
     }
 
-    print(f"╔═══════════════════════════════════════════════════════╗")
-    print(f"║  NetVista CSV Data Generator  (scale={s})            ║")
-    print(f"║  Output: {args.output_dir:<44s} ║")
-    print(f"╠═══════════════════════════════════════════════════════╣")
+    print("+-------------------------------------------------------+")
+    print(f"|  Meridian Bank BFSI CSV Generator  (scale={s})        |")
+    print(f"|  Output: {args.output_dir:<44s}|")
+    print("+-------------------------------------------------------+")
     for t, c in targets.items():
-        if t == "network_metrics":
-            c = 15 * 7 * 24 * 60  # 15 customers × 7 days × 1440 min
-        print(f"║  {t:<22s} : {c:>12,} rows          ║")
-    print(f"╚═══════════════════════════════════════════════════════╝")
+        if t == "account_kpis":
+            c = 10 * 28 * 24  # customers x days x hours
+        print(f"|  {t:<22s} : {c:>12,} rows          |")
+    print("+-------------------------------------------------------+")
     print()
 
     generators = [
-        ("netflow_logs", ["ts", "src_ip", "dst_ip", "src_port", "dst_port", "protocol",
-                          "bytes", "packets", "tcp_flags", "flow_duration",
-                          "src_as", "dst_as", "input_if", "output_if", "sampler_id", "region_id"],
-         lambda w, n: gen_netflow(w, n), targets["netflow_logs"]),
-        ("dns_logs", ["ts", "client_ip", "query_name", "query_type", "response_code",
-                      "response_ip", "response_time", "is_recursive", "region_id"],
-         lambda w, n: gen_dns(w, n), targets["dns_logs"]),
-        ("firewall_logs", ["ts", "src_ip", "dst_ip", "src_port", "dst_port", "protocol",
-                           "action", "rule_id", "bytes", "zone_src", "zone_dst", "region_id"],
-         lambda w, n: gen_firewall(w, n), targets["firewall_logs"]),
-        ("syslog_events", ["ts", "src_ip", "hostname", "facility", "severity",
-                           "program", "message", "region_id"],
-         lambda w, n: gen_syslog(w, n), targets["syslog_events"]),
-        ("bgp_events", ["ts", "peer_ip", "prefix", "event_type", "as_path",
-                        "next_hop", "origin", "local_pref", "med", "community", "region_id"],
-         lambda w, n: gen_bgp(w, n), targets["bgp_events"]),
-        ("network_metrics", ["ts", "customer_id", "region_id", "probe_ip",
-                             "latency_ms", "jitter_ms", "packet_loss_pct",
-                             "throughput_mbps", "mos_score"],
-         lambda w, n: gen_metrics(w), 0),
+        ("transactions", ["ts", "account_id", "card_bin", "pan_last4", "amount", "currency", "mcc",
+                          "merchant_id", "merchant_name", "merchant_country", "channel", "txn_type",
+                          "auth_response", "beneficiary_account", "beneficiary_country", "iso_msg", "region_id"],
+         lambda w, n: gen_transactions(w, n), targets["transactions"]),
+        ("device_events", ["ts", "account_id", "device_fingerprint", "ip_country", "channel",
+                           "event_type", "result", "region_id"],
+         lambda w, n: gen_device_events(w, n), targets["device_events"]),
+        ("auth_decisions", ["ts", "account_id", "card_bin", "mcc", "amount", "decision", "rule_id",
+                            "channel", "merchant_country", "region_id"],
+         lambda w, n: gen_auth_decisions(w, n), targets["auth_decisions"]),
+        ("case_narratives", ["ts", "account_id", "card_bin", "analyst", "queue", "severity",
+                             "narrative", "region_id"],
+         lambda w, n: gen_case_narratives(w, n), targets["case_narratives"]),
+        ("wire_events", ["ts", "ordering_account", "beneficiary_bic", "beneficiary_country",
+                         "event_type", "rail", "amount", "region_id"],
+         lambda w, n: gen_wire_events(w, n), targets["wire_events"]),
+        ("account_kpis", ["ts", "customer_id", "region_id", "txn_velocity", "avg_ticket",
+                          "decline_rate_pct", "fraud_bps", "chargeback_rate_pct"],
+         lambda w, n: gen_account_kpis(w), 0),
     ]
 
     for name, headers, gen_fn, count in generators:
         path = os.path.join(args.output_dir, f"{name}.csv")
-        print(f"\n[*] Generating {name} → {path}")
+        print(f"\n[*] Generating {name} -> {path}")
         with open(path, "w", newline="") as f:
             writer = csv.writer(f)
-            # No header row — gpfdist external tables don't expect headers
+            # No header row -- gpfdist external tables don't expect headers
             gen_fn(writer, count)
         size_mb = os.path.getsize(path) / (1024 * 1024)
-        print(f"    → {size_mb:.1f} MB")
+        print(f"    -> {size_mb:.1f} MB")
 
-    print(f"\n✓ All CSV files generated in {args.output_dir}/")
+    print(f"\nAll CSV files generated in {args.output_dir}/")
     print(f"  Next: gpfdist -d {args.output_dir} -p 8081 &")
-    print(f"  Then: psql -f 03_load_external.sql")
+    print(f"  Then: psql -f 03_load_external_bfsi.sql")
 
 
 if __name__ == "__main__":
