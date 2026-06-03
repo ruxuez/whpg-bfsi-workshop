@@ -473,7 +473,7 @@ tr:last-child td{border-bottom:none}
     </svg>
     <div>
       <h1>WarehousePG <span>Fraud & AML Analytics</span></h1>
-      <div class="hdr-sub">Meridian Retail Bank × EDB — Live on WHPG · ~50M rows · last 28 days</div>
+      <div class="hdr-sub">Meridian Retail Bank × EDB — Live on WHPG · ~15M rows · last 28 days</div>
     </div>
   </div>
   <div class="hdr-right">
@@ -509,7 +509,7 @@ tr:last-child td{border-bottom:none}
   <div class="pnl" id="pnl-4">
     <div class="sec-hdr">
       <span class="n">Q</span><h2>SQL Editor</h2>
-      <div class="d">Run any SELECT against the live 50M row dataset</div>
+      <div class="d">Run any SELECT against the live 15M row dataset</div>
     </div>
     <textarea class="sqled" id="sqlin" spellcheck="false">
 SELECT
