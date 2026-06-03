@@ -56,7 +56,7 @@ FROM _curated;
 
 -- Embed ONLY the curated rows into narrative_embeddings, using the SAME 32-dim layout
 -- as Lab 3 Step 1.3 so cosine distance is comparable across all notes.
-INSERT INTO narrative_embeddings (note_id, account_id, card_bin, analyst, queue, severity, narrative, persona, embedding)
+INSERT INTO case_embeddings (note_id, account_id, card_bin, analyst, queue, severity, narrative, persona, embedding)
 SELECT
     n.note_id, n.account_id, n.card_bin, n.analyst, n.queue, n.severity, left(n.narrative,300), c.persona,
     ARRAY[
@@ -90,12 +90,12 @@ FROM case_narratives n
 JOIN _curated c ON c.narrative = n.narrative
 WHERE n.analyst = 'workshop-curated';
 
-ANALYZE narrative_embeddings;
+ANALYZE case_embeddings;
 
 COMMIT;  -- _curated is dropped here; curated rows are now persisted
 
 -- Quick check: curated rows landed and are searchable
 SELECT persona, count(*) AS curated_notes
-FROM narrative_embeddings
+FROM case_embeddings
 WHERE note_id IN (SELECT note_id FROM case_narratives WHERE analyst='workshop-curated')
 GROUP BY 1 ORDER BY 2 DESC;
