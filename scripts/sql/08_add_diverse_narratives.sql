@@ -54,11 +54,11 @@ SELECT ('2026-06-10'::timestamp + random()*interval '20 days'), account_id, NULL
        queue, severity, narrative, (1+(random()*6)::int)
 FROM _curated;
 
--- Embed ONLY the curated rows into case_embeddings, using the SAME 32-dim layout
--- as 06_lab3_ai_analytics.sql so cosine distance is comparable across all notes.
-INSERT INTO case_embeddings (note_id, account_id, queue, narrative, severity, persona, embedding)
+-- Embed ONLY the curated rows into narrative_embeddings, using the SAME 32-dim layout
+-- as Lab 3 Step 1.3 so cosine distance is comparable across all notes.
+INSERT INTO narrative_embeddings (note_id, account_id, card_bin, analyst, queue, severity, narrative, persona, embedding)
 SELECT
-    n.note_id, n.account_id, n.queue, left(n.narrative,300), n.severity, c.persona,
+    n.note_id, n.account_id, n.card_bin, n.analyst, n.queue, n.severity, left(n.narrative,300), c.persona,
     ARRAY[
       n.severity::float/5.0,
       CASE WHEN n.queue='cards-fraud' THEN 1 ELSE 0 END,
@@ -90,12 +90,12 @@ FROM case_narratives n
 JOIN _curated c ON c.narrative = n.narrative
 WHERE n.analyst = 'workshop-curated';
 
-ANALYZE case_embeddings;
+ANALYZE narrative_embeddings;
 
 COMMIT;  -- _curated is dropped here; curated rows are now persisted
 
 -- Quick check: curated rows landed and are searchable
 SELECT persona, count(*) AS curated_notes
-FROM case_embeddings
+FROM narrative_embeddings
 WHERE note_id IN (SELECT note_id FROM case_narratives WHERE analyst='workshop-curated')
 GROUP BY 1 ORDER BY 2 DESC;
