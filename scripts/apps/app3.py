@@ -117,7 +117,7 @@ LIMIT 15"""
     ROUND(AVG(f.total_amount)::numeric, 2)  AS avg_spend,
     ROUND(AVG(f.distinct_merchants), 0)     AS avg_merchants,
     ROUND(AVG(f.amount_cv)::numeric, 4)     AS avg_cv
-FROM bfsi_demo.kmeans_assignments a
+FROM bfsi_demo.kmeans_labeled a
 JOIN bfsi_demo.account_features f ON a.account_id = f.account_id
 GROUP BY 1, 2
 ORDER BY
@@ -139,7 +139,7 @@ ORDER BY
         ROUND(AVG(f.distinct_merchants), 0)     AS merchants,
         ROUND(AVG(f.total_amount)::numeric, 2)  AS spend,
         ROUND(AVG(f.amount_cv)::numeric, 4)     AS amount_cv
-    FROM bfsi_demo.kmeans_assignments a
+    FROM bfsi_demo.kmeans_labeled a
     JOIN bfsi_demo.account_features f ON a.account_id = f.account_id
     GROUP BY a.inferred_label
 ),
@@ -180,7 +180,7 @@ ORDER BY
         ROUND(AVG(f.distinct_merchants), 0)     AS avg_merchants,
         ROUND(AVG(f.total_amount)::numeric, 2)  AS avg_spend,
         ROUND(AVG(f.amount_cv)::numeric, 4)     AS avg_cv
-    FROM bfsi_demo.kmeans_assignments a
+    FROM bfsi_demo.kmeans_labeled a
     JOIN bfsi_demo.account_features f ON a.account_id = f.account_id
     WHERE a.inferred_label IN ('CARD-TESTING', 'BUST-OUT', 'STRUCTURING')
     GROUP BY a.inferred_label

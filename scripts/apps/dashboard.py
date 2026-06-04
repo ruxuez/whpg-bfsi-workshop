@@ -56,7 +56,7 @@ def load_cluster_points() -> pd.DataFrame:
                 f.txn_count, f.distinct_mccs, f.distinct_merchants,
                 f.total_amount, f.avg_amount, f.merchant_concentration,
                 f.stddev_amount, f.amount_cv
-            FROM bfsi_demo.kmeans_assignments a
+            FROM bfsi_demo.kmeans_labeled a
             JOIN bfsi_demo.account_features f USING (account_id)
             WHERE a.inferred_label IN ('CARD-TESTING', 'BUST-OUT', 'STRUCTURING')
         ),
@@ -69,7 +69,7 @@ def load_cluster_points() -> pd.DataFrame:
                 f.txn_count, f.distinct_mccs, f.distinct_merchants,
                 f.total_amount, f.avg_amount, f.merchant_concentration,
                 f.stddev_amount, f.amount_cv
-            FROM bfsi_demo.kmeans_assignments a
+            FROM bfsi_demo.kmeans_labeled a
             JOIN bfsi_demo.account_features f USING (account_id)
             WHERE a.inferred_label = 'NORMAL'
             ORDER BY RANDOM()
@@ -118,7 +118,7 @@ def load_cluster_summary() -> pd.DataFrame:
             ROUND(AVG(f.merchant_concentration)::numeric, 4) AS avg_concentration,
             ROUND(AVG(f.stddev_amount)::numeric, 2)       AS avg_stddev,
             ROUND(AVG(f.amount_cv)::numeric, 4)           AS avg_cv
-        FROM bfsi_demo.kmeans_assignments a
+        FROM bfsi_demo.kmeans_labeled a
         JOIN bfsi_demo.account_features   f USING (account_id)
         GROUP BY a.cluster_id, a.inferred_label
         ORDER BY
