@@ -199,9 +199,9 @@ ORDER BY
 pgvector_patterns AS (
     SELECT
         CASE
-            WHEN persona = 'card_testing' THEN '\U0001f50d CARD-TESTING'
-            WHEN persona = 'bust_out'     THEN '\U0001f4e4 BUST-OUT'
-            WHEN persona = 'structuring'  THEN '\U0001f916 STRUCTURING'
+            WHEN persona = 'card_testing' THEN 'CARD-TESTING'
+            WHEN persona = 'bust_out'     THEN 'BUST-OUT'
+            WHEN persona = 'structuring'  THEN 'STRUCTURING'
         END AS fraud_type,
         COUNT(*)                       AS notes,
         COUNT(DISTINCT account_id)     AS accounts,
