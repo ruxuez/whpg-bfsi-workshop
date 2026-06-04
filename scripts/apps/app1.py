@@ -28,7 +28,7 @@ app = Flask(__name__)
 DB = {
     "host":     os.environ.get("WHPG_HOST", "localhost"),
     "port":     int(os.environ.get("WHPG_PORT", 5432)),
-    "dbname":   os.environ.get("WHPG_DB",   "bank"),
+    "dbname":   os.environ.get("WHPG_DB",   "demo"),
     "user":     os.environ.get("WHPG_USER", "gpadmin"),
     "password": os.environ.get("WHPG_PASS", ""),
 }
@@ -53,7 +53,7 @@ def run(sql, params=None):
     # Set search_path via connection options — this applies BEFORE any query
     # runs and survives MPP dispatch; avoids races with autocommit + cur.execute.
     conn = psycopg2.connect(
-        options=f'-c search_path={SCHEMA},public',
+        options=f'-c search_path={SCHEMA},public -c enable_groupagg=off',
         **DB,
     )
     conn.set_session(autocommit=True)
@@ -168,7 +168,7 @@ FROM case_narratives c
 JOIN auth_decisions a ON a.account_id = c.account_id
     AND a.ts::date = c.ts::date
     AND a.card_bin = c.card_bin
-WHERE c.ts >= '2026-06-01'::timestamp
+WHERE c.ts >= '2026-06-01'::timestamp AND a.decision IN ('DECLINE', 'STEP_UP')
 GROUP BY 1, 2, 3, 4
 ORDER BY declines_same_day DESC LIMIT 30"""
     },
