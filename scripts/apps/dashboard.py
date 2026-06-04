@@ -78,6 +78,7 @@ def load_cluster_points() -> pd.DataFrame:
         SELECT
             account_id,
             cluster_id,
+            inferred_label AS label,
             txn_count AS txns,
             distinct_mccs AS mccs,
             distinct_merchants AS merchants,
@@ -91,6 +92,7 @@ def load_cluster_points() -> pd.DataFrame:
         SELECT
             account_id,
             cluster_id,
+            inferred_label,
             txn_count,
             distinct_mccs,
             distinct_merchants,
@@ -100,7 +102,7 @@ def load_cluster_points() -> pd.DataFrame:
             ROUND(stddev_amount::numeric, 2),
             ROUND(amount_cv::numeric, 4)
         FROM normal_sample
-        ORDER BY cluster_id, spend DESC
+        ORDER BY label, cluster_id, spend DESC
     """)
     with get_connection() as conn:
         return pd.read_sql(sql, conn)
