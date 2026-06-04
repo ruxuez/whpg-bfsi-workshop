@@ -159,18 +159,18 @@ ORDER BY t.amount DESC LIMIT 20"""
     {
         "id": "2a", "panel": 1,
         "name": "2A \u00b7 Case \u00d7 Auth Correlation",
-        "desc": "Join case narratives to same-day authorization declines \u2014 replaces a SIEM",
+        "desc": "Join case narratives to authorization decisions within 15-min window \u2014 replaces a SIEM",
         "sql": """SELECT c.account_id, c.queue, c.severity,
     LEFT(c.narrative, 80) AS case_note,
-    COUNT(*) FILTER (WHERE a.decision = 'DECLINE') AS declines_same_day,
-    COUNT(*) FILTER (WHERE a.decision = 'STEP_UP') AS step_ups_same_day
+    COUNT(*) FILTER (WHERE a.decision = 'DECLINE') AS declines_nearby,
+    COUNT(*) FILTER (WHERE a.decision = 'APPROVE') AS approvals_nearby
 FROM case_narratives c
 JOIN auth_decisions a ON a.account_id = c.account_id
-    AND a.ts::date = c.ts::date
     AND a.card_bin = c.card_bin
-WHERE c.ts >= '2026-06-01'::timestamp AND a.decision IN ('DECLINE', 'STEP_UP')
+    AND c.ts BETWEEN a.ts - INTERVAL '5 minutes' AND a.ts + INTERVAL '10 minutes'
+WHERE c.ts >= '2026-06-01'::timestamp
 GROUP BY 1, 2, 3, 4
-ORDER BY declines_same_day DESC LIMIT 30"""
+ORDER BY declines_nearby DESC LIMIT 30"""
     },
     {
         "id": "2c", "panel": 1,
