@@ -47,21 +47,60 @@ def get_connection():
 
 def load_cluster_points() -> pd.DataFrame:
     sql = textwrap.dedent("""
+        WITH fraud_accounts AS (
+            -- Include ALL fraud accounts (card-testing, bust-out, structuring)
+            SELECT
+                a.account_id,
+                a.cluster_id,
+                a.inferred_label,
+                f.txn_count, f.distinct_mccs, f.distinct_merchants,
+                f.total_amount, f.avg_amount, f.merchant_concentration,
+                f.stddev_amount, f.amount_cv
+            FROM bfsi_demo.kmeans_assignments a
+            JOIN bfsi_demo.account_features f USING (account_id)
+            WHERE a.inferred_label IN ('CARD-TESTING', 'BUST-OUT', 'STRUCTURING')
+        ),
+        normal_sample AS (
+            -- Sample 2000 normal accounts
+            SELECT
+                a.account_id,
+                a.cluster_id,
+                a.inferred_label,
+                f.txn_count, f.distinct_mccs, f.distinct_merchants,
+                f.total_amount, f.avg_amount, f.merchant_concentration,
+                f.stddev_amount, f.amount_cv
+            FROM bfsi_demo.kmeans_assignments a
+            JOIN bfsi_demo.account_features f USING (account_id)
+            WHERE a.inferred_label = 'NORMAL'
+            ORDER BY RANDOM()
+            LIMIT 2000
+        )
         SELECT
-            a.account_id,
-            a.cluster_id,
-            f.txn_count          AS txns,
-            f.distinct_mccs      AS mccs,
-            f.distinct_merchants AS merchants,
-            ROUND(f.total_amount::numeric, 2)                              AS spend,
-            ROUND(f.avg_amount::numeric, 2)                                AS avg_ticket,
-            ROUND(f.merchant_concentration::numeric, 4)                    AS merch_concentration,
-            ROUND(f.stddev_amount::numeric, 2)                             AS stddev_amount,
-            ROUND(f.amount_cv::numeric, 4)                                 AS amount_cv
-        FROM bfsi_demo.kmeans_assignments  a
-        JOIN bfsi_demo.account_features    f USING (account_id)
-        ORDER BY a.cluster_id, f.total_amount DESC
-        LIMIT 2000
+            account_id,
+            cluster_id,
+            txn_count AS txns,
+            distinct_mccs AS mccs,
+            distinct_merchants AS merchants,
+            ROUND(total_amount::numeric, 2) AS spend,
+            ROUND(avg_amount::numeric, 2) AS avg_ticket,
+            ROUND(merchant_concentration::numeric, 4) AS merch_concentration,
+            ROUND(stddev_amount::numeric, 2) AS stddev_amount,
+            ROUND(amount_cv::numeric, 4) AS amount_cv
+        FROM fraud_accounts
+        UNION ALL
+        SELECT
+            account_id,
+            cluster_id,
+            txn_count,
+            distinct_mccs,
+            distinct_merchants,
+            ROUND(total_amount::numeric, 2),
+            ROUND(avg_amount::numeric, 2),
+            ROUND(merchant_concentration::numeric, 4),
+            ROUND(stddev_amount::numeric, 2),
+            ROUND(amount_cv::numeric, 4)
+        FROM normal_sample
+        ORDER BY cluster_id, spend DESC
     """)
     with get_connection() as conn:
         return pd.read_sql(sql, conn)
@@ -70,6 +109,7 @@ def load_cluster_summary() -> pd.DataFrame:
     sql = textwrap.dedent("""
         SELECT
             a.cluster_id,
+            a.inferred_label AS persona,
             COUNT(*)                                       AS acct_count,
             ROUND(AVG(f.txn_count)::numeric, 1)           AS avg_txns,
             ROUND(AVG(f.distinct_mccs)::numeric, 1)       AS avg_mccs,
@@ -77,17 +117,17 @@ def load_cluster_summary() -> pd.DataFrame:
             ROUND(AVG(f.total_amount)::numeric, 2)        AS avg_spend,
             ROUND(AVG(f.merchant_concentration)::numeric, 4) AS avg_concentration,
             ROUND(AVG(f.stddev_amount)::numeric, 2)       AS avg_stddev,
-            ROUND(AVG(f.amount_cv)::numeric, 4)           AS avg_cv,
-            CASE
-                WHEN AVG(f.amount_cv) < 0.1          THEN 'STRUCTURING'
-                WHEN AVG(f.distinct_merchants) > 50  THEN 'CARD-TESTING'
-                WHEN AVG(f.total_amount) > 100000    THEN 'BUST-OUT'
-                ELSE 'NORMAL'
-            END AS persona
+            ROUND(AVG(f.amount_cv)::numeric, 4)           AS avg_cv
         FROM bfsi_demo.kmeans_assignments a
         JOIN bfsi_demo.account_features   f USING (account_id)
-        GROUP BY a.cluster_id
-        ORDER BY acct_count DESC
+        GROUP BY a.cluster_id, a.inferred_label
+        ORDER BY
+            CASE a.inferred_label
+                WHEN 'CARD-TESTING' THEN 1
+                WHEN 'BUST-OUT' THEN 2
+                WHEN 'STRUCTURING' THEN 3
+                WHEN 'NORMAL' THEN 4
+            END, acct_count DESC
     """)
     with get_connection() as conn:
         return pd.read_sql(sql, conn)

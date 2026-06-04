@@ -110,22 +110,23 @@ LIMIT 15"""
         "desc": "K-Means clustering on 6 behavioural features - NO LABELS, finds fraud rings automatically",
         "sql": """SELECT
     a.cluster_id,
+    a.inferred_label AS persona_label,
     COUNT(*) AS accounts,
     ROUND(COUNT(*) * 100.0 / SUM(COUNT(*)) OVER (), 1) AS pct,
     ROUND(AVG(f.txn_count), 0)              AS avg_txns,
     ROUND(AVG(f.total_amount)::numeric, 2)  AS avg_spend,
     ROUND(AVG(f.distinct_merchants), 0)     AS avg_merchants,
-    ROUND(AVG(f.amount_cv)::numeric, 4)     AS avg_cv,
-    CASE
-        WHEN AVG(f.amount_cv) < 0.1          THEN '\U0001f916 STRUCTURING'
-        WHEN AVG(f.distinct_merchants) > 50  THEN '\U0001f50d CARD-TESTING'
-        WHEN AVG(f.total_amount) > 100000    THEN '\U0001f4e4 BUST-OUT'
-        ELSE '\u2705 NORMAL'
-    END AS persona
+    ROUND(AVG(f.amount_cv)::numeric, 4)     AS avg_cv
 FROM bfsi_demo.kmeans_assignments a
 JOIN bfsi_demo.account_features f ON a.account_id = f.account_id
-GROUP BY 1
-ORDER BY accounts DESC"""
+GROUP BY 1, 2
+ORDER BY
+    CASE a.inferred_label
+        WHEN 'CARD-TESTING' THEN 1
+        WHEN 'BUST-OUT' THEN 2
+        WHEN 'STRUCTURING' THEN 3
+        WHEN 'NORMAL' THEN 4
+    END"""
     },
     {
         "id": "b2", "panel": 1,
@@ -133,29 +134,18 @@ ORDER BY accounts DESC"""
         "desc": "CARD-TESTING: many more merchants | BUST-OUT: far higher spend than a normal account",
         "sql": """WITH cluster_agg AS (
     SELECT
-        a.cluster_id,
+        a.inferred_label AS persona,
         COUNT(*) AS accounts,
         ROUND(AVG(f.distinct_merchants), 0)     AS merchants,
         ROUND(AVG(f.total_amount)::numeric, 2)  AS spend,
         ROUND(AVG(f.amount_cv)::numeric, 4)     AS amount_cv
     FROM bfsi_demo.kmeans_assignments a
     JOIN bfsi_demo.account_features f ON a.account_id = f.account_id
-    GROUP BY a.cluster_id
-),
-cluster_stats AS (
-    SELECT
-        CASE
-            WHEN amount_cv < 0.1   THEN 'STRUCTURING'
-            WHEN merchants > 50    THEN 'CARD-TESTING'
-            WHEN spend > 100000    THEN 'BUST-OUT'
-            ELSE 'NORMAL'
-        END AS persona,
-        accounts, merchants, spend, amount_cv
-    FROM cluster_agg
+    GROUP BY a.inferred_label
 ),
 normal AS (
     SELECT merchants AS n_merch, spend AS n_spend
-    FROM cluster_stats WHERE persona = 'NORMAL' LIMIT 1
+    FROM cluster_agg WHERE persona = 'NORMAL' LIMIT 1
 )
 SELECT
     cs.persona,
@@ -165,9 +155,15 @@ SELECT
     cs.amount_cv,
     ROUND(cs.merchants::numeric / NULLIF(n.n_merch, 0), 0) AS merchants_vs_normal,
     ROUND(cs.spend::numeric    / NULLIF(n.n_spend, 0), 0) AS spend_vs_normal
-FROM cluster_stats cs
+FROM cluster_agg cs
 LEFT JOIN normal n ON TRUE
-ORDER BY cs.accounts DESC"""
+ORDER BY
+    CASE cs.persona
+        WHEN 'CARD-TESTING' THEN 1
+        WHEN 'BUST-OUT' THEN 2
+        WHEN 'STRUCTURING' THEN 3
+        WHEN 'NORMAL' THEN 4
+    END"""
     },
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -177,26 +173,17 @@ ORDER BY cs.accounts DESC"""
         "id": "c1", "panel": 2,
         "name": "C1 - The AI Factory: Fraud Pattern Correlation",
         "desc": "MADlib finds behavioural clusters \u2192 pgvector finds semantic patterns \u2192 BOTH detect the SAME fraud types in ONE query!",
-        "sql": """WITH cluster_stats AS (
+        "sql": """WITH madlib_patterns AS (
     SELECT
-        a.cluster_id,
+        a.inferred_label AS fraud_type,
         COUNT(*) AS accts,
         ROUND(AVG(f.distinct_merchants), 0)     AS avg_merchants,
         ROUND(AVG(f.total_amount)::numeric, 2)  AS avg_spend,
         ROUND(AVG(f.amount_cv)::numeric, 4)     AS avg_cv
     FROM bfsi_demo.kmeans_assignments a
     JOIN bfsi_demo.account_features f ON a.account_id = f.account_id
-    GROUP BY a.cluster_id
-),
-madlib_patterns AS (
-    SELECT
-        CASE
-            WHEN avg_cv < 0.1          THEN '\U0001f916 STRUCTURING'
-            WHEN avg_merchants > 50    THEN '\U0001f50d CARD-TESTING'
-            WHEN avg_spend > 100000    THEN '\U0001f4e4 BUST-OUT'
-        END AS fraud_type,
-        accts, avg_merchants, avg_spend, avg_cv
-    FROM cluster_stats
+    WHERE a.inferred_label IN ('CARD-TESTING', 'BUST-OUT', 'STRUCTURING')
+    GROUP BY a.inferred_label
 ),
 pgvector_patterns AS (
     SELECT
