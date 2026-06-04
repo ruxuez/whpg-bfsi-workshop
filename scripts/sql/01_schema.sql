@@ -168,7 +168,7 @@ CREATE TABLE case_narratives (
     narrative       TEXT,
     region_id       INT
 ) WITH (appendoptimized=true, orientation=column, compresstype=zstd, compresslevel=3)
-DISTRIBUTED BY (note_id)
+DISTRIBUTED BY (account_id, card_bin)
 PARTITION BY RANGE (ts) (
     START ('2025-12-01'::timestamp) INCLUSIVE
     END   ('2026-12-01'::timestamp) EXCLUSIVE
@@ -190,7 +190,7 @@ CREATE TABLE auth_decisions (
     merchant_country CHAR(2),
     region_id       INT
 ) WITH (appendoptimized=true, orientation=column, compresstype=zstd, compresslevel=3)
-DISTRIBUTED BY (decision_id)
+DISTRIBUTED BY (account_id, card_bin)
 PARTITION BY RANGE (ts) (
     START ('2025-12-01'::timestamp) INCLUSIVE
     END   ('2026-12-01'::timestamp) EXCLUSIVE
