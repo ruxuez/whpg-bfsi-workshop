@@ -324,14 +324,22 @@ def update_charts(pts_json, summ_json, x_col, y_col):
     pts = pd.read_json(pts_json, orient="split")
     summ = pd.read_json(summ_json, orient="split")
     
-    # Scatter
-    pts["label"] = pts["cluster_id"].map(CLUSTER_LABELS)
-    fig_s = px.scatter(pts, x=x_col, y=y_col, color="label", color_discrete_sequence=COLORS, opacity=0.6)
+    # Scatter - use label from SQL (inferred_label), with explicit color mapping
+    color_map = {
+        "CARD-TESTING": "#3DBFBF",  # teal
+        "BUST-OUT": "#D85A30",       # orange
+        "STRUCTURING": "#1D9E75",    # green
+        "NORMAL": "#E8972A",         # amber
+    }
+    fig_s = px.scatter(pts, x=x_col, y=y_col, color="label",
+                       color_discrete_map=color_map, opacity=0.6,
+                       category_orders={"label": ["CARD-TESTING", "BUST-OUT", "STRUCTURING", "NORMAL"]})
     fig_s.update_layout(**_layout(height=450))
 
-    # Distribution
-    summ["label"] = summ["cluster_id"].map(CLUSTER_LABELS)
-    fig_d = px.bar(summ, x="acct_count", y="label", orientation="h", color="label", color_discrete_sequence=COLORS)
+    # Distribution - use persona from SQL
+    fig_d = px.bar(summ, x="acct_count", y="persona", orientation="h", color="persona",
+                   color_discrete_map=color_map,
+                   category_orders={"persona": ["CARD-TESTING", "BUST-OUT", "STRUCTURING", "NORMAL"]})
     fig_d.update_layout(**_layout(height=250), showlegend=False)
 
     # Radar
