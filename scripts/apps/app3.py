@@ -85,19 +85,30 @@ FROM bfsi_demo.case_embeddings"""
     WHERE persona = 'structuring' AND queue = 'aml-tm'
     ORDER BY note_id
     LIMIT 1
+),
+similar_notes AS (
+    SELECT DISTINCT ON (LEFT(e.narrative, 90))
+        e.account_id,
+        e.queue,
+        LEFT(e.narrative, 90) AS similar_note,
+        e.persona AS ground_truth,
+        ROUND((1 - (e.embedding <=> r.embedding))::numeric, 4) AS similarity,
+        e.embedding <=> r.embedding AS distance
+    FROM bfsi_demo.case_embeddings e
+    CROSS JOIN reference_note r
+    WHERE e.note_id != r.note_id
+      AND e.persona = 'structuring'
+    ORDER BY LEFT(e.narrative, 90), e.embedding <=> r.embedding
 )
 SELECT
-    r.ref_note               AS reference_note,
-    e.account_id,
-    e.queue,
-    LEFT(e.narrative, 90)    AS similar_note,
-    e.persona                AS ground_truth,
-    ROUND((1 - (e.embedding <=> r.embedding))::numeric, 4) AS similarity
-FROM bfsi_demo.case_embeddings e
-CROSS JOIN reference_note r
-WHERE e.note_id != r.note_id
-  AND e.persona = 'structuring'
-ORDER BY e.embedding <=> r.embedding
+    (SELECT ref_note FROM reference_note) AS reference_note,
+    account_id,
+    queue,
+    similar_note,
+    ground_truth,
+    similarity
+FROM similar_notes
+ORDER BY distance
 LIMIT 15"""
     },
 
