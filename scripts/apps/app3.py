@@ -66,9 +66,9 @@ def run_write(sql, params=None):
 SQL_1A_BEFORE = """
 -- Fraud transactions from K-Means clusters that are NOT yet in fraud_watchlists
 -- These accounts were detected by MADlib but haven't been written back yet.
--- Run ML Watchlist Refresh above, then re-run this — rows should disappear.
+-- Uses inferred_label instead of cluster_id to handle K-means non-determinism.
 WITH ml_fraud_accounts AS (
-    SELECT 
+    SELECT
         kl.account_id,
         kl.inferred_label,
         -- Map ML labels to watchlist categories
@@ -86,7 +86,7 @@ WITH ml_fraud_accounts AS (
     FROM bfsi_demo.kmeans_labeled kl
     WHERE kl.inferred_label IN ('CARD-TESTING', 'BUST-OUT', 'STRUCTURING')
 )
-SELECT 
+SELECT
     t.account_id,
     mf.inferred_label             AS fraud_persona,
     mf.ml_category                AS fraud_type_detected_by_ml,
@@ -100,7 +100,7 @@ FROM bfsi_demo.transactions t
 JOIN ml_fraud_accounts mf ON t.account_id = mf.account_id
 WHERE t.ts >= '2026-06-01'::timestamp
   AND NOT EXISTS (
-        SELECT 1 
+        SELECT 1
         FROM bfsi_demo.fraud_watchlists w
         WHERE w.single_account = t.account_id
           AND w.feed_name = 'MADlib K-Means'
@@ -108,7 +108,7 @@ WHERE t.ts >= '2026-06-01'::timestamp
       )
 GROUP BY t.account_id, mf.inferred_label, mf.ml_category, mf.ml_confidence
 ORDER BY total_exposure DESC
-LIMIT 20;
+LIMIT 20
 """
 
 SQL_1A_AFTER = """
@@ -161,36 +161,42 @@ FROM   acct_hits
 """
 
 SQL_ML_INSERT = """
+-- Insert MADlib fraud findings into fraud_watchlists
+-- Uses inferred_label instead of cluster_id for deterministic behavior
 INSERT INTO bfsi_demo.fraud_watchlists
   (feed_name, bin_range, single_account, category, confidence,
    country_code, first_seen, last_seen, active)
 SELECT
-  'MADlib K-Means', NULL,
-  ka.account_id,
-  CASE ka.cluster_id
-    WHEN 1 THEN 'compromised_bin'
-    WHEN 3 THEN 'structuring'
-    WHEN 5 THEN 'velocity_abuse'
+  'MADlib K-Means',
+  NULL,
+  kl.account_id,
+  CASE kl.inferred_label
+    WHEN 'CARD-TESTING' THEN 'compromised_bin'
+    WHEN 'BUST-OUT' THEN 'velocity_abuse'
+    WHEN 'STRUCTURING' THEN 'structuring'
   END,
-  CASE ka.cluster_id
-    WHEN 1 THEN 87
-    WHEN 3 THEN 85
-    WHEN 5 THEN 75
+  CASE kl.inferred_label
+    WHEN 'CARD-TESTING' THEN 87
+    WHEN 'BUST-OUT' THEN 85
+    WHEN 'STRUCTURING' THEN 90
   END,
   'US',
   NOW(), NOW(), TRUE
-FROM bfsi_demo.kmeans_assignments ka
-WHERE ka.cluster_id IN (1,3,5)
+FROM bfsi_demo.kmeans_labeled kl
+WHERE kl.inferred_label IN ('CARD-TESTING', 'BUST-OUT', 'STRUCTURING')
+ON CONFLICT DO NOTHING
 """
 
 SQL_ML_EXPIRE = """
+-- Expire accounts that are no longer in fraud clusters
+-- Uses inferred_label instead of cluster_id
 UPDATE bfsi_demo.fraud_watchlists
 SET    active=FALSE, last_seen=NOW()
 WHERE  feed_name='MADlib K-Means' AND active=TRUE
   AND  NOT EXISTS (
-         SELECT 1 FROM bfsi_demo.kmeans_assignments ka
-         WHERE  ka.account_id  = bfsi_demo.fraud_watchlists.single_account
-           AND  ka.cluster_id IN (1,3,5)
+         SELECT 1 FROM bfsi_demo.kmeans_labeled kl
+         WHERE  kl.account_id = bfsi_demo.fraud_watchlists.single_account
+           AND  kl.inferred_label IN ('CARD-TESTING', 'BUST-OUT', 'STRUCTURING')
        )
 """
 
