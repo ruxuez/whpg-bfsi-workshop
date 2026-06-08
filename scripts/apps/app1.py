@@ -165,10 +165,13 @@ ORDER BY t.amount DESC LIMIT 20"""
     COUNT(*) FILTER (WHERE a.decision = 'DECLINE') AS declines_nearby,
     COUNT(*) FILTER (WHERE a.decision = 'APPROVE') AS approvals_nearby
 FROM case_narratives c
-JOIN auth_decisions a ON a.account_id = c.account_id
-    AND a.card_bin = c.card_bin
-    AND c.ts BETWEEN a.ts - INTERVAL '5 minutes' AND a.ts + INTERVAL '10 minutes'
+JOIN auth_decisions a 
+ON a.account_id = c.account_id
+   AND a.card_bin = c.card_bin
+    AND a.ts::date = c.ts::date
 WHERE c.ts >= '2026-06-01'::timestamp
+and a.ts >= '2026-06-01'::timestamp
+AND c.ts BETWEEN a.ts - INTERVAL '5 minutes' AND a.ts + INTERVAL '10 minutes'
 GROUP BY 1, 2, 3, 4
 ORDER BY declines_nearby DESC LIMIT 30"""
     },
