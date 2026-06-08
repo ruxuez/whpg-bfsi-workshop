@@ -46,6 +46,145 @@ def run(sql, params=None):
     finally:
         conn.close()
 
+def run_write(sql, params=None):
+    """Execute a write (INSERT/UPDATE/DELETE/TRUNCATE) and return rowcount."""
+    conn = psycopg2.connect(**DB)
+    conn.set_session(autocommit=True)
+    try:
+        cur = conn.cursor()
+        t0  = time.perf_counter()
+        cur.execute("SET search_path TO bfsi_demo, public;")
+        cur.execute(sql, params)
+        return {"rowcount": cur.rowcount, "ms": round((time.perf_counter()-t0)*1000,1)}
+    except Exception as e:
+        return {"rowcount": 0, "ms": 0, "error": str(e)}
+    finally:
+        conn.close()
+
+# ── ML Watchlist SQL ──────────────────────────────────────────────────────────
+
+SQL_1A_BEFORE = """
+-- Fraud transactions from K-Means clusters that are NOT yet in fraud_watchlists
+-- These accounts were detected by MADlib but haven't been written back yet.
+-- Run ML Watchlist Refresh above, then re-run this — rows should disappear.
+WITH ml_fraud_accounts AS (
+    SELECT ka.account_id,
+           CASE ka.cluster_id
+             WHEN 1 THEN 'compromised_bin'
+             WHEN 3 THEN 'structuring'
+             WHEN 5 THEN 'velocity_abuse'
+           END AS ml_category,
+           CASE ka.cluster_id
+             WHEN 1 THEN 87 WHEN 3 THEN 85 WHEN 5 THEN 75
+           END AS ml_confidence
+    FROM bfsi_demo.kmeans_assignments ka
+    WHERE ka.cluster_id IN (1,3,5)
+)
+SELECT t.account_id,
+       mf.ml_category                AS fraud_type_detected_by_ml,
+       mf.ml_confidence              AS confidence,
+       COUNT(*)                      AS transactions,
+       ROUND(SUM(t.amount),2)        AS total_exposure,
+       MIN(t.ts)                     AS first_txn,
+       MAX(t.ts)                     AS last_txn,
+       'NOT IN watchlist'            AS watchlist_status
+FROM bfsi_demo.transactions t
+JOIN ml_fraud_accounts mf ON t.account_id = mf.account_id
+WHERE t.ts >= '2026-06-01'::timestamp
+  AND NOT EXISTS (
+        SELECT 1 FROM bfsi_demo.fraud_watchlists w
+        WHERE  w.single_account = t.account_id
+          AND  w.feed_name = 'MADlib K-Means'
+          AND  w.active    = TRUE
+      )
+GROUP BY t.account_id, mf.ml_category, mf.ml_confidence
+ORDER BY total_exposure DESC
+LIMIT 20
+"""
+
+SQL_1A_AFTER = """
+-- Each branch has its own LIMIT so BIN rows are never crowded out
+-- by the much larger ML account totals ($245M vs $23K per BIN).
+-- Both groups always visible; blue = BIN range, green = ML K-Means account.
+WITH bin_hits AS (
+    SELECT wb.card_bin::TEXT       AS match_key,
+           wb.feed_name, wb.category, wb.confidence,
+           'BIN range match'       AS source,
+           COUNT(*)                AS transactions,
+           ROUND(SUM(t.amount),2)  AS total_amount,
+           MIN(t.ts) AS first_txn, MAX(t.ts) AS last_txn
+    FROM   bfsi_demo.transactions t
+    JOIN   (
+               SELECT feed_name, category, confidence,
+                      generate_series(lower(bin_range), upper(bin_range)-1) AS card_bin
+               FROM   bfsi_demo.fraud_watchlists
+               WHERE  active=TRUE AND confidence>=75
+                 AND  bin_range IS NOT NULL AND NOT isempty(bin_range)
+           ) wb ON t.card_bin = wb.card_bin
+    WHERE  t.ts >= '2026-06-01'::timestamp
+    GROUP  BY 1,2,3,4,5
+    ORDER  BY total_amount DESC
+    LIMIT  10
+),
+acct_hits AS (
+    SELECT 'acct:'||t.account_id::TEXT AS match_key,
+           w.feed_name, w.category, w.confidence,
+           'ML K-Means account'    AS source,
+           COUNT(*)                 AS transactions,
+           ROUND(SUM(t.amount),2)   AS total_amount,
+           MIN(t.ts) AS first_txn,  MAX(t.ts) AS last_txn
+    FROM   bfsi_demo.transactions t
+    JOIN   bfsi_demo.fraud_watchlists w ON t.account_id = w.single_account
+    WHERE  t.ts >= '2026-06-01'::timestamp
+      AND  w.active=TRUE AND w.confidence>=75 AND w.single_account IS NOT NULL
+    GROUP  BY 1,2,3,4,5
+    ORDER  BY total_amount DESC
+    LIMIT  10
+)
+-- BIN rows first (blue), then ML rows (green) — both groups always shown
+SELECT match_key, feed_name, category, confidence, source,
+       transactions, total_amount, first_txn, last_txn
+FROM   bin_hits
+UNION ALL
+SELECT match_key, feed_name, category, confidence, source,
+       transactions, total_amount, first_txn, last_txn
+FROM   acct_hits
+"""
+
+SQL_ML_INSERT = """
+INSERT INTO bfsi_demo.fraud_watchlists
+  (feed_name, bin_range, single_account, category, confidence,
+   country_code, first_seen, last_seen, active)
+SELECT
+  'MADlib K-Means', NULL,
+  ka.account_id,
+  CASE ka.cluster_id
+    WHEN 1 THEN 'compromised_bin'
+    WHEN 3 THEN 'structuring'
+    WHEN 5 THEN 'velocity_abuse'
+  END,
+  CASE ka.cluster_id
+    WHEN 1 THEN 87
+    WHEN 3 THEN 85
+    WHEN 5 THEN 75
+  END,
+  'US',
+  NOW(), NOW(), TRUE
+FROM bfsi_demo.kmeans_assignments ka
+WHERE ka.cluster_id IN (1,3,5)
+"""
+
+SQL_ML_EXPIRE = """
+UPDATE bfsi_demo.fraud_watchlists
+SET    active=FALSE, last_seen=NOW()
+WHERE  feed_name='MADlib K-Means' AND active=TRUE
+  AND  NOT EXISTS (
+         SELECT 1 FROM bfsi_demo.kmeans_assignments ka
+         WHERE  ka.account_id  = bfsi_demo.fraud_watchlists.single_account
+           AND  ka.cluster_id IN (1,3,5)
+       )
+"""
+
 # ── Query definitions ────────────────────────────────────────────────────────
 QUERIES = [
     # ══════════════════════════════════════════════════════════════════════════
@@ -238,12 +377,28 @@ SELECT
     '< 5 seconds',
     'Zero data movement, SQL-native, no external dependencies'"""
     },
+    # ══════════════════════════════════════════════════════════════════════════
+    # Panel D: ML → Watchlist
+    # ══════════════════════════════════════════════════════════════════════════
+    {
+        "id": "d1", "panel": 3,
+        "name": "D1 - ML Fraud Gap — Detected but NOT in Watchlist",
+        "desc": "Transactions from K-Means fraud clusters that exist in transactions but are NOT yet flagged in fraud_watchlists. Run Refresh above, then re-run — should show 0 rows.",
+        "sql": SQL_1A_BEFORE,
+    },
+    {
+        "id": "d2", "panel": 3,
+        "name": "D2 - Query 1A Extended — BIN Ranges + ML Accounts",
+        "desc": "After Refresh: BIN-match rows (blue) + ML K-Means account rows (green). Orange = high exposure. Run D1 first to see the gap, refresh, then run D2 to see them appear.",
+        "sql": SQL_1A_AFTER,
+    },
 ]
 
 PANELS = [
-    {"name": "pgvector",    "icon": "A", "desc": "Semantic search finds fraud by MEANING, not keywords"},
-    {"name": "MADlib",      "icon": "B", "desc": "Unsupervised clustering discovers fraud personas automatically"},
-    {"name": "AI Factory",  "icon": "C", "desc": "Combine both in ONE query — impossible in traditional warehouses"},
+    {"name": "pgvector",       "icon": "A", "desc": "Semantic search finds fraud by MEANING, not keywords"},
+    {"name": "MADlib",         "icon": "B", "desc": "Unsupervised clustering discovers fraud personas automatically"},
+    {"name": "AI Factory",     "icon": "C", "desc": "Combine both in ONE query — impossible in traditional warehouses"},
+    {"name": "ML → Watchlist", "icon": "D", "desc": "Write K-Means results to fraud_watchlists · Query 1A before vs after"},
 ]
 
 # ── API ───────────────────────────────────────────────────────────────────────
@@ -275,6 +430,79 @@ def api_sql():
     if w not in ("SELECT", "WITH", "EXPLAIN"):
         return jsonify({"error": "Only SELECT / WITH / EXPLAIN allowed"}), 403
     return jsonify(run(sql))
+
+@app.route("/api/watchlist/refresh", methods=["POST"])
+def api_watchlist_refresh():
+    """
+    Idempotent refresh — safe to run multiple times.
+    Step 1: soft-reset  — expire any existing MADlib K-Means flags (active=FALSE)
+    Step 2: insert fresh — write current K-Means results to fraud_watchlists
+    Step 3: expire stale — accounts that left the fraud clusters
+    """
+    import time as _t; t0 = _t.perf_counter()
+    rst = run_write(
+        "UPDATE bfsi_demo.fraud_watchlists "
+        "SET active=FALSE, last_seen=NOW() "
+        "WHERE feed_name='MADlib K-Means' AND active=TRUE"
+    )
+    if "error" in rst:
+        return jsonify({"ok": False, "error": rst["error"]}), 500
+    ins = run_write(SQL_ML_INSERT)
+    if "error" in ins:
+        return jsonify({"ok": False, "error": ins["error"]}), 500
+    exp = run_write(SQL_ML_EXPIRE)
+    if "error" in exp:
+        return jsonify({"ok": False, "error": exp["error"]}), 500
+    summary = run("""
+        SELECT feed_name, category,
+               COUNT(*) FILTER (WHERE active=TRUE) AS active_flags
+        FROM   bfsi_demo.fraud_watchlists
+        GROUP  BY feed_name, category ORDER BY feed_name, category
+    """)
+    return jsonify({
+        "ok":       True,
+        "reset":    rst["rowcount"], "reset_ms":  rst["ms"],
+        "inserted": ins["rowcount"], "insert_ms": ins["ms"],
+        "expired":  exp["rowcount"], "expire_ms": exp["ms"],
+        "total_ms": round((_t.perf_counter()-t0)*1000, 1),
+        "summary":  summary["data"],
+    })
+
+@app.route("/api/watchlist/reset", methods=["POST"])
+def api_watchlist_reset():
+    """
+    mode=soft — expire ML flags (active→FALSE). Default. Re-run refresh after.
+    mode=hard — DELETE all MADlib K-Means rows.
+    mode=full — TRUNCATE all derived ML tables (kmeans_*, account_features).
+                Requires re-running 06_ai_analytics + 07_kmeans_fallback after.
+    """
+    mode  = request.args.get("mode", "soft")
+    import time as _t; t0=_t.perf_counter()
+    steps = []
+    if mode == "soft":
+        r = run_write("UPDATE bfsi_demo.fraud_watchlists SET active=FALSE,last_seen=NOW() WHERE feed_name='MADlib K-Means' AND active=TRUE")
+        steps.append({"step":"Expire ML flags (active→FALSE)","rows":r.get("rowcount",0),"error":r.get("error")})
+    elif mode == "hard":
+        r = run_write("DELETE FROM bfsi_demo.fraud_watchlists WHERE feed_name='MADlib K-Means'")
+        steps.append({"step":"Delete all MADlib K-Means rows","rows":r.get("rowcount",0),"error":r.get("error")})
+    elif mode == "full":
+        for label, sql in [
+            ("Expire ML flags",               "UPDATE bfsi_demo.fraud_watchlists SET active=FALSE,last_seen=NOW() WHERE feed_name='MADlib K-Means' AND active=TRUE"),
+            ("Truncate kmeans_assignments",   "TRUNCATE bfsi_demo.kmeans_assignments"),
+            ("Truncate km_raw",               "TRUNCATE bfsi_demo.km_raw"),
+            ("Truncate km_points",            "TRUNCATE bfsi_demo.km_points"),
+            ("Truncate km_result",            "TRUNCATE bfsi_demo.km_result"),
+            ("Truncate account_features",     "TRUNCATE bfsi_demo.account_features"),
+            ("Truncate account_features_norm","TRUNCATE bfsi_demo.account_features_norm"),
+        ]:
+            r = run_write(sql)
+            steps.append({"step":label,"rows":r.get("rowcount",0),"error":r.get("error")})
+            if r.get("error"): break
+    else:
+        return jsonify({"ok":False,"error":f"Unknown mode: {mode}"}), 400
+    errors = [s for s in steps if s.get("error")]
+    return jsonify({"ok":len(errors)==0,"mode":mode,"steps":steps,
+                    "total_ms":round((_t.perf_counter()-t0)*1000,1),"errors":errors})
 
 @app.route("/api/health")
 def api_health():
@@ -400,6 +628,9 @@ th{text-align:left;padding:7px 10px;color:var(--dim);font-size:10px;text-transfo
 td{padding:7px 10px;border-bottom:1px solid var(--border)}
 tr:last-child td{border-bottom:none}
 .empty{color:var(--dim);padding:20px;text-align:center;font-size:13px}
+tr.unflagged-row td{background:#fff7ed;color:#9a3412}   /* orange: ML found, not in watchlist */
+tr.ml-row td{background:#f0fdf4;color:#166534}            /* green: ML accounts now flagged */
+tr.bin-row td{background:#eff6ff;color:#1e40af}           /* blue: original BIN range matches */
 .spinner{width:26px;height:26px;border:3px solid var(--border);border-top-color:var(--accent);
          border-radius:50%;animation:sp .75s linear infinite;margin:0 auto}
 @keyframes sp{to{transform:rotate(360deg)}}
@@ -416,9 +647,94 @@ tr:last-child td{border-bottom:none}
 
 
 
+/* ── scenario card ── */
+.scenario{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:22px}
+.sc-card{background:var(--card);border:1px solid var(--border);border-radius:11px;padding:16px 18px}
+.sc-card.full{grid-column:1/-1}
+.sc-card.highlight{border-color:rgba(6,214,160,.4);background:rgba(6,214,160,.04)}
+.sc-title{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;
+          color:var(--accent);margin-bottom:6px}
+.sc-title.blue{color:var(--blue)}
+.sc-title.warn{color:var(--warn)}
+.sc-title.purple{color:var(--purple)}
+.sc-body{font-size:13px;color:var(--muted);line-height:1.65}
+.sc-body strong{color:var(--text)}
+.sc-body code{background:var(--bg);padding:1px 5px;border-radius:3px;
+              font-family:'Courier New',monospace;font-size:11px}
+.sc-compare{display:grid;grid-template-columns:1fr 1fr;gap:0;border-radius:9px;overflow:hidden;border:1px solid var(--border)}
+.sc-col{padding:12px 14px}
+.sc-col.bad{background:#fef2f2}.sc-col.good{background:#f0fdf4}
+.sc-col-title{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;margin-bottom:6px}
+.sc-col.bad .sc-col-title{color:#991b1b}.sc-col.good .sc-col-title{color:#166534}
+.sc-col ul{list-style:none;padding:0;font-size:12px;color:var(--muted);line-height:1.8}
+.sc-col.bad ul li::before{content:"✗ "}.sc-col.good ul li::before{content:"✓ "}
+.sc-stage{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:8px 0}
+.sc-box{background:var(--bg);border:1px solid var(--border);border-radius:6px;
+        padding:5px 10px;font-size:11px;font-family:'Courier New',monospace;color:var(--text)}
+.sc-box.hi{background:rgba(6,214,160,.1);border-color:rgba(6,214,160,.3);color:#065f46}
+.sc-arrow{color:var(--dim);font-size:14px;font-weight:700}
+.sc-stat{text-align:center}
+.sc-stat .big{font-size:28px;font-weight:700;font-family:'Courier New',monospace;line-height:1}
+.sc-stat .lbl{font-size:10px;text-transform:uppercase;letter-spacing:.05em;color:var(--dim);margin-top:2px}
+.sc-personas{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-top:8px}
+.sc-persona{border-radius:8px;padding:10px 10px 8px;border:1px solid transparent}
+.sc-persona.normal{background:#f0fdf4;border-color:#bbf7d0}
+.sc-persona.card{background:#eff6ff;border-color:#bfdbfe}
+.sc-persona.bust{background:#fff7ed;border-color:#fed7aa}
+.sc-persona.struct{background:#fdf4ff;border-color:#e9d5ff}
+.sc-persona .p-icon{font-size:18px;margin-bottom:4px}
+.sc-persona .p-name{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.04em}
+.sc-persona.normal .p-name{color:#166534}
+.sc-persona.card .p-name{color:#1e40af}
+.sc-persona.bust .p-name{color:#9a3412}
+.sc-persona.struct .p-name{color:#6b21a8}
+.sc-persona .p-stat{font-size:10px;color:var(--dim);margin-top:2px;line-height:1.5}
+
 /* ── footer ── */
 .ft{margin-top:32px;padding:14px 0;border-top:1px solid var(--border);
     display:flex;justify-content:space-between;color:var(--dim);font-size:11px}
+
+/* ── Panel D extras ── */
+.p3 .qid{background:rgba(234,88,12,.12);color:#ea580c}
+tr.ml-row td{background:#f0fdf4;color:#166534}
+.wl-card{background:var(--card);border:1px solid var(--border);border-radius:11px;
+         padding:18px 22px;margin-bottom:20px}
+.wl-title{font-size:15px;font-weight:700;margin-bottom:3px}
+.wl-sub{font-size:12px;color:var(--dim);margin-bottom:14px;line-height:1.55}
+.wl-actions{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:14px}
+.btn-wl{background:linear-gradient(135deg,#ea580c,#d97706);color:#fff;border:0;
+        padding:9px 22px;border-radius:7px;font-size:13px;font-weight:700;
+        cursor:pointer;font-family:inherit;transition:.15s}
+.btn-wl:hover{opacity:.85}.btn-wl:disabled{opacity:.4;cursor:wait}
+.btn-rst{background:0;border:1px solid var(--border);color:var(--muted);
+         padding:8px 14px;border-radius:7px;font-size:12px;cursor:pointer;font-family:inherit}
+.btn-rst:hover{border-color:var(--danger);color:var(--danger)}
+.wl-stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(110px,1fr));gap:8px}
+.wsc{background:var(--bg);border:1px solid var(--border);border-radius:8px;
+     padding:8px 12px;text-align:center}
+.wsc .l{font-size:10px;text-transform:uppercase;letter-spacing:.5px;color:var(--dim)}
+.wsc .v{font-size:22px;font-weight:700;font-family:'Courier New',monospace;margin-top:2px}
+.wl-log{background:#0f172a;border-radius:8px;padding:10px 14px;font-family:'Courier New',monospace;
+        font-size:11px;line-height:1.7;max-height:160px;overflow-y:auto;
+        margin-top:12px;display:none}
+.wl-log.show{display:block}
+.wl-log .ok{color:#34d399}.wl-log .err{color:#f87171}.wl-log .info{color:#94a3b8}
+/* reset modal — normal-flow faux viewport, avoids position:fixed */
+.rst-wrap{display:none;min-height:180px;background:rgba(0,0,0,.45);border-radius:11px;
+          padding:20px;align-items:center;justify-content:center;margin-bottom:14px}
+.rst-wrap.show{display:flex}
+.rst-box{background:var(--card);border-radius:11px;padding:22px;max-width:400px;width:100%}
+.rst-box h3{font-size:15px;font-weight:700;margin-bottom:8px}
+.rst-box p{font-size:12px;color:var(--muted);margin-bottom:14px;line-height:1.6}
+.rst-btns{display:flex;gap:8px;flex-wrap:wrap}
+.rb-soft{background:rgba(251,191,36,.1);border:1px solid rgba(251,191,36,.4);color:var(--warn);
+         padding:7px 14px;border-radius:7px;cursor:pointer;font-size:12px;font-weight:600;font-family:inherit}
+.rb-hard{background:rgba(239,68,68,.08);border:1px solid rgba(239,68,68,.3);color:var(--danger);
+         padding:7px 14px;border-radius:7px;cursor:pointer;font-size:12px;font-weight:600;font-family:inherit}
+.rb-full{background:rgba(124,58,237,.08);border:1px solid rgba(124,58,237,.3);color:var(--purple);
+         padding:7px 14px;border-radius:7px;cursor:pointer;font-size:12px;font-weight:600;font-family:inherit}
+.rb-cancel{background:0;border:1px solid var(--border);color:var(--dim);
+           padding:7px 14px;border-radius:7px;cursor:pointer;font-size:12px;font-family:inherit}
 </style>
 </head><body>
 
@@ -449,6 +765,7 @@ tr:last-child td{border-bottom:none}
   <button class="tab"     onclick="switchTab(1)">Part B: MADlib / SQL</button>
   <button class="tab"     onclick="switchTab(2)">Part C: AI Factory</button>
   <button class="tab"     onclick="switchTab(3)" style="border-color:rgba(167,139,250,.3);color:var(--purple)">SQL Editor</button>
+  <button class="tab"     onclick="switchTab(4)" style="border-color:rgba(234,88,12,.3);color:#ea580c">D: ML &#8594; Watchlist</button>
 </div>
 
 <div class="main" id="main">
@@ -470,90 +787,62 @@ LIMIT 20;</textarea>
     <div style="margin-top:14px;overflow-x:auto;max-height:500px;overflow-y:auto" id="sqlr"></div>
   </div>
 
-  <!-- DATA RELOAD -->
+
+  <!-- Panel D: ML → Watchlist (static; query cards injected by buildPanels) -->
   <div class="pnl" id="pnl-4">
     <div class="sec-hdr">
-      <span class="n" style="background:linear-gradient(135deg,var(--warn),#b45309)">↺</span>
-      <h2>Data Reload</h2>
-      <div class="d">Re-runs all 5 SQL scripts — refreshes timestamps and rebuilds all derived tables including K-Means assignments</div>
+      <span class="n" style="background:linear-gradient(135deg,#ea580c,#d97706)">D</span>
+      <h2>ML &#8594; Watchlist</h2>
+      <div class="d">Write K-Means results back to fraud_watchlists · Query 1A before vs after ML update</div>
     </div>
 
-    <div class="reload-card">
-      <div class="reload-hdr">
-        <div>
-          <div class="reload-title">Full Dataset Reload</div>
-          <div class="reload-sub">{{ workshop_dir }} — drops schema, reseeds, loads ~50M rows (Jan–Apr 2026), rebuilds pgvector embeddings, MADlib features &amp; K-Means cluster assignments</div>
-        </div>
-        <div class="reload-actions">
-          <div class="spin-ring" id="reload-spinner"></div>
-          <button class="btn-reload" id="btn-reload" onclick="startReload()">⟳ Start Reload</button>
-          <button class="btn-abort"  id="btn-abort"  onclick="abortReload()" disabled>✕ Abort</button>
-        </div>
-      </div>
-
-      <div class="reload-body">
-        <!-- Status bar -->
-        <div class="reload-status-bar">
-          <div class="rstat">Status: <strong id="rstat-txt">Idle</strong></div>
-          <div class="rstat">Steps: <strong id="rstat-step">—</strong></div>
-          <div class="rstat">Elapsed: <strong id="rstat-elapsed">—</strong></div>
-        </div>
-
-        <!-- Step cards -->
-        <div class="reload-steps" id="reload-steps">
-          {% for fname, label in reload_scripts %}
-          <div class="step-card" id="step-{{ loop.index0 }}">
-            <div class="step-num">Step {{ loop.index }}</div>
-            <div class="step-name">{{ label }}</div>
-            <div class="step-file">{{ fname }}</div>
-            <div class="step-status idle" id="step-st-{{ loop.index0 }}">Waiting</div>
-          </div>
-          {% endfor %}
-        </div>
-
-        <!-- Log -->
-        <div style="font-size:11px;color:var(--dim);margin-bottom:6px;
-                    display:flex;justify-content:space-between;align-items:center">
-          <span>Live output</span>
-          <button onclick="clearLog()" style="background:0;border:0;color:var(--dim);
-                  cursor:pointer;font-size:11px;font-family:inherit">Clear</button>
-        </div>
-        <div class="logbox" id="reload-log">
-          <div class="log-line log-info">
-            <span class="log-ts">--:--:--</span>
-            <span class="log-msg">Ready — click "Start Reload" to refresh all data to current timestamps.</span>
-          </div>
-        </div>
+    <!-- Reset info box -->
+    <div style="background:#fef9f0;border:1px solid rgba(234,88,12,.25);border-radius:11px;padding:14px 18px;margin-bottom:16px;font-size:12px;line-height:1.7">
+      <div style="font-weight:700;color:#ea580c;margin-bottom:6px">&#9432; What to reset if Inserted = 0</div>
+      <div style="color:var(--muted)">
+        If the Refresh shows <strong>Inserted 0</strong>, those accounts are already in the watchlist from a previous run.<br>
+        Run this in psql to soft-reset (safe — just expires the flags, you can re-refresh immediately):<br>
+        <code style="background:var(--bg);padding:3px 8px;border-radius:4px;font-family:'Courier New',monospace;font-size:11px;display:inline-block;margin-top:4px">
+          UPDATE bfsi_demo.fraud_watchlists SET active=FALSE, last_seen=NOW() WHERE feed_name='MADlib K-Means' AND active=TRUE;
+        </code><br>
+        Then click <strong>Run Refresh</strong> again — D1 will show the gap, D2 will show them filled.
       </div>
     </div>
 
-    <!-- Info card -->
-    <div style="background:var(--card);border:1px solid var(--border);border-radius:12px;padding:18px 22px">
-      <div style="font-weight:600;margin-bottom:10px;font-size:14px">Why you need this</div>
-      <div style="font-size:13px;color:var(--muted);line-height:1.8">
-        The pgvector queries (A1, A2) and MADlib features (B1–B3) are static tables built from the
-        netflow/syslog data. The AI Factory query (C1) filters for anomalous IPs using aggregates over
-        <code style="background:var(--bg);padding:1px 5px;border-radius:3px;font-family:'Courier New',monospace">netflow_features</code>
-        which was populated from timestamped source data. After ~6h those source rows age out and the
-        features table may look sparse. A full reload re-inserts ~50M rows
-        and rebuilds all derived tables including the K-Means cluster assignments used by B3
-        (using MADlib kmeanspp if available, or a pure-SQL z-score fallback) —
-        takes approximately <strong>3–5 minutes</strong>.
+    <!-- Watchlist pipeline card -->
+    <div class="wl-card">
+      <div class="wl-title">ML Watchlist Pipeline</div>
+      <div class="wl-sub">
+        <b>Step 1</b>: Run D1 to see fraud transactions <em>not yet</em> in the watchlist (the gap MADlib found).<br>
+        <b>Step 2</b>: Click <strong>Run Refresh</strong> — writes K-Means results to fraud_watchlists.<br>
+        <b>Step 3</b>: Re-run D1 (should now show 0) and run D2 to see all flagged transactions with color coding.
       </div>
-      <div style="margin-top:14px;display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:8px">
-        {% for fname, label in reload_scripts %}
-        <div style="background:var(--bg);border:1px solid var(--border);border-radius:7px;padding:10px 12px">
-          <div style="font-family:'Courier New',monospace;font-size:10px;color:var(--accent);margin-bottom:3px">{{ fname }}</div>
-          <div style="font-size:12px;font-weight:500">{{ label }}</div>
-        </div>
-        {% endfor %}
+      <div class="wl-actions">
+        <button class="btn-wl"  id="btn-wl-refresh" onclick="wlRefresh()">&#9654; Run Refresh</button>
+        <span id="wl-status" style="font-size:13px;color:var(--dim)">Not yet run this session</span>
       </div>
+      <div class="wl-stats">
+        <div class="wsc"><div class="l">Inserted</div><div class="v" id="wl-ins" style="color:var(--accent)">—</div></div>
+        <div class="wsc"><div class="l">Expired</div> <div class="v" id="wl-exp" style="color:var(--warn)">—</div></div>
+        <div class="wsc"><div class="l">Time</div>    <div class="v" id="wl-ms"  style="color:var(--blue)">—</div></div>
+        <div class="wsc"><div class="l">ML Flags</div><div class="v" id="wl-tot" style="color:#ea580c">—</div></div>
+      </div>
+      <div class="wl-log" id="wl-log"></div>
     </div>
+
+    <!-- Query cards injected by buildPanels (D1, D2, D3) -->
+    <div class="sbar">
+      <div class="sstat"><div class="l">Queries</div><div class="v" style="color:var(--accent)">2</div></div>
+      <div class="sstat"><div class="l">Completed</div><div class="v" style="color:var(--blue)" id="done-3">0</div></div>
+      <div class="sstat"><div class="l">Total Time</div><div class="v" style="color:var(--warn)" id="tms-3">—</div></div>
+      <button class="rabtn" id="rabtn-3" onclick="runPanel(3)">&#9654; Run All 2</button>
+    </div>
+    <div class="qgrid" id="pnl-4-qgrid"></div>
   </div>
 
   <div class="ft">
-    <div>EDB WarehousePG — Lab 3: AI-Powered Analytics</div>
-    <div style="font-family:'Courier New',monospace">pgvector + MADlib + AI Factory</div>
+    <div>EDB WarehousePG — Lab 3: AI-Powered Analytics + ML Watchlist</div>
+    <div style="font-family:'Courier New',monospace">pgvector + MADlib + AI Factory + ML&#8594;Watchlist</div>
   </div>
 </div><!-- /main -->
 
@@ -585,40 +874,144 @@ function tbl(rows){
 }
 
 // ── build query panels ────────────────────────────────────────────────────
+function qCards(qs, pi){
+  let h='';
+  qs.forEach(q=>{
+    h += `<div class="qcard p${pi}" id="qc-${q.id}">
+      <div class="qbar" onclick="toggle('${q.id}')">
+        <span class="qid">${q.id.toUpperCase()}</span>
+        <div style="flex:1"><div class="qname">${esc(q.name)}</div><div class="qdesc">${esc(q.desc)}</div></div>
+        <span class="qtm" id="qt-${q.id}"></span>
+        <button class="rbtn" id="rb-${q.id}" onclick="event.stopPropagation();runQ('${q.id}')">Run</button>
+      </div>
+      <div class="qbody" data-pi="${pi}">
+        <div class="qsql">${esc(q.sql)}</div>
+        <div class="qactions">
+          <button class="rbtn" onclick="runQ('${q.id}')">&#9654; Run</button>
+          <button class="rbtn" onclick="copyQ('${q.id}')" style="background:var(--bdim);color:var(--blue);border-color:rgba(59,130,246,.3)">Copy SQL</button>
+          <button class="rbtn" onclick="toEditor('${q.id}')" style="background:rgba(167,139,250,.1);color:var(--purple);border-color:rgba(167,139,250,.3)">Edit in SQL</button>
+        </div>
+        <div class="qres" id="qr-${q.id}"></div>
+      </div>
+    </div>`;
+  });
+  return h;
+}
+
+const SCENARIO_HTML = {
+  0: `<div class="scenario">
+    <div class="sc-card full highlight">
+      <div class="sc-title">&#128270; The problem — Part A: pgvector</div>
+      <div class="sc-body">Analysts write keyword searches like <code>WHERE narrative LIKE '%structuring%'</code>. Fraud rings use different words for the same behaviour — <em>sub-threshold splits, layering, smurfing, rapid pass-through</em>. Keyword search misses <strong>70–80% of fraud</strong>.<br><br>
+      pgvector stores each case note as a 32-dimension vector encoding <strong>meaning, not words</strong>. A single <code>&lt;=&gt;</code> cosine distance operator finds semantically similar notes across all phrasing variants — no UDF, no regex, no re-indexing as language evolves.</div>
+    </div>
+    <div class="sc-card">
+      <div class="sc-title blue">WITHOUT pgvector</div>
+      <div class="sc-col bad" style="border-radius:8px;padding:10px 14px">
+        <ul><li>Keyword regex — misses phrasing variants</li><li>New attack = new rules written manually</li><li>30% fraud coverage</li><li>Export to Pinecone / Weaviate (data movement)</li></ul>
+      </div>
+    </div>
+    <div class="sc-card">
+      <div class="sc-title" style="color:var(--accent)">WITH pgvector (WHPG native)</div>
+      <div class="sc-col good" style="border-radius:8px;padding:10px 14px">
+        <ul><li>Semantic similarity — finds meaning, not words</li><li>New phrasings caught automatically</li><li>95% fraud coverage</li><li>Native operator in the same database — zero data movement</li></ul>
+      </div>
+    </div>
+  </div>`,
+
+  1: `<div class="scenario">
+    <div class="sc-card full highlight">
+      <div class="sc-title">&#129504; The problem — Part B: MADlib K-Means</div>
+      <div class="sc-body">You can't write rules for fraud you haven't seen yet. MADlib runs <strong>K-Means clustering in-database</strong> on 6 behavioural features extracted from ~50K accounts across 13M transactions — no labels required. The algorithm discovers fraud rings automatically by grouping accounts with statistically similar spend patterns.<br><br>
+      <strong>No data ever leaves WarehousePG.</strong> On Snowflake or Databricks you'd export to SageMaker, train externally, re-import results. Here: one SQL call, same engine, same second.</div>
+    </div>
+    <div class="sc-card">
+      <div class="sc-title warn">Traditional pipeline</div>
+      <div class="sc-stage">
+        <span class="sc-box">Warehouse</span><span class="sc-arrow">→</span>
+        <span class="sc-box">Export ETL</span><span class="sc-arrow">→</span>
+        <span class="sc-box">SageMaker</span><span class="sc-arrow">→</span>
+        <span class="sc-box">Re-import</span><span class="sc-arrow">→</span>
+        <span class="sc-box">App</span>
+      </div>
+      <div class="sc-body" style="font-size:12px;margin-top:6px">6 stages · 3 vendors · 2 security reviews · hours of lag</div>
+    </div>
+    <div class="sc-card">
+      <div class="sc-title" style="color:var(--accent)">WHPG in-database ML</div>
+      <div class="sc-stage">
+        <span class="sc-box hi">account_features</span><span class="sc-arrow">→</span>
+        <span class="sc-box hi">MADlib K-Means</span><span class="sc-arrow">→</span>
+        <span class="sc-box hi">kmeans_labeled</span>
+      </div>
+      <div class="sc-body" style="font-size:12px;margin-top:6px">1 engine · 1 SQL call · 0 data exports · &lt; 5 seconds</div>
+    </div>
+    <div class="sc-card full">
+      <div class="sc-title purple">6 behavioural features fed to K-Means</div>
+      <div class="sc-body" style="margin-bottom:10px">Each account becomes a point in 6-dimensional feature space. The algorithm finds natural clusters — fraud rings self-identify by proximity.</div>
+      <div style="display:grid;grid-template-columns:repeat(6,1fr);gap:8px;text-align:center">
+        <div style="background:var(--bg);border-radius:7px;padding:8px 6px"><div style="font-size:18px">&#128200;</div><div style="font-size:10px;font-weight:600;margin-top:3px">txn_count</div><div style="font-size:10px;color:var(--dim)">How active?</div></div>
+        <div style="background:var(--bg);border-radius:7px;padding:8px 6px"><div style="font-size:18px">&#127978;</div><div style="font-size:10px;font-weight:600;margin-top:3px">distinct_merchants</div><div style="font-size:10px;color:var(--dim)">How many merchants?</div></div>
+        <div style="background:var(--bg);border-radius:7px;padding:8px 6px"><div style="font-size:18px">&#128181;</div><div style="font-size:10px;font-weight:600;margin-top:3px">total_amount</div><div style="font-size:10px;color:var(--dim)">How much spend?</div></div>
+        <div style="background:var(--bg);border-radius:7px;padding:8px 6px"><div style="font-size:18px">&#127922;</div><div style="font-size:10px;font-weight:600;margin-top:3px">merchant_entropy</div><div style="font-size:10px;color:var(--dim)">How scattered?</div></div>
+        <div style="background:var(--bg);border-radius:7px;padding:8px 6px"><div style="font-size:18px">&#128101;</div><div style="font-size:10px;font-weight:600;margin-top:3px">mcc_spread</div><div style="font-size:10px;color:var(--dim)">Merchant diversity?</div></div>
+        <div style="background:var(--bg);border-radius:7px;padding:8px 6px"><div style="font-size:18px">&#128202;</div><div style="font-size:10px;font-weight:600;margin-top:3px">amount_cv</div><div style="font-size:10px;color:var(--dim)">Amount consistency?</div></div>
+      </div>
+      <div class="sc-personas">
+        <div class="sc-persona normal"><div class="p-icon">&#10003;</div><div class="p-name">Normal</div><div class="p-stat">~50K accounts<br>6 merchants · $2.3K avg</div></div>
+        <div class="sc-persona card"><div class="p-icon">&#128269;</div><div class="p-name">Card-Testing</div><div class="p-stat">~40 accounts<br>600 merchants · tiny tickets</div></div>
+        <div class="sc-persona bust"><div class="p-icon">&#128228;</div><div class="p-name">Bust-Out</div><div class="p-stat">~30 accounts<br>9 merchants · $1.5M spend</div></div>
+        <div class="sc-persona struct"><div class="p-icon">&#129302;</div><div class="p-name">Structuring</div><div class="p-stat">~40 accounts<br>1 merchant · $4.7K fixed</div></div>
+      </div>
+    </div>
+  </div>`,
+
+  2: `<div class="scenario">
+    <div class="sc-card full highlight">
+      <div class="sc-title">&#127981; Part C: The AI Factory — pgvector + MADlib in ONE query</div>
+      <div class="sc-body">MADlib finds <strong>behavioural anomalies</strong> (accounts with extreme spend patterns). pgvector finds <strong>semantic matches</strong> (case notes with similar meaning). Join them — and the same fraud types surface from two completely independent signals in a single SQL statement.<br><br>
+      This is the critical limitation of competing platforms: <strong>Snowflake and Databricks cannot do this without exporting data to an external ML tool.</strong> In WarehousePG, both algorithms run where the data lives — no API, no data movement, no token cost until the very last mile.</div>
+    </div>
+    <div class="sc-card">
+      <div class="sc-title blue">Token funnel — why this matters for LLM cost</div>
+      <div class="sc-stage" style="flex-direction:column;align-items:flex-start;gap:6px">
+        <div style="display:flex;align-items:center;gap:8px"><span class="sc-box">13M rows</span><span class="sc-arrow">→</span><span style="font-size:11px;color:var(--dim)">MADlib K-Means · 0 tokens</span></div>
+        <div style="display:flex;align-items:center;gap:8px"><span class="sc-box hi">~26 anomalous accounts</span><span class="sc-arrow">→</span><span style="font-size:11px;color:var(--dim)">pgvector search · 0 tokens</span></div>
+        <div style="display:flex;align-items:center;gap:8px"><span class="sc-box hi">~40 related events</span><span class="sc-arrow">→</span><span style="font-size:11px;color:var(--dim)">LLM summary · ~2–4K tokens</span></div>
+      </div>
+    </div>
+    <div class="sc-card">
+      <div class="sc-title" style="color:var(--accent)">The competitive moat</div>
+      <div class="sc-body">
+        <strong>Snowflake / Databricks:</strong> export 13M rows → SageMaker → re-import → JOIN → 2–4 hours<br><br>
+        <strong>WarehousePG:</strong> <code>SELECT madlib.kmeanspp(...)</code> + <code>&lt;=&gt;</code> in one query → &lt; 5 seconds<br><br>
+        Cost grows with <em>findings</em>, not data size.
+      </div>
+    </div>
+  </div>`
+};
+
 function buildPanels(){
   const main   = document.getElementById('main');
   const anchor = document.getElementById('pnl-3');
   PANELS.forEach((p, pi)=>{
     const qs = QUERIES.filter(q=>q.panel===pi);
+    // Panel 3 (D) already has its wrapper HTML; just inject cards into the qgrid
+    if(pi===3){
+      const grid=document.getElementById('pnl-4-qgrid');
+      if(grid) grid.innerHTML=qCards(qs,pi);
+      return;
+    }
     let h = `<div class="pnl${pi===0?' on':''}" id="pnl-${pi}">`;
     h += `<div class="sec-hdr"><span class="n">${p.icon}</span><h2>${p.name}</h2><div class="d">${esc(p.desc)}</div></div>`;
+    // inject scenario card if defined for this panel
+    if(SCENARIO_HTML[pi]) h += SCENARIO_HTML[pi];
     h += `<div class="sbar">
       <div class="sstat"><div class="l">Queries</div><div class="v" style="color:var(--accent)">${qs.length}</div></div>
       <div class="sstat"><div class="l">Completed</div><div class="v" style="color:var(--blue)" id="done-${pi}">0</div></div>
       <div class="sstat"><div class="l">Total Time</div><div class="v" style="color:var(--warn)" id="tms-${pi}">—</div></div>
-      <button class="rabtn" id="rabtn-${pi}" onclick="runPanel(${pi})">▶ Run All ${qs.length}</button>
+      <button class="rabtn" id="rabtn-${pi}" onclick="runPanel(${pi})">&#9654; Run All ${qs.length}</button>
     </div>`;
-    h += `<div class="qgrid">`;
-    qs.forEach(q=>{
-      h += `<div class="qcard p${pi}" id="qc-${q.id}">
-        <div class="qbar" onclick="toggle('${q.id}')">
-          <span class="qid">${q.id.toUpperCase()}</span>
-          <div style="flex:1"><div class="qname">${esc(q.name)}</div><div class="qdesc">${esc(q.desc)}</div></div>
-          <span class="qtm" id="qt-${q.id}"></span>
-          <button class="rbtn" id="rb-${q.id}" onclick="event.stopPropagation();runQ('${q.id}')">Run</button>
-        </div>
-        <div class="qbody">
-          <div class="qsql">${esc(q.sql)}</div>
-          <div class="qactions">
-            <button class="rbtn" onclick="runQ('${q.id}')">▶ Run</button>
-            <button class="rbtn" onclick="copyQ('${q.id}')" style="background:var(--bdim);color:var(--blue);border-color:rgba(59,130,246,.3)">Copy SQL</button>
-            <button class="rbtn" onclick="toEditor('${q.id}')" style="background:rgba(167,139,250,.1);color:var(--purple);border-color:rgba(167,139,250,.3)">Edit in SQL</button>
-          </div>
-          <div class="qres" id="qr-${q.id}"></div>
-        </div>
-      </div>`;
-    });
-    h += `</div></div>`;
+    h += `<div class="qgrid">${qCards(qs,pi)}</div></div>`;
     const div = document.createElement('div');
     div.innerHTML = h;
     main.insertBefore(div.firstChild, anchor);
@@ -692,139 +1085,107 @@ async function runSQL(){
   }
 }
 
-// ── DATA RELOAD ───────────────────────────────────────────────────────────
-let reloadPollTimer = null;
-let reloadStartTs   = null;
-let lastLogLen      = 0;
 
-const STEP_KEYWORDS = [
-  '01_schema',
-  '02_seed_reference',
-  '03_load_external',
-  '06_ai_analytics',
-  '07_kmeans_fallback',
-];
-
-function setStepState(idx, state){
-  const card = document.getElementById('step-'+idx);
-  const st   = document.getElementById('step-st-'+idx);
-  if(!card) return;
-  card.className = 'step-card'+(state!=='idle'?' '+state:'');
-  st.className   = 'step-status '+state;
-  st.textContent = {idle:'Waiting',active:'Running…',done:'✓ Done',error:'✗ Error'}[state]||state;
+// ── Panel D: ML Watchlist ────────────────────────────────────────────────
+function wlLog(msg, cls='info'){
+  const box=document.getElementById('wl-log');
+  box.classList.add('show');
+  const d=document.createElement('div'); d.className=cls;
+  const ts=new Date().toLocaleTimeString('en-GB',{hour12:false});
+  d.textContent=`[${ts}] ${msg}`;
+  box.appendChild(d); box.scrollTop=box.scrollHeight;
 }
 
-function guessActiveStep(logLines){
-  for(let i=logLines.length-1;i>=0;i--){
-    const msg=logLines[i][2]||'';
-    for(let s=0;s<STEP_KEYWORDS.length;s++){
-      if(msg.includes(STEP_KEYWORDS[s])) return s;
-    }
-  }
-  return -1;
+function fmtN(n){
+  n=Number(n);
+  if(n>=1e6) return(n/1e6).toFixed(1)+'M';
+  if(n>=1e3) return(n/1e3).toFixed(1)+'K';
+  return n.toLocaleString();
 }
 
-function renderLog(logLines, append=false){
-  const box=document.getElementById('reload-log');
-  if(!append){ box.innerHTML=''; lastLogLen=0; }
-  const newLines=logLines.slice(lastLogLen);
-  newLines.forEach(([ts,lvl,msg])=>{
-    const div=document.createElement('div');
-    div.className='log-line log-'+lvl;
-    div.innerHTML=`<span class="log-ts">${esc(ts)}</span><span class="log-msg">${esc(msg)}</span>`;
-    box.appendChild(div);
-  });
-  if(newLines.length) box.scrollTop=box.scrollHeight;
-  lastLogLen=logLines.length;
-}
-
-async function pollReload(){
+async function wlRefresh(){
+  const btn=document.getElementById('btn-wl-refresh');
+  const st =document.getElementById('wl-status');
+  btn.disabled=true; btn.textContent='Running…';
+  st.textContent='Refreshing…'; st.style.color='var(--warn)';
+  document.getElementById('wl-log').innerHTML='';
+  wlLog('Step 1: Expire existing MADlib K-Means flags…');
   try{
-    const r=await(await fetch('/api/reload/status')).json();
-    renderLog(r.log, true);
-
-    if(reloadStartTs){
-      const sec=Math.round((Date.now()-reloadStartTs)/1000);
-      document.getElementById('rstat-elapsed').textContent=sec+'s';
-    }
-
-    const activeStep=guessActiveStep(r.log);
-    for(let i=0;i<STEP_KEYWORDS.length;i++){
-      const isDone  = activeStep>i || (!r.running && r.log.some(([,,m])=>m&&m.includes('✓')&&m.includes(STEP_KEYWORDS[i])));
-      const isErr   = r.log.some(([,l])=>l==='error') && activeStep===i && !isDone;
-      const isActive= r.running && activeStep===i;
-      setStepState(i, isDone?'done':isErr?'error':isActive?'active':'idle');
-    }
-
-    const stepsDone=STEP_KEYWORDS.filter((_,i)=>
-      r.log.some(([,,m])=>m&&m.includes('✓')&&m.includes(STEP_KEYWORDS[i]))
-    ).length;
-    document.getElementById('rstat-step').textContent=stepsDone+' / '+STEP_KEYWORDS.length;
-
-    if(r.running){
-      document.getElementById('rstat-txt').textContent='Running';
-      document.getElementById('reload-spinner').classList.add('active');
-    } else {
-      document.getElementById('reload-spinner').classList.remove('active');
-      clearInterval(reloadPollTimer); reloadPollTimer=null;
-      document.getElementById('btn-reload').disabled=false;
-      document.getElementById('btn-abort').disabled=true;
-      document.getElementById('rstat-txt').textContent=
-        r.log.some(([,l])=>l==='done') ? '✓ Complete' : 'Idle';
-      document.getElementById('tab-reload').textContent='✓ Reload Done';
-      setTimeout(()=>{ document.getElementById('tab-reload').textContent='⟳ Data Reload'; }, 5000);
-    }
-  }catch(e){ console.error('poll error',e); }
+    const r=await(await fetch('/api/watchlist/refresh',{method:'POST'})).json();
+    if(!r.ok){ wlLog('ERROR: '+r.error,'err'); st.textContent='Error'; st.style.color='var(--danger)'; btn.disabled=false; btn.textContent='&#9654; Run Refresh'; return; }
+    wlLog(`  ✓ Reset ${r.reset} existing flags (${r.reset_ms}ms)`,'ok');
+    wlLog('Step 2: INSERT fresh from kmeans_assignments…');
+    wlLog(`  ✓ Inserted ${r.inserted} new flags (${r.insert_ms}ms)`,'ok');
+    wlLog('Step 3: Expire accounts that left fraud clusters…');
+    wlLog(`  ✓ Expired ${r.expired} stale flags (${r.expire_ms}ms)`,'ok');
+    wlLog(`Done in ${r.total_ms}ms`,'ok');
+    document.getElementById('wl-ins').textContent=fmtN(r.inserted);
+    document.getElementById('wl-exp').textContent=fmtN(r.expired);
+    document.getElementById('wl-ms').textContent =r.total_ms+'ms';
+    const tot=(r.summary||[]).filter(s=>s.feed_name==='MADlib K-Means').reduce((s,x)=>s+(x.active_flags||0),0);
+    document.getElementById('wl-tot').textContent=fmtN(tot);
+    wlLog(''); (r.summary||[]).forEach(s=>wlLog(`  ${s.feed_name} / ${s.category}: ${s.active_flags} active`));
+    wlLog(''); wlLog('Run D1 — should show 0 unflagged accounts. Run D2 to see all flagged transactions.');
+    st.textContent='✓ Complete'; st.style.color='var(--accent)';
+    btn.disabled=false; btn.textContent='&#9654; Run Refresh';
+    await runQ('d1');
+    await runQ('d2');
+  }catch(e){
+    wlLog('Network error: '+e.message,'err');
+    st.textContent='Error'; st.style.color='var(--danger)';
+    btn.disabled=false; btn.textContent='&#9654; Run Refresh';
+  }
 }
 
-async function startReload(){
-  if(!confirm('This will drop and recreate the entire schema (~5–8 min). Proceed?')) return;
-  lastLogLen=0;
-  document.getElementById('reload-log').innerHTML='';
-  for(let i=0;i<STEP_KEYWORDS.length;i++) setStepState(i,'idle');
 
-  const r=await(await fetch('/api/reload/start',{method:'POST'})).json();
-  if(!r.ok){ alert('Error: '+r.msg); return; }
 
-  reloadStartTs=Date.now();
-  document.getElementById('btn-reload').disabled=true;
-  document.getElementById('btn-abort').disabled=false;
-  document.getElementById('rstat-txt').textContent='Running';
-  document.getElementById('rstat-elapsed').textContent='0s';
-  document.getElementById('reload-spinner').classList.add('active');
-  document.getElementById('tab-reload').textContent='↻ Reloading…';
-  reloadPollTimer=setInterval(pollReload, 1000);
+// ── tbl override: support optional row highlight function ─────────────────
+const _tbl_orig=tbl;
+function tblHL(rows, hlFn){
+  if(!rows||!rows.length) return '<div class="empty">No results — run the ML Watchlist Refresh first, then re-run this query.</div>';
+  const ks=Object.keys(rows[0]);
+  let h='<table><thead><tr>'+ks.map(k=>'<th>'+esc(k)+'</th>').join('')+'</tr></thead><tbody>';
+  rows.forEach(r=>{
+    const cls=hlFn?hlFn(r):'';
+    h+=`<tr${cls?' class="'+cls+'"':''}>` +ks.map(k=>'<td>'+(r[k]!=null?esc(String(r[k])):'—')+'</td>').join('')+'</tr>';
+  });
+  return h+'</tbody></table>';
 }
 
-async function abortReload(){
-  if(!confirm('Abort the reload? The current script may still finish.')) return;
-  await fetch('/api/reload/abort',{method:'POST'});
-  clearInterval(reloadPollTimer);
-  document.getElementById('btn-reload').disabled=false;
-  document.getElementById('btn-abort').disabled=true;
-  document.getElementById('rstat-txt').textContent='Aborted';
-  document.getElementById('reload-spinner').classList.remove('active');
-}
-
-function clearLog(){
-  document.getElementById('reload-log').innerHTML='';
-  lastLogLen=0;
+// patch runQ to highlight d2 rows
+const _runQ_orig=runQ;
+async function runQ(id){
+  const btn=document.getElementById('rb-'+id);
+  btn.disabled=true; btn.textContent='…';
+  document.getElementById('qr-'+id).innerHTML='<div style="padding:20px;text-align:center"><div class="spinner"></div></div>';
+  document.getElementById('qc-'+id).classList.add('open');
+  try{
+    const r=await(await fetch('/api/run',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id})})).json();
+    results[id]=r;
+    const slow=r.ms>5000;
+    document.getElementById('qt-'+id).innerHTML=`<span class="t${slow?' slow':''}">${fmtMs(r.ms)}</span><span class="r" style="color:var(--dim);margin-left:6px">${r.rows} rows</span>`;
+    const hlFn = id==='d1'
+      ? (row=>'unflagged-row')  // all D1 rows are unflagged — highlight orange
+      : id==='d2'
+      ? (row=>{
+          const src=(row.source||'').toString();
+          if(src.includes('ML')) return 'ml-row';     // green: new ML accounts
+          return 'bin-row';                            // blue: original BIN matches
+        })
+      : null;
+    document.getElementById('qr-'+id).innerHTML=r.error
+      ?`<div style="color:var(--danger);padding:12px;font-family:'Courier New',monospace;font-size:12px">ERROR: ${esc(r.error)}</div>`
+      :tblHL(r.data, hlFn);
+  }catch(e){
+    document.getElementById('qr-'+id).innerHTML=`<div style="color:var(--danger);padding:12px">${e.message}</div>`;
+  }
+  btn.disabled=false; btn.textContent='Run';
+  updatePanel(QUERIES.find(q=>q.id===id).panel);
 }
 
 // ── init ──────────────────────────────────────────────────────────────────
 buildPanels();
-// Resume poll if reload was already running
-fetch('/api/reload/status').then(r=>r.json()).then(d=>{
-  if(d.running){
-    reloadStartTs=Date.now();
-    document.getElementById('btn-reload').disabled=true;
-    document.getElementById('btn-abort').disabled=false;
-    document.getElementById('reload-spinner').classList.add('active');
-    reloadPollTimer=setInterval(pollReload,1000);
-  } else if(d.log&&d.log.length){
-    renderLog(d.log,false);
-  }
-});
+
 </script>
 </body></html>"""
 if __name__ == "__main__":
@@ -836,4 +1197,4 @@ if __name__ == "__main__":
 ║  http://0.0.0.0:5002                                    ║
 ╚══════════════════════════════════════════════════════════╝
     """)
-    app.run(host="0.0.0.0", port=5002, debug=False)
+    app.run(host="0.0.0.0", port=5010, debug=False)

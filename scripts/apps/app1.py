@@ -194,17 +194,16 @@ ORDER BY events DESC"""
         "id": "3c", "panel": 2,
         "name": "3C \u00b7 Customer Risk Scorecard",
         "desc": "Per-customer risk scoring via fraud_risk_score() \u2014 worst-first for review",
-        "sql": """SELECT c.customer_name, c.segment, r.region_code,
+        "sql": """SELECT c.customer_name, c.segment,
     ROUND(AVG(k.decline_rate_pct), 2) AS avg_decline_pct,
-    ROUND(AVG(k.fraud_bps), 1)        AS avg_fraud_bps,
-    ROUND(AVG(k.txn_velocity), 1)     AS avg_velocity,
+    ROUND(AVG(k.fraud_bps), 1) AS avg_fraud_bps,
+    ROUND(AVG(k.txn_velocity), 1) AS avg_velocity,
     ROUND(fraud_risk_score(AVG(k.avg_ticket), AVG(k.decline_rate_pct), AVG(k.fraud_bps)), 1) AS risk_score,
     rp.max_decline_rate
 FROM customers c
 JOIN risk_profiles rp ON c.customer_id = rp.customer_id AND rp.effective_to IS NULL
-JOIN regions r ON c.region_id = r.region_id
-JOIN account_kpis k ON c.customer_id = k.customer_id AND k.ts >= '2026-06-01'::timestamp
-GROUP BY 1, 2, 3, 8
+JOIN account_kpis k ON c.customer_id = k.customer_id
+GROUP BY c.customer_name, c.segment, rp.max_decline_rate
 ORDER BY risk_score DESC"""
     },
     {
@@ -242,7 +241,7 @@ PANELS = [
 CHECK_QUESTIONS = [
     {
         "kind": "concept",
-        "title": "Why was card_bin <@ bin_range fast on 33M transactions?",
+        "title": "Why was card_bin <@ bin_range fast on 5M transactions?",
         "ask": "You ran the watchlist join in roughly 1 second. Name three things that made that fast \u2014 that wouldn't be true on single-node Postgres or on Snowflake.",
         "listen": "Native int8range type with a GiST index (no string parsing) \u00b7 MPP parallelism across all segments \u00b7 no UDF overhead \u2014 the containment operator is built into the planner",
     },
