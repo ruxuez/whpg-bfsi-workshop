@@ -1,1215 +1,887 @@
 #!/usr/bin/env python3
 """
-Lab 3 - AI-Powered Fraud Analytics: STREAMLINED Dashboard (BFSI)
-Focus: pgvector value, MADlib value, and their combination
+PGAA Lab 3 Dashboard - Iceberg vs Native WHPG (Workshop Edition)
 
-Connects to WarehousePG (bfsi schema, port 5432)
+Trimmed from 8 queries / benchmark-heavy to 5 queries / 4 lab-aligned tabs:
+  1. Same SQL, Two Engines  - side-by-side runner, one click each
+  2. Speed Comparison       - clean bar chart, no winner splash
+  3. Comprehension Check    - 2 discussion questions with reveal-answer
+  4. Challenge              - fill-in-the-blank SQL with reveal solution
+
+USAGE
+  pip3 install flask psycopg2-binary
+  python3 pgaa_dashboard_app.py                 # default: port 5000
+  python3 pgaa_dashboard_app.py --port 5050     # specific port
+  PORT=5050 python3 pgaa_dashboard_app.py       # via env var
+
+DB OVERRIDES (env vars):
+  WHPG_HOST, WHPG_PORT, WHPG_DB, WHPG_USER, WHPG_PASS
+  WHPG_NATIVE_SCHEMA   (default: demo)  - schema where native tables live
 """
 
-import os, time, decimal
-from datetime import datetime, date
-from flask import Flask, render_template_string, jsonify, request
+import os, time, argparse, concurrent.futures
 import psycopg2, psycopg2.extras
+from flask import Flask, jsonify, Response, request
 
 app = Flask(__name__)
 
-DB = {
-    "host":     os.environ.get("WHPG_HOST", "localhost"),
-    "port":     int(os.environ.get("WHPG_PORT", 5432)),
-    "dbname":   os.environ.get("WHPG_DB",   "demo"),
-    "user":     os.environ.get("WHPG_USER", "gpadmin"),
-    "password": os.environ.get("WHPG_PASS", ""),
+DB_CONFIG = {
+    'host':     os.environ.get('WHPG_HOST', 'localhost'),
+    'port':     int(os.environ.get('WHPG_PORT', 5432)),
+    'database': os.environ.get('WHPG_DB',   'demo'),
+    'user':     os.environ.get('WHPG_USER', 'gpadmin'),
+    'password': os.environ.get('WHPG_PASS', ''),
+}
+NATIVE_SCHEMA = os.environ.get('WHPG_NATIVE_SCHEMA', 'demo')
+
+
+def query(sql):
+    conn = psycopg2.connect(**DB_CONFIG)
+    cur = conn.cursor()
+    t0 = time.perf_counter()
+    cur.execute(sql)
+    rows = cur.fetchall()
+    ms = round((time.perf_counter() - t0) * 1000, 2)
+    cols = [d[0] for d in cur.description] if cur.description else []
+    cur.close(); conn.close()
+    return {'columns': cols, 'rows': rows, 'row_count': len(rows), 'exec_time_ms': ms}
+
+
+def to_native(sql):
+    return (sql
+            .replace('customers_iceberg',   f'{NATIVE_SCHEMA}.customers')
+            .replace('products_iceberg',    f'{NATIVE_SCHEMA}.products')
+            .replace('orders_iceberg',      f'{NATIVE_SCHEMA}.orders')
+            .replace('order_items_iceberg', f'{NATIVE_SCHEMA}.order_items')
+            .replace('events_iceberg',      f'{NATIVE_SCHEMA}.events'))
+
+
+QUERIES = {
+    'revenue': {
+        'name': 'Revenue by Category',
+        'desc': 'Simple JOIN - sets the baseline',
+        'sql': '''SELECT p.category,
+       COUNT(DISTINCT oi.order_id)             AS orders,
+       SUM(oi.quantity)                        AS units_sold,
+       ROUND(SUM(oi.quantity * oi.unit_price)::numeric, 2) AS revenue
+FROM   products_iceberg    p
+JOIN   order_items_iceberg oi ON p.product_id = oi.product_id
+GROUP  BY p.category
+ORDER  BY revenue DESC''',
+    },
+    'top20': {
+        'name': 'Top 20 Customers',
+        'desc': 'Multi-table JOIN - ranked by spend',
+        'sql': '''SELECT c.customer_id,
+       c.first_name || ' ' || c.last_name      AS customer,
+       COUNT(o.order_id)                       AS orders,
+       ROUND(SUM(o.total_amount)::numeric, 2)  AS lifetime_value
+FROM   customers_iceberg c
+JOIN   orders_iceberg    o ON c.customer_id = o.customer_id
+GROUP  BY 1, 2
+ORDER  BY lifetime_value DESC
+LIMIT  20''',
+    },
+    'funnel': {
+        'name': 'Conversion Funnel',
+        'desc': 'CTE on events - view -> cart -> purchase',
+        'sql': '''WITH funnel AS (
+    SELECT customer_id,
+           MAX(CASE WHEN event_type = 'page_view'   THEN 1 ELSE 0 END) AS viewed,
+           MAX(CASE WHEN event_type = 'add_to_cart' THEN 1 ELSE 0 END) AS carted,
+           MAX(CASE WHEN event_type = 'purchase'    THEN 1 ELSE 0 END) AS purchased
+    FROM   events_iceberg
+    GROUP  BY customer_id
+)
+SELECT SUM(viewed)       AS viewers,
+       SUM(carted)       AS cart_adds,
+       SUM(purchased)    AS purchases,
+       ROUND(100.0 * SUM(carted)    / NULLIF(SUM(viewed), 0), 2) AS view_to_cart_pct,
+       ROUND(100.0 * SUM(purchased) / NULLIF(SUM(carted), 0), 2) AS cart_to_buy_pct
+FROM   funnel''',
+    },
+    'summary': {
+        'name': 'Executive Summary',
+        'desc': '5 parallel COUNT(*) - quick scan-cost check',
+        'sql': '''SELECT (SELECT COUNT(*) FROM customers_iceberg)   AS customers,
+       (SELECT COUNT(*) FROM products_iceberg)    AS products,
+       (SELECT COUNT(*) FROM orders_iceberg)      AS orders,
+       (SELECT COUNT(*) FROM order_items_iceberg) AS order_items,
+       (SELECT COUNT(*) FROM events_iceberg)      AS events''',
+    },
+    'daily': {
+        'name': 'Daily Dashboard (5-table JOIN)',
+        'desc': 'The complex query - biggest perf gap between engines',
+        'sql': '''SELECT o.order_date,
+       COUNT(DISTINCT o.order_id)                     AS orders,
+       ROUND(SUM(o.total_amount)::numeric, 2)         AS revenue,
+       COUNT(DISTINCT o.customer_id)                  AS unique_customers,
+       SUM(oi.quantity)                               AS units_sold,
+       COUNT(*) FILTER (WHERE o.status = 'delivered') AS delivered,
+       COUNT(DISTINCT e.session_id)                   AS sessions
+FROM   orders_iceberg      o
+JOIN   order_items_iceberg oi ON o.order_id    = oi.order_id
+JOIN   products_iceberg    p  ON oi.product_id = p.product_id
+JOIN   customers_iceberg   c  ON o.customer_id = c.customer_id
+LEFT JOIN events_iceberg   e  ON c.customer_id = e.customer_id
+                              AND e.event_date = o.order_date
+GROUP  BY o.order_date
+ORDER  BY o.order_date DESC
+LIMIT  30''',
+    },
 }
 
-def run(sql, params=None):
-    conn = psycopg2.connect(**DB)
-    conn.set_session(autocommit=True)
-    try:
-        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-        t0 = time.perf_counter()
-        cur.execute("SET search_path TO bfsi_demo, public;")
-        cur.execute(sql, params)
-        ms = round((time.perf_counter() - t0) * 1000, 1)
-        rows = []
-        for row in cur.fetchall():
-            r = {}
-            for k, v in row.items():
-                if isinstance(v, (datetime, date)):  r[k] = v.isoformat()
-                elif isinstance(v, decimal.Decimal): r[k] = float(v)
-                elif v is None:                      r[k] = None
-                elif isinstance(v, (int, float, bool)): r[k] = v
-                else:                                r[k] = str(v)
-            rows.append(r)
-        return {"data": rows, "ms": ms, "rows": len(rows)}
-    except Exception as e:
-        return {"data": [], "ms": 0, "rows": 0, "error": str(e)}
-    finally:
-        conn.close()
 
-def run_write(sql, params=None):
-    """Execute a write (INSERT/UPDATE/DELETE/TRUNCATE) and return rowcount."""
-    conn = psycopg2.connect(**DB)
-    conn.set_session(autocommit=True)
-    try:
-        cur = conn.cursor()
-        t0  = time.perf_counter()
-        cur.execute("SET search_path TO bfsi_demo, public;")
-        cur.execute(sql, params)
-        return {"rowcount": cur.rowcount, "ms": round((time.perf_counter()-t0)*1000,1)}
-    except Exception as e:
-        return {"rowcount": 0, "ms": 0, "error": str(e)}
-    finally:
-        conn.close()
-
-# ── ML Watchlist SQL ──────────────────────────────────────────────────────────
-
-SQL_1A_BEFORE = """
--- Fraud transactions from K-Means clusters that are NOT yet in fraud_watchlists
--- These accounts were detected by MADlib but haven't been written back yet.
--- Uses inferred_label instead of cluster_id to handle K-means non-determinism.
-WITH ml_fraud_accounts AS (
-    SELECT
-        kl.account_id,
-        kl.inferred_label,
-        -- Map ML labels to watchlist categories
-        CASE kl.inferred_label
-            WHEN 'CARD-TESTING' THEN 'compromised_bin'
-            WHEN 'BUST-OUT' THEN 'velocity_abuse'
-            WHEN 'STRUCTURING' THEN 'structuring'
-        END AS ml_category,
-        -- Confidence scores by fraud type
-        CASE kl.inferred_label
-            WHEN 'CARD-TESTING' THEN 87
-            WHEN 'BUST-OUT' THEN 85
-            WHEN 'STRUCTURING' THEN 90
-        END AS ml_confidence
-    FROM bfsi_demo.kmeans_labeled kl
-    WHERE kl.inferred_label IN ('CARD-TESTING', 'BUST-OUT', 'STRUCTURING')
-)
-SELECT
-    t.account_id,
-    mf.inferred_label             AS fraud_persona,
-    mf.ml_category                AS fraud_type_detected_by_ml,
-    mf.ml_confidence              AS confidence,
-    COUNT(*)                      AS transactions,
-    ROUND(SUM(t.amount), 2)       AS total_exposure,
-    MIN(t.ts)                     AS first_txn,
-    MAX(t.ts)                     AS last_txn,
-    'NOT IN watchlist'            AS watchlist_status
-FROM bfsi_demo.transactions t
-JOIN ml_fraud_accounts mf ON t.account_id = mf.account_id
-WHERE t.ts >= '2026-06-01'::timestamp
-  AND NOT EXISTS (
-        SELECT 1
-        FROM bfsi_demo.fraud_watchlists w
-        WHERE w.single_account = t.account_id
-          AND w.feed_name = 'MADlib K-Means'
-          AND w.active = TRUE
-      )
-GROUP BY t.account_id, mf.inferred_label, mf.ml_category, mf.ml_confidence
-ORDER BY total_exposure DESC
-LIMIT 20
-"""
-
-SQL_1A_AFTER = """
--- Each branch has its own LIMIT so BIN rows are never crowded out
--- by the much larger ML account totals ($245M vs $23K per BIN).
--- Both groups always visible; blue = BIN range, green = ML K-Means account.
-WITH bin_hits AS (
-    SELECT wb.card_bin::TEXT       AS match_key,
-           wb.feed_name, wb.category, wb.confidence,
-           'BIN range match'       AS source,
-           COUNT(*)                AS transactions,
-           ROUND(SUM(t.amount),2)  AS total_amount,
-           MIN(t.ts) AS first_txn, MAX(t.ts) AS last_txn
-    FROM   bfsi_demo.transactions t
-    JOIN   (
-               SELECT feed_name, category, confidence,
-                      generate_series(lower(bin_range), upper(bin_range)-1) AS card_bin
-               FROM   bfsi_demo.fraud_watchlists
-               WHERE  active=TRUE AND confidence>=75
-                 AND  bin_range IS NOT NULL AND NOT isempty(bin_range)
-           ) wb ON t.card_bin = wb.card_bin
-    WHERE  t.ts >= '2026-06-01'::timestamp
-    GROUP  BY 1,2,3,4,5
-    ORDER  BY total_amount DESC
-    LIMIT  10
-),
-acct_hits AS (
-    SELECT 'acct:'||t.account_id::TEXT AS match_key,
-           w.feed_name, w.category, w.confidence,
-           'ML K-Means account'    AS source,
-           COUNT(*)                 AS transactions,
-           ROUND(SUM(t.amount),2)   AS total_amount,
-           MIN(t.ts) AS first_txn,  MAX(t.ts) AS last_txn
-    FROM   bfsi_demo.transactions t
-    JOIN   bfsi_demo.fraud_watchlists w ON t.account_id = w.single_account
-    WHERE  t.ts >= '2026-06-01'::timestamp
-      AND  w.active=TRUE AND w.confidence>=75 AND w.single_account IS NOT NULL
-    GROUP  BY 1,2,3,4,5
-    ORDER  BY total_amount DESC
-    LIMIT  10
-)
--- BIN rows first (blue), then ML rows (green) — both groups always shown
-SELECT match_key, feed_name, category, confidence, source,
-       transactions, total_amount, first_txn, last_txn
-FROM   bin_hits
-UNION ALL
-SELECT match_key, feed_name, category, confidence, source,
-       transactions, total_amount, first_txn, last_txn
-FROM   acct_hits
-"""
-
-SQL_ML_INSERT = """
--- Insert MADlib fraud findings into fraud_watchlists
--- Uses inferred_label instead of cluster_id for deterministic behavior
-INSERT INTO bfsi_demo.fraud_watchlists
-  (feed_name, bin_range, single_account, category, confidence,
-   country_code, first_seen, last_seen, active)
-SELECT
-  'MADlib K-Means',
-  NULL,
-  kl.account_id,
-  CASE kl.inferred_label
-    WHEN 'CARD-TESTING' THEN 'compromised_bin'
-    WHEN 'BUST-OUT' THEN 'velocity_abuse'
-    WHEN 'STRUCTURING' THEN 'structuring'
-  END,
-  CASE kl.inferred_label
-    WHEN 'CARD-TESTING' THEN 87
-    WHEN 'BUST-OUT' THEN 85
-    WHEN 'STRUCTURING' THEN 90
-  END,
-  'US',
-  NOW(), NOW(), TRUE
-FROM bfsi_demo.kmeans_labeled kl
-WHERE kl.inferred_label IN ('CARD-TESTING', 'BUST-OUT', 'STRUCTURING')
-ON CONFLICT DO NOTHING
-"""
-
-SQL_ML_EXPIRE = """
--- Expire accounts that are no longer in fraud clusters
--- Uses inferred_label instead of cluster_id
-UPDATE bfsi_demo.fraud_watchlists
-SET    active=FALSE, last_seen=NOW()
-WHERE  feed_name='MADlib K-Means' AND active=TRUE
-  AND  NOT EXISTS (
-         SELECT 1 FROM bfsi_demo.kmeans_labeled kl
-         WHERE  kl.account_id = bfsi_demo.fraud_watchlists.single_account
-           AND  kl.inferred_label IN ('CARD-TESTING', 'BUST-OUT', 'STRUCTURING')
-       )
-"""
-
-# ── Query definitions ────────────────────────────────────────────────────────
-QUERIES = [
-    # ══════════════════════════════════════════════════════════════════════════
-    # Panel A: pgvector — Semantic Search Beats Keyword Search
-    # ══════════════════════════════════════════════════════════════════════════
+CHECK_QUESTIONS = [
     {
-        "id": "a1", "panel": 0,
-        "name": "A1 - The Keyword Search Problem",
-        "desc": "LIKE '%structuring%' finds almost nothing, yet the structuring persona is everywhere - same behaviour, different words!",
-        "sql": """SELECT
-    'Keyword Search Results' AS search_method,
-    COUNT(*) AS total_notes,
-    COUNT(*) FILTER (WHERE narrative ILIKE '%structuring%')      AS found_structuring,
-    COUNT(*) FILTER (WHERE narrative ILIKE '%money laundering%') AS found_laundering,
-    COUNT(*) FILTER (WHERE narrative ILIKE '%smurfing%')         AS found_smurfing,
-    '\u274c Misses: "just below the limit", "split deposits", "layering"' AS limitation,
-    COUNT(*) FILTER (WHERE persona = 'structuring') AS actual_structuring_notes
-FROM bfsi_demo.case_embeddings
-
-UNION ALL
-
-SELECT
-    'What We Actually Have' AS search_method,
-    COUNT(*) AS total_notes,
-    NULL, NULL, NULL,
-    'Notes describing the same behaviour using different words' AS limitation,
-    COUNT(*) FILTER (WHERE persona = 'structuring') AS actual_structuring_notes
-FROM bfsi_demo.case_embeddings"""
+        'kind': 'concept',
+        'title': 'Why did the same SQL just run on two completely different storage systems?',
+        'ask': "You ran identical SQL against Iceberg files on object storage and against native AOCO segments. "
+               "What does WHPG do under the hood that lets one engine read both?",
+        'listen': "PGAA exposes Iceberg tables as Postgres foreign tables - the planner sees them as just-another-relation. "
+                  "The MPP executor handles parallel scan whether the data lives on segments (AOCO) or on S3 (Parquet). "
+                  "Same SQL, same planner, same parallelism - just a different scan operator.",
     },
     {
-        "id": "a2", "panel": 0,
-        "name": "A2 - pgvector Finds Fraud by MEANING",
-        "desc": "Find case notes similar to a known structuring narrative - semantic search surfaces related cases WITHOUT exact keywords!",
-        "sql": """WITH reference_note AS (
-    SELECT note_id, LEFT(narrative, 80) AS ref_note, embedding
-    FROM bfsi_demo.case_embeddings
-    WHERE persona = 'structuring' AND queue = 'aml-tm'
-    ORDER BY note_id
-    LIMIT 1
-),
-similar_notes AS (
-    SELECT DISTINCT ON (LEFT(e.narrative, 90))
-        e.account_id,
-        e.queue,
-        LEFT(e.narrative, 90) AS similar_note,
-        e.persona AS ground_truth,
-        ROUND((1 - (e.embedding <=> r.embedding))::numeric, 4) AS similarity,
-        e.embedding <=> r.embedding AS distance
-    FROM bfsi_demo.case_embeddings e
-    CROSS JOIN reference_note r
-    WHERE e.note_id != r.note_id
-      AND e.persona = 'structuring'
-    ORDER BY LEFT(e.narrative, 90), e.embedding <=> r.embedding
-)
-SELECT
-    (SELECT ref_note FROM reference_note) AS reference_note,
-    account_id,
-    queue,
-    similar_note,
-    ground_truth,
-    similarity
-FROM similar_notes
-ORDER BY distance
-LIMIT 15"""
-    },
-
-    # ══════════════════════════════════════════════════════════════════════════
-    # Panel B: MADlib — Unsupervised Fraud Discovery
-    # ══════════════════════════════════════════════════════════════════════════
-    {
-        "id": "b1", "panel": 1,
-        "name": "B1 - MADlib Discovered the Fraud Personas",
-        "desc": "K-Means clustering on 6 behavioural features - NO LABELS, finds fraud rings automatically",
-        "sql": """SELECT
-    a.cluster_id,
-    a.inferred_label AS persona_label,
-    COUNT(*) AS accounts,
-    ROUND(COUNT(*) * 100.0 / SUM(COUNT(*)) OVER (), 1) AS pct,
-    ROUND(AVG(f.txn_count), 0)              AS avg_txns,
-    ROUND(AVG(f.total_amount)::numeric, 2)  AS avg_spend,
-    ROUND(AVG(f.distinct_merchants), 0)     AS avg_merchants,
-    ROUND(AVG(f.amount_cv)::numeric, 4)     AS avg_cv
-FROM bfsi_demo.kmeans_labeled a
-JOIN bfsi_demo.account_features f ON a.account_id = f.account_id
-GROUP BY 1, 2
-ORDER BY
-    CASE a.inferred_label
-        WHEN 'CARD-TESTING' THEN 1
-        WHEN 'BUST-OUT' THEN 2
-        WHEN 'STRUCTURING' THEN 3
-        WHEN 'NORMAL' THEN 4
-    END"""
-    },
-    {
-        "id": "b2", "panel": 1,
-        "name": "B2 - The Dramatic Differences",
-        "desc": "CARD-TESTING: many more merchants | BUST-OUT: far higher spend than a normal account",
-        "sql": """WITH cluster_agg AS (
-    SELECT
-        a.inferred_label AS persona,
-        COUNT(*) AS accounts,
-        ROUND(AVG(f.distinct_merchants), 0)     AS merchants,
-        ROUND(AVG(f.total_amount)::numeric, 2)  AS spend,
-        ROUND(AVG(f.amount_cv)::numeric, 4)     AS amount_cv
-    FROM bfsi_demo.kmeans_labeled a
-    JOIN bfsi_demo.account_features f ON a.account_id = f.account_id
-    GROUP BY a.inferred_label
-),
-normal AS (
-    SELECT merchants AS n_merch, spend AS n_spend
-    FROM cluster_agg WHERE persona = 'NORMAL' LIMIT 1
-)
-SELECT
-    cs.persona,
-    cs.accounts,
-    cs.merchants,
-    cs.spend,
-    cs.amount_cv,
-    ROUND(cs.merchants::numeric / NULLIF(n.n_merch, 0), 0) AS merchants_vs_normal,
-    ROUND(cs.spend::numeric    / NULLIF(n.n_spend, 0), 0) AS spend_vs_normal
-FROM cluster_agg cs
-LEFT JOIN normal n ON TRUE
-ORDER BY
-    CASE cs.persona
-        WHEN 'CARD-TESTING' THEN 1
-        WHEN 'BUST-OUT' THEN 2
-        WHEN 'STRUCTURING' THEN 3
-        WHEN 'NORMAL' THEN 4
-    END"""
-    },
-
-    # ══════════════════════════════════════════════════════════════════════════
-    # Panel C: The AI Factory — Combining pgvector + MADlib
-    # ══════════════════════════════════════════════════════════════════════════
-    {
-        "id": "c1", "panel": 2,
-        "name": "C1 - The AI Factory: Fraud Pattern Correlation",
-        "desc": "MADlib finds behavioural clusters \u2192 pgvector finds semantic patterns \u2192 BOTH detect the SAME fraud types in ONE query!",
-        "sql": """WITH madlib_patterns AS (
-    SELECT
-        a.inferred_label AS fraud_type,
-        COUNT(*) AS accts,
-        ROUND(AVG(f.distinct_merchants), 0)     AS avg_merchants,
-        ROUND(AVG(f.total_amount)::numeric, 2)  AS avg_spend,
-        ROUND(AVG(f.amount_cv)::numeric, 4)     AS avg_cv
-    FROM bfsi_demo.kmeans_labeled a
-    JOIN bfsi_demo.account_features f ON a.account_id = f.account_id
-    WHERE a.inferred_label IN ('CARD-TESTING', 'BUST-OUT', 'STRUCTURING')
-    GROUP BY a.inferred_label
-),
-pgvector_patterns AS (
-    SELECT
-        CASE
-            WHEN persona = 'card_testing' THEN 'CARD-TESTING'
-            WHEN persona = 'bust_out'     THEN 'BUST-OUT'
-            WHEN persona = 'structuring'  THEN 'STRUCTURING'
-        END AS fraud_type,
-        COUNT(*)                       AS notes,
-        COUNT(DISTINCT account_id)     AS accounts,
-        string_agg(DISTINCT queue, ', ') AS queues_seen
-    FROM bfsi_demo.case_embeddings
-    WHERE persona IN ('card_testing', 'bust_out', 'structuring')
-    GROUP BY persona
-)
-SELECT
-    mp.fraud_type,
-    mp.accts::text || ' accounts (MADlib)'      AS behavioral_evidence,
-    mp.avg_merchants::text || ' avg merchants'  AS behavior_metric_1,
-    '$' || mp.avg_spend::text || ' avg spend'   AS behavior_metric_2,
-    pv.notes::text || ' notes (pgvector)'       AS semantic_evidence,
-    pv.queues_seen                              AS semantic_queues
-FROM madlib_patterns mp
-JOIN pgvector_patterns pv ON mp.fraud_type = pv.fraud_type
-WHERE mp.fraud_type IS NOT NULL
-ORDER BY mp.accts DESC"""
-    },
-    {
-        "id": "c2", "panel": 2,
-        "name": "C2 - Why This Matters",
-        "desc": "In traditional warehouses: export \u2192 train \u2192 join (hours). Here: ONE SQL query (<5 sec)",
-        "sql": """SELECT
-    'Traditional Warehouse (Snowflake/BigQuery)' AS approach,
-    'Export 13M rows \u2192 Python \u2192 train model \u2192 upload results \u2192 JOIN' AS workflow,
-    '2-4 hours' AS time,
-    'Requires data movement, external tools, model versioning' AS complexity
-UNION ALL
-SELECT
-    'EDB WarehousePG (In-Database ML)',
-    'MADlib K-Means + pgvector similarity search in ONE query',
-    '< 5 seconds',
-    'Zero data movement, SQL-native, no external dependencies'"""
-    },
-    # ══════════════════════════════════════════════════════════════════════════
-    # Panel D: ML → Watchlist
-    # ══════════════════════════════════════════════════════════════════════════
-    {
-        "id": "d1", "panel": 3,
-        "name": "D1 - ML Fraud Gap — Detected but NOT in Watchlist",
-        "desc": "Transactions from K-Means fraud clusters that exist in transactions but are NOT yet flagged in fraud_watchlists. Run Refresh above, then re-run — should show 0 rows.",
-        "sql": SQL_1A_BEFORE,
-    },
-    {
-        "id": "d2", "panel": 3,
-        "name": "D2 - Query 1A Extended — BIN Ranges + ML Accounts",
-        "desc": "After Refresh: BIN-match rows (blue) + ML K-Means account rows (green). Orange = high exposure. Run D1 first to see the gap, refresh, then run D2 to see them appear.",
-        "sql": SQL_1A_AFTER,
+        'kind': 'practical',
+        'title': 'Which query had the biggest gap between Iceberg and native - and why?',
+        'ask': "Look at your benchmark numbers. Which of the 5 queries showed the largest speed difference between "
+               "Iceberg and native AOCO? Why that query specifically?",
+        'listen': "Daily Dashboard (5-table JOIN) typically has the biggest gap. Reason: AOCO is column-stored "
+                  "and DISTRIBUTED BY, so multi-table joins stay co-located on segments. "
+                  "Iceberg via PGAA reads Parquet from object storage - every JOIN side comes back over the network "
+                  "before the planner can match rows. The more JOINs, the wider the gap.",
     },
 ]
 
-PANELS = [
-    {"name": "pgvector",       "icon": "A", "desc": "Semantic search finds fraud by MEANING, not keywords"},
-    {"name": "MADlib",         "icon": "B", "desc": "Unsupervised clustering discovers fraud personas automatically"},
-    {"name": "AI Factory",     "icon": "C", "desc": "Combine both in ONE query — impossible in traditional warehouses"},
-    {"name": "ML → Watchlist", "icon": "D", "desc": "Write K-Means results to fraud_watchlists · Query 1A before vs after"},
-]
 
-# ── API ───────────────────────────────────────────────────────────────────────
-@app.route("/api/run", methods=["POST"])
-def api_run():
-    qid = request.json.get("id")
-    q = next((q for q in QUERIES if q["id"] == qid), None)
-    if not q:
-        return jsonify({"error": f"Unknown query: {qid}"}), 404
-    r = run(q["sql"])
-    r["id"] = qid
-    return jsonify(r)
+CHALLENGE = {
+    'title': 'Find the top 5 products by revenue',
+    'context': "You're handed this query but the JOIN condition is missing. "
+               "Fill in the blank to make it run. Hint: products and order_items share one obvious key.",
+    'template': '''-- Top 5 products by revenue
+SELECT p.product_id,
+       p.name        AS product_name,
+       p.category,
+       SUM(oi.quantity)                                    AS units_sold,
+       ROUND(SUM(oi.quantity * oi.unit_price)::numeric, 2) AS revenue
+FROM   products_iceberg    p
+JOIN   order_items_iceberg oi
+       ON   /* FILL IN THE JOIN CONDITION */
+GROUP  BY p.product_id, p.name, p.category
+ORDER  BY revenue DESC
+LIMIT  5''',
+    'solution': 'p.product_id = oi.product_id',
+    'why_it_matters': "products and order_items share product_id - that's the natural join key. "
+                      "On native AOCO, if both tables are DISTRIBUTED BY (product_id), the join runs locally on each "
+                      "segment with no Motion. On Iceberg, the same join still works - but data has to come back from "
+                      "object storage before the segments can match rows.",
+}
 
-@app.route("/api/run_all", methods=["POST"])
-def api_run_all():
-    results = []
-    for q in QUERIES:
-        r = run(q["sql"])
-        results.append({"id": q["id"], "name": q["name"],
-                        "ms": r["ms"], "rows": r["rows"], "error": r.get("error")})
-    return jsonify({"results": results, "total_ms": round(sum(r["ms"] for r in results), 1)})
 
-@app.route("/api/sql", methods=["POST"])
-def api_sql():
-    sql = request.json.get("sql", "").strip()
-    if not sql:
-        return jsonify({"error": "No SQL provided"}), 400
-    w = sql.split()[0].upper() if sql.split() else ""
-    if w not in ("SELECT", "WITH", "EXPLAIN"):
-        return jsonify({"error": "Only SELECT / WITH / EXPLAIN allowed"}), 403
-    return jsonify(run(sql))
+@app.route('/')
+def index():
+    # Inject server-side config into the HTML so the JS knows the schema
+    html = DASHBOARD_HTML.replace('__NATIVE_SCHEMA__', NATIVE_SCHEMA)
+    return Response(html, mimetype='text/html')
 
-@app.route("/api/watchlist/refresh", methods=["POST"])
-def api_watchlist_refresh():
-    """
-    Idempotent refresh — safe to run multiple times.
-    Step 1: soft-reset  — expire any existing MADlib K-Means flags (active=FALSE)
-    Step 2: insert fresh — write current K-Means results to fraud_watchlists
-    Step 3: expire stale — accounts that left the fraud clusters
-    """
-    import time as _t; t0 = _t.perf_counter()
-    rst = run_write(
-        "UPDATE bfsi_demo.fraud_watchlists "
-        "SET active=FALSE, last_seen=NOW() "
-        "WHERE feed_name='MADlib K-Means' AND active=TRUE"
-    )
-    if "error" in rst:
-        return jsonify({"ok": False, "error": rst["error"]}), 500
-    ins = run_write(SQL_ML_INSERT)
-    if "error" in ins:
-        return jsonify({"ok": False, "error": ins["error"]}), 500
-    exp = run_write(SQL_ML_EXPIRE)
-    if "error" in exp:
-        return jsonify({"ok": False, "error": exp["error"]}), 500
-    summary = run("""
-        SELECT feed_name, category,
-               COUNT(*) FILTER (WHERE active=TRUE) AS active_flags
-        FROM   bfsi_demo.fraud_watchlists
-        GROUP  BY feed_name, category ORDER BY feed_name, category
-    """)
+
+@app.route('/api/queries')
+def list_queries():
+    return jsonify({k: {'name': v['name'], 'desc': v['desc'], 'sql': v['sql']}
+                    for k, v in QUERIES.items()})
+
+
+@app.route('/api/check')
+def list_check():
+    return jsonify(CHECK_QUESTIONS)
+
+
+@app.route('/api/challenge')
+def get_challenge():
+    out = {k: v for k, v in CHALLENGE.items() if k != 'solution'}
+    out['solution'] = CHALLENGE['solution']
+    return jsonify(out)
+
+
+@app.route('/api/challenge/check', methods=['POST'])
+def check_challenge():
+    user = (request.json or {}).get('answer', '').lower().replace(' ', '')
+    expected = CHALLENGE['solution'].lower().replace(' ', '')
+    alt = 'oi.product_id=p.product_id'
     return jsonify({
-        "ok":       True,
-        "reset":    rst["rowcount"], "reset_ms":  rst["ms"],
-        "inserted": ins["rowcount"], "insert_ms": ins["ms"],
-        "expired":  exp["rowcount"], "expire_ms": exp["ms"],
-        "total_ms": round((_t.perf_counter()-t0)*1000, 1),
-        "summary":  summary["data"],
+        'correct': expected in user or alt in user,
+        'solution': CHALLENGE['solution'],
+        'why': CHALLENGE['why_it_matters'],
     })
 
-@app.route("/api/watchlist/reset", methods=["POST"])
-def api_watchlist_reset():
-    """
-    mode=soft — expire ML flags (active→FALSE). Default. Re-run refresh after.
-    mode=hard — DELETE all MADlib K-Means rows.
-    mode=full — TRUNCATE all derived ML tables (kmeans_*, account_features).
-                Requires re-running 06_ai_analytics + 07_kmeans_fallback after.
-    """
-    mode  = request.args.get("mode", "soft")
-    import time as _t; t0=_t.perf_counter()
-    steps = []
-    if mode == "soft":
-        r = run_write("UPDATE bfsi_demo.fraud_watchlists SET active=FALSE,last_seen=NOW() WHERE feed_name='MADlib K-Means' AND active=TRUE")
-        steps.append({"step":"Expire ML flags (active→FALSE)","rows":r.get("rowcount",0),"error":r.get("error")})
-    elif mode == "hard":
-        r = run_write("DELETE FROM bfsi_demo.fraud_watchlists WHERE feed_name='MADlib K-Means'")
-        steps.append({"step":"Delete all MADlib K-Means rows","rows":r.get("rowcount",0),"error":r.get("error")})
-    elif mode == "full":
-        for label, sql in [
-            ("Expire ML flags",               "UPDATE bfsi_demo.fraud_watchlists SET active=FALSE,last_seen=NOW() WHERE feed_name='MADlib K-Means' AND active=TRUE"),
-            ("Truncate kmeans_assignments",   "TRUNCATE bfsi_demo.kmeans_assignments"),
-            ("Truncate km_raw",               "TRUNCATE bfsi_demo.km_raw"),
-            ("Truncate km_points",            "TRUNCATE bfsi_demo.km_points"),
-            ("Truncate km_result",            "TRUNCATE bfsi_demo.km_result"),
-            ("Truncate account_features",     "TRUNCATE bfsi_demo.account_features"),
-            ("Truncate account_features_norm","TRUNCATE bfsi_demo.account_features_norm"),
-        ]:
-            r = run_write(sql)
-            steps.append({"step":label,"rows":r.get("rowcount",0),"error":r.get("error")})
-            if r.get("error"): break
-    else:
-        return jsonify({"ok":False,"error":f"Unknown mode: {mode}"}), 400
-    errors = [s for s in steps if s.get("error")]
-    return jsonify({"ok":len(errors)==0,"mode":mode,"steps":steps,
-                    "total_ms":round((_t.perf_counter()-t0)*1000,1),"errors":errors})
 
-@app.route("/api/health")
-def api_health():
+@app.route('/api/challenge/run', methods=['POST'])
+def run_challenge():
+    join_clause = (request.json or {}).get('join_clause', '').strip()
+    if not join_clause:
+        return jsonify({'error': 'No JOIN condition provided'}), 400
+    sql = CHALLENGE['template'].replace(
+        '/* FILL IN THE JOIN CONDITION */', join_clause)
     try:
-        conn = psycopg2.connect(**DB)
-        cur = conn.cursor()
-        cur.execute("SELECT version()")
-        ver = cur.fetchone()[0]
-        conn.close()
-        return jsonify({"status": "ok", "version": ver})
+        return jsonify({'sql': sql, 'result': query(sql)})
     except Exception as e:
-        return jsonify({"status": "error", "error": str(e)}), 500
+        return jsonify({'error': str(e), 'sql': sql}), 500
 
-@app.route("/")
-def index():
-    return render_template_string(HTML, panels=PANELS, queries=QUERIES)
 
-# ── HTML (same as app3.py, just streamlined queries) ─────────────────────────
-HTML = r"""<!DOCTYPE html>
-<html lang="en"><head>
-<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Lab 3 — AI Analytics | WarehousePG</title>
-<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 256 256'%3E%3Cg transform='translate(-862,18)'%3E%3Cpath fill='%232a9993' d='M1060.7,2.12c-30.98,2.37-56.03,27.09-58.74,58.06-2.88,33.35,19.98,61.96,50.96,68.22v61.62c0,2.54-2.03,4.4-4.4,4.4h-16.76c-2.54,0-4.4-2.03-4.4-4.4v-44.35c0-7.28-5.92-13.37-13.37-13.37h-49.94c-7.28,0-13.37,5.92-13.37,13.37v44.35c0,2.54-2.03,4.4-4.4,4.4h-16.76c-2.37,0-4.4-2.03-4.4-4.4v-97.17l73.47-73.47c1.69-1.69,1.69-4.57,0-6.26l-11.85-11.85c-1.69-1.69-4.57-1.69-6.26,0l-125.27,125.27c-1.69,1.69-1.69,4.57,0,6.26l11.85,11.85c1.69,1.69,4.57,1.69,6.26,0l26.07-26.24v88.37c0,7.28,5.92,13.37,13.37,13.37h50.11c7.28,0,13.37-5.92,13.37-13.37v-44.35c0-2.54,2.03-4.4,4.4-4.4h16.76c2.37,0,4.4,2.03,4.4,4.4v44.35c0,7.28,5.92,13.37,13.37,13.37h50.11c7.28,0,13.37-5.92,13.37-13.37v-98.19c0-2.54-2.03-4.4-4.4-4.4h-7.45c-20.99,0-38.77-16.59-39.27-37.58-.51-21.67,17.44-39.61,39.11-39.1,20.99.34,37.58,18.28,37.58,39.27v123.41c0,2.54,2.03,4.4,4.4,4.4h16.76c2.54,0,4.4-2.03,4.4-4.4v-124.26c-.17-36.9-31.49-66.53-69.07-63.82Z'/%3E%3Ccircle fill='%232a9993' cx='1065.61' cy='65.94' r='12.7'/%3E%3C/g%3E%3C/svg%3E">
+@app.route('/api/compare/<qid>')
+def compare(qid):
+    if qid not in QUERIES:
+        return jsonify({'error': 'Not found'}), 404
+    q = QUERIES[qid]
+    try:    ice = query(q['sql'])
+    except Exception as e: ice = {'error': str(e), 'exec_time_ms': 0}
+    try:    nat = query(to_native(q['sql']))
+    except Exception as e: nat = {'error': str(e), 'exec_time_ms': 0}
+    return jsonify({'name': q['name'], 'iceberg': ice, 'native': nat})
+
+
+@app.route('/api/run_all')
+def run_all():
+    def run_one(qid, q, mode):
+        try:
+            r = query(to_native(q['sql']) if mode == 'native' else q['sql'])
+            return {'id': qid, 'name': q['name'], 'exec_time_ms': r['exec_time_ms'],
+                    'row_count': r['row_count']}
+        except Exception as e:
+            return {'id': qid, 'name': q['name'], 'error': str(e), 'exec_time_ms': 0}
+
+    order = list(QUERIES.keys())
+    def run_batch(mode):
+        t0 = time.perf_counter()
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as ex:
+            futs = {ex.submit(run_one, qid, q, mode): qid for qid, q in QUERIES.items()}
+            res = [f.result() for f in concurrent.futures.as_completed(futs)]
+        wall = round((time.perf_counter() - t0) * 1000, 2)
+        res.sort(key=lambda x: order.index(x['id']))
+        return res, wall
+
+    nat_res, nat_wall = run_batch('native')
+    ice_res, ice_wall = run_batch('iceberg')
+    return jsonify({
+        'native':  {'queries': nat_res, 'wall_time_ms': nat_wall},
+        'iceberg': {'queries': ice_res, 'wall_time_ms': ice_wall},
+    })
+
+
+@app.route('/api/diag')
+def diag():
+    out = {'native_schema': NATIVE_SCHEMA, 'iceberg_tables': [],
+           'native_tables': [], 'errors': []}
+    for t in ['customers', 'products', 'orders', 'order_items', 'events']:
+        for label, name in [('iceberg', f'{t}_iceberg'),
+                            ('native',  f'{NATIVE_SCHEMA}.{t}')]:
+            try:
+                r = query(f'SELECT COUNT(*) FROM {name}')
+                out[f'{label}_tables'].append({'table': name, 'rows': r['rows'][0][0]})
+            except Exception as e:
+                out['errors'].append({'table': name, 'error': str(e)})
+    return jsonify(out)
+
+
+@app.route('/api/sql', methods=['POST'])
+def run_sql():
+    """Run an arbitrary SELECT/WITH/EXPLAIN — used by the SQL Editor tab."""
+    sql = (request.json or {}).get('sql', '').strip().rstrip(';')
+    if not sql:
+        return jsonify({'error': 'No SQL provided'}), 400
+    first = sql.split(None, 1)[0].upper() if sql else ''
+    if first not in ('SELECT', 'WITH', 'EXPLAIN'):
+        return jsonify({'error': 'Only SELECT, WITH, or EXPLAIN allowed'}), 403
+    try:
+        return jsonify(query(sql))
+    except Exception as e:
+        return jsonify({'error': str(e)}), 200
+
+
+# =============================================================================
+# HTML template (single-file dashboard)
+# =============================================================================
+DASHBOARD_HTML = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>Lab 3 - Iceberg vs Native WHPG</title>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet"/>
 <style>
 :root{
-  --bg:#f0f2f5;--card:#ffffff;--border:#d1d5db;--text:#1e293b;--dim:#6b7280;
-  --muted:#4b5563;--accent:#059669;--adim:rgba(6,214,160,.12);
-  --warn:#d97706;--wdim:rgba(251,191,36,.1);--danger:#ef4444;--ddim:rgba(239,68,68,.1);
-  --blue:#2563eb;--bdim:rgba(59,130,246,.1);--purple:#7c3aed;--cyan:#0891b2;
+  --teal:#3DBFBF; --teal-d:#1D8080; --teal-l:#E6F6F6;
+  --ok:#27A67A; --ok-l:#E7F6F0;
+  --err:#D94040; --err-l:#FDEAEA;
+  --warn:#E8972A; --warn-l:#FEF5E6;
+  --tx:#222; --txs:#555; --txm:#888;
+  --bdr:#E2E2E2; --bg:#F5F5F5; --bg2:#FAFAFA;
+  --rl:12px;
+  --font:'IBM Plex Sans',sans-serif; --mono:'IBM Plex Mono',monospace;
+  --sh:0 1px 3px rgba(0,0,0,.06),0 1px 2px rgba(0,0,0,.04);
 }
-*{margin:0;padding:0;box-sizing:border-box}
-body{background:var(--bg);color:var(--text);font-family:system-ui,sans-serif}
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+body{font-family:var(--font);background:var(--bg);color:var(--tx);min-height:100vh;line-height:1.55;font-size:14.5px}
 
-/* ── header ── */
-.hdr{background:linear-gradient(135deg,#1e293b,#0f172a);border-bottom:1px solid #334155;
-     padding:0 28px;height:54px;display:flex;align-items:center;justify-content:space-between;
-     position:sticky;top:0;z-index:300}
-.hdr-left{display:flex;align-items:center;gap:12px}
-.logo-svg{width:36px;height:36px;flex-shrink:0}
-.hdr h1{font-size:18px;font-weight:700;letter-spacing:-.4px;color:#e2e8f0}
-.hdr h1 span{color:#34d399}
-.hdr-sub{color:#94a3b8;font-size:11px}
-.hdr-right{display:flex;align-items:center;gap:12px}
-.live-badge{background:rgba(52,211,153,.18);color:#34d399;padding:3px 10px;border-radius:5px;
-            font-size:11px;font-weight:600;font-family:'Courier New',monospace;
-            animation:blink 2s infinite}
-@keyframes blink{0%,100%{opacity:1}50%{opacity:.55}}
-.dot-live{width:8px;height:8px;border-radius:50%;background:#34d399;
-          box-shadow:0 0 6px #059669;display:inline-block}
-#conn{color:#94a3b8;font-family:'Courier New',monospace;font-size:11px}
+.nav{background:#fff;border-top:3px solid var(--teal);border-bottom:1px solid var(--bdr);
+     height:56px;display:flex;align-items:center;padding:0 24px;gap:16px;
+     position:sticky;top:0;z-index:50;box-shadow:var(--sh)}
+.nav-brand{font-size:16px;font-weight:700;color:var(--ok);letter-spacing:.5px}
+.nav-brand span{color:var(--teal-d)}
+.nav-div{width:1px;height:22px;background:var(--bdr)}
+.nav-title{font-size:13px;font-weight:500;color:var(--txs)}
+.nav-sp{flex:1}
+.nav-pill{display:flex;align-items:center;gap:7px;font-size:12px;color:var(--txs);
+          background:var(--bg);border:1px solid var(--bdr);padding:5px 13px;border-radius:20px}
+.sdot{width:7px;height:7px;border-radius:50%;background:#CCC}
+.sdot.on{background:var(--ok);box-shadow:0 0 6px rgba(39,166,122,.5);animation:blink 2.5s infinite}
+.sdot.err{background:var(--err)}
+@keyframes blink{0%,100%{opacity:1}60%{opacity:.4}}
 
-/* ── tabs ── */
-.tabs{background:#f8fafc;border-bottom:1px solid var(--border);
-      padding:8px 28px;display:flex;gap:4px;overflow-x:auto;
-      position:sticky;top:54px;z-index:200}
-.tab{background:0;border:1px solid transparent;color:var(--muted);padding:8px 16px;
-     border-radius:7px;cursor:pointer;font-size:13px;font-family:inherit;
-     transition:.18s;white-space:nowrap;font-weight:500}
-.tab:hover{color:var(--text);background:rgba(0,0,0,.04)}
-.tab.on{background:var(--adim);border-color:rgba(6,214,160,.3);color:var(--accent);font-weight:600}
-.tab.reload-tab{border-color:rgba(251,191,36,.3);color:var(--warn)}
-.tab.reload-tab.on{background:var(--wdim);border-color:rgba(251,191,36,.5);color:var(--warn)}
+.tabs{background:#fff;border-bottom:1px solid var(--bdr);padding:0 24px;display:flex;
+      position:sticky;top:56px;z-index:40;overflow-x:auto}
+.tab{background:0;border:0;color:var(--txs);padding:14px 20px;cursor:pointer;
+     font-family:inherit;font-size:13.5px;font-weight:500;white-space:nowrap;
+     border-bottom:3px solid transparent;transition:.15s}
+.tab:hover{color:var(--tx)}
+.tab.on{color:var(--teal-d);border-bottom-color:var(--teal);font-weight:600}
+.tab.warn-tab.on{color:var(--warn);border-bottom-color:var(--warn)}
 
-/* ── layout ── */
-.main{padding:24px 28px;max-width:1440px;margin:0 auto}
-.pnl{display:none}.pnl.on{display:block;animation:fi .25s ease}
-@keyframes fi{from{opacity:0;transform:translateY(5px)}to{opacity:1;transform:none}}
+.page{max-width:1280px;margin:0 auto;padding:24px}
+.pane{display:none}.pane.on{display:block;animation:fi .2s ease}
+@keyframes fi{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}
 
-/* ── section header ── */
-.sec-hdr{margin-bottom:20px}
-.sec-hdr .n{background:linear-gradient(135deg,var(--accent),var(--cyan));color:#fff;
-            width:30px;height:30px;border-radius:7px;display:inline-flex;align-items:center;
-            justify-content:center;font-size:13px;font-weight:800;
-            font-family:'Courier New',monospace;margin-right:10px;vertical-align:middle}
-.sec-hdr h2{display:inline;font-size:20px;font-weight:700;vertical-align:middle}
-.sec-hdr .d{color:var(--dim);font-size:13px;margin-top:4px;margin-left:40px}
+.lead{font-size:13.5px;color:var(--txs);margin-bottom:20px;max-width:820px;line-height:1.6}
+.lead strong{color:var(--tx)}
 
-/* ── summary bar ── */
-.sbar{display:flex;gap:14px;flex-wrap:wrap;margin-bottom:18px;padding:14px 18px;
-      background:var(--card);border:1px solid var(--border);border-radius:11px;align-items:center}
-.sstat{text-align:center;min-width:80px}
-.sstat .l{color:var(--dim);font-size:10px;text-transform:uppercase;letter-spacing:.5px}
-.sstat .v{font-size:22px;font-weight:700;font-family:'Courier New',monospace}
-.rabtn{background:linear-gradient(135deg,var(--purple),var(--blue));color:#fff;border:0;
-       padding:10px 22px;border-radius:7px;font-size:13px;font-weight:700;
-       cursor:pointer;font-family:inherit;margin-left:auto;transition:.15s}
-.rabtn:hover{opacity:.85}.rabtn:disabled{opacity:.4;cursor:wait}
-
-/* ── query cards ── */
-.qgrid{display:grid;grid-template-columns:1fr;gap:12px;margin-bottom:24px}
-.qcard{background:var(--card);border:1px solid var(--border);border-radius:11px;
-       box-shadow:0 1px 3px rgba(0,0,0,.07);overflow:hidden;transition:.18s}
-.qcard:hover{border-color:rgba(6,214,160,.3)}
-.qbar{display:flex;align-items:center;gap:10px;padding:13px 16px;cursor:pointer}
-.qid{min-width:32px;height:24px;border-radius:5px;display:flex;align-items:center;
-     justify-content:center;font-family:'Courier New',monospace;font-size:11px;font-weight:700}
-.p0 .qid{background:var(--adim);color:var(--accent)}
-.p1 .qid{background:var(--bdim);color:var(--blue)}
-.p2 .qid{background:rgba(167,139,250,.15);color:var(--purple)}
-.qname{flex:1;font-size:14px;font-weight:500}
-.qdesc{color:var(--dim);font-size:11px}
-.qtm .t{background:var(--adim);color:var(--accent);padding:2px 8px;border-radius:4px;
-        font-size:11px;font-weight:600;font-family:'Courier New',monospace}
-.qtm .t.slow{background:var(--wdim);color:var(--warn)}
-.qtm .r{color:var(--dim);margin-left:6px;font-size:11px}
-.rbtn{background:var(--adim);color:var(--accent);border:1px solid rgba(6,214,160,.3);
-      padding:5px 12px;border-radius:5px;cursor:pointer;font-family:'Courier New',monospace;
-      font-size:11px;font-weight:600;transition:.15s}
-.rbtn:hover{background:rgba(6,214,160,.22)}.rbtn:disabled{opacity:.4;cursor:wait}
-.qbody{display:none;padding:0 16px 16px}.qcard.open .qbody{display:block}
-.qsql{background:#f8fafc;border-radius:6px;padding:10px 12px;
-      font-family:'Courier New',monospace;font-size:11px;color:var(--muted);
-      line-height:1.55;max-height:180px;overflow:auto;margin-bottom:10px;
-      white-space:pre-wrap;word-break:break-all}
-.qactions{display:flex;gap:8px;margin-bottom:10px;flex-wrap:wrap}
-.qres{overflow-x:auto;max-height:380px;overflow-y:auto;border-radius:6px}
-
-/* ── table ── */
-table{width:100%;border-collapse:collapse;font-size:12px;font-family:'Courier New',monospace}
-th{text-align:left;padding:7px 10px;color:var(--dim);font-size:10px;text-transform:uppercase;
-   letter-spacing:.5px;border-bottom:1px solid var(--border);font-weight:500;
-   position:sticky;top:0;background:var(--card);z-index:1}
-td{padding:7px 10px;border-bottom:1px solid var(--border)}
+.qgrid{display:flex;flex-direction:column;gap:12px}
+.qcard{background:#fff;border:1px solid var(--bdr);border-radius:var(--rl);overflow:hidden;box-shadow:var(--sh)}
+.qhead{display:flex;align-items:center;gap:12px;padding:14px 18px;cursor:pointer;border-bottom:1px solid transparent;transition:.15s}
+.qhead:hover{background:var(--bg2)}
+.qcard.open .qhead{border-bottom-color:var(--bdr)}
+.qnum{width:30px;height:30px;border-radius:6px;background:var(--teal-l);color:var(--teal-d);
+      display:flex;align-items:center;justify-content:center;font-family:var(--mono);font-size:11px;font-weight:700;flex-shrink:0}
+.qmeta{flex:1;min-width:0}
+.qname{font-size:14px;font-weight:600;color:var(--tx)}
+.qdesc{font-size:12px;color:var(--txm);margin-top:1px}
+.qtimes{display:flex;gap:6px;align-items:center}
+.tchip{padding:3px 9px;border-radius:11px;font-size:10.5px;font-weight:600;font-family:var(--mono);white-space:nowrap}
+.tchip.nat{background:var(--ok-l);color:#1A7A57}
+.tchip.ice{background:var(--teal-l);color:var(--teal-d)}
+.tchip.pending{background:var(--bg);color:var(--txm)}
+.qbtn{background:linear-gradient(135deg,#4ECDC4,#3DBFBF);color:#fff;border:0;
+      padding:7px 14px;border-radius:6px;cursor:pointer;font-family:inherit;font-size:12px;font-weight:600;transition:.15s}
+.qbtn:hover{filter:brightness(1.08)}
+.qbtn:disabled{opacity:.5;cursor:wait}
+.qbody{display:none;padding:0 18px 18px}
+.qcard.open .qbody{display:block}
+.qsql{font-family:var(--mono);font-size:11.5px;color:#444;background:#F5FAFA;padding:12px 14px;
+      border-radius:6px;margin:0;white-space:pre-wrap;line-height:1.7;max-height:200px;overflow:auto}
+.qsql-pair{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin:14px 0}
+@media(max-width:900px){.qsql-pair{grid-template-columns:1fr}}
+.qsql-side{display:flex;flex-direction:column;gap:6px;min-width:0}
+.qsql-lbl{font-size:11px;font-weight:600;color:var(--txs);display:flex;align-items:center;gap:6px;text-transform:uppercase;letter-spacing:.4px}
+.qsql-lbl .cd{width:8px;height:8px;border-radius:50%}
+.qsql-lbl .cd.ice{background:var(--teal,#3DBFBF)}
+.qsql-lbl .cd.nat{background:var(--ok,#27A67A)}
+.qcols{display:grid;grid-template-columns:1fr 1fr;border:1px solid var(--bdr);border-radius:6px;overflow:hidden}
+@media(max-width:780px){.qcols{grid-template-columns:1fr}}
+.qcol{border-right:1px solid var(--bdr)}
+.qcol:last-child{border-right:none}
+.qcolh{padding:10px 14px;background:var(--bg2);font-size:11px;font-weight:600;color:var(--txs);
+       display:flex;align-items:center;gap:8px;border-bottom:1px solid var(--bdr)}
+.cd{width:8px;height:8px;border-radius:50%}.cd.nat{background:var(--ok)}.cd.ice{background:var(--teal)}
+.qres{max-height:280px;overflow:auto}
+table{width:100%;border-collapse:collapse;font-family:var(--mono);font-size:11.5px}
+th{text-align:left;padding:7px 12px;color:var(--txm);font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;
+   border-bottom:1px solid var(--bdr);background:#fff;position:sticky;top:0;white-space:nowrap}
+td{padding:6px 12px;border-bottom:1px solid #F0F0F0;white-space:nowrap}
 tr:last-child td{border-bottom:none}
-.empty{color:var(--dim);padding:20px;text-align:center;font-size:13px}
-tr.unflagged-row td{background:#fff7ed;color:#9a3412}   /* orange: ML found, not in watchlist */
-tr.ml-row td{background:#f0fdf4;color:#166534}            /* green: ML accounts now flagged */
-tr.bin-row td{background:#eff6ff;color:#1e40af}           /* blue: original BIN range matches */
-.spinner{width:26px;height:26px;border:3px solid var(--border);border-top-color:var(--accent);
-         border-radius:50%;animation:sp .75s linear infinite;margin:0 auto}
+
+.run-bar{display:flex;gap:10px;align-items:center;margin-bottom:20px;flex-wrap:wrap}
+.run-btn{background:linear-gradient(135deg,#4ECDC4,#45A89C);color:#fff;border:0;padding:10px 20px;
+         border-radius:7px;cursor:pointer;font-family:inherit;font-size:13.5px;font-weight:600;transition:.15s}
+.run-btn:hover{filter:brightness(1.08)}
+.run-btn:disabled{opacity:.5;cursor:wait}
+.totals{display:flex;gap:24px;background:#fff;padding:14px 20px;border:1px solid var(--bdr);
+        border-radius:var(--rl);margin-bottom:18px;flex-wrap:wrap}
+.tot{display:flex;flex-direction:column;gap:2px}
+.tot-l{font-size:10.5px;font-weight:600;text-transform:uppercase;letter-spacing:.6px;color:var(--txm)}
+.tot-v{font-family:var(--mono);font-size:18px;font-weight:700}
+.tot.nat .tot-v{color:#1A7A57}.tot.ice .tot-v{color:var(--teal-d)}
+
+.bars{background:#fff;border:1px solid var(--bdr);border-radius:var(--rl);padding:18px 20px}
+.brow{display:grid;grid-template-columns:200px 1fr 130px;gap:16px;align-items:center;padding:12px 0;border-bottom:1px solid #F0F0F0}
+.brow:last-child{border-bottom:none}
+.bname{font-size:13px;font-weight:500}
+.bvis{display:flex;flex-direction:column;gap:6px}
+.bone{display:grid;grid-template-columns:54px 1fr 80px;gap:10px;align-items:center;font-size:11.5px}
+.bone-lbl{color:var(--txm);font-size:10.5px;font-weight:600}
+.bbar{height:14px;background:var(--bg);border-radius:7px;overflow:hidden;position:relative}
+.bfill{height:100%;border-radius:7px;transition:width .5s ease}
+.bfill.nat{background:linear-gradient(90deg,#27A67A,#1A7A57)}
+.bfill.ice{background:linear-gradient(90deg,#4ECDC4,#3DBFBF)}
+.btime{font-family:var(--mono);font-size:11.5px;font-weight:600;text-align:right}
+.bratio{font-family:var(--mono);font-size:12px;font-weight:600;text-align:right;color:var(--ok,#27A67A)}
+.bratio.dim{color:var(--txm)}
+
+.check-grid{display:grid;grid-template-columns:1fr 1fr;gap:18px}
+@media(max-width:760px){.check-grid{grid-template-columns:1fr}}
+.qq{background:#fff;border:1px solid var(--bdr);border-radius:var(--rl);overflow:hidden}
+.qq-head{padding:12px 18px;color:#fff;font-weight:700;font-size:11.5px;letter-spacing:.5px;text-transform:uppercase}
+.qq.concept .qq-head{background:var(--teal)}
+.qq.practical .qq-head{background:#1A4767}
+.qq-body{padding:18px 22px}
+.qq-title{font-size:14.5px;font-weight:600;color:#1A4767;margin-bottom:12px;line-height:1.4}
+.qq-ask{font-size:13px;color:#333;margin-bottom:14px;line-height:1.6}
+.reveal-btn{background:rgba(59,130,246,.1);color:#2563eb;border:1px solid rgba(59,130,246,.3);
+            padding:7px 14px;border-radius:6px;cursor:pointer;font-family:inherit;font-size:12px;font-weight:600}
+.reveal-btn:hover{background:rgba(59,130,246,.18)}
+.listen{display:none;margin-top:14px;padding:14px 16px;background:#EEF2F4;border-left:3px solid var(--teal);
+        border-radius:0 6px 6px 0;font-size:12px;color:var(--txs);line-height:1.6;font-style:italic}
+.listen.on{display:block}
+.listen-l{font-size:10px;font-weight:700;color:var(--teal-d);text-transform:uppercase;letter-spacing:1px;margin-bottom:6px;font-style:normal}
+
+.ch-card{background:#fff;border:1px solid var(--bdr);border-radius:var(--rl);overflow:hidden;margin-bottom:18px}
+.ch-head{padding:14px 20px;background:linear-gradient(135deg,#FEF5E6,#FFF8E1);border-bottom:1px solid var(--bdr)}
+.ch-title{font-size:15px;font-weight:600;color:#8A5A10;margin-bottom:4px}
+.ch-context{font-size:12.5px;color:var(--txs);line-height:1.55}
+.ch-body{padding:18px 20px}
+.ch-tmpl{font-family:var(--mono);font-size:12px;background:#F5FAFA;padding:14px 16px;border-radius:6px;
+         white-space:pre-wrap;line-height:1.7;color:#333;margin-bottom:14px}
+.ch-tmpl .blank{background:#FFF8E1;color:#8A5A10;padding:1px 6px;border-radius:3px;font-weight:600}
+.ch-input{width:100%;font-family:var(--mono);font-size:13px;padding:10px 14px;
+          border:2px solid var(--bdr);border-radius:6px;background:#fff}
+.ch-input:focus{outline:0;border-color:var(--teal)}
+.ch-actions{display:flex;gap:10px;margin-top:12px;flex-wrap:wrap}
+.ch-feedback{margin-top:14px;padding:14px 16px;border-radius:6px;display:none;font-size:13px;line-height:1.6}
+.ch-feedback.on{display:block}
+.ch-feedback.ok{background:var(--ok-l);color:#1A7A57;border-left:3px solid var(--ok)}
+.ch-feedback.no{background:var(--err-l);color:#A02020;border-left:3px solid var(--err)}
+.ch-solution{margin-top:14px;padding:14px 16px;background:#F0F4F8;border-left:3px solid #1A4767;
+             border-radius:0 6px 6px 0;font-size:12.5px;display:none}
+.ch-solution.on{display:block}
+.ch-solution code{font-family:var(--mono);background:#fff;padding:2px 7px;border-radius:3px;color:#C0392B;font-size:12px}
+.ch-solution-l{font-size:10px;font-weight:700;color:#1A4767;text-transform:uppercase;letter-spacing:1px;margin-bottom:6px}
+
+.spinner{display:inline-block;width:14px;height:14px;border:2px solid rgba(255,255,255,.3);border-top-color:#fff;border-radius:50%;animation:sp .7s linear infinite;vertical-align:middle;margin-right:6px}
 @keyframes sp{to{transform:rotate(360deg)}}
-
-/* ── SQL editor ── */
-.sqled{width:100%;min-height:140px;background:#f8fafc;border:1px solid var(--border);
-       border-radius:8px;color:var(--text);font-family:'Courier New',monospace;
-       font-size:13px;padding:14px;resize:vertical;line-height:1.6}
-.sqled:focus{outline:0;border-color:var(--accent)}
-.runbtn{background:linear-gradient(135deg,var(--accent),var(--cyan));color:#fff;border:0;
-        padding:10px 22px;border-radius:7px;font-size:13px;font-weight:700;
-        cursor:pointer;font-family:inherit;margin-top:10px;transition:.15s}
-.runbtn:hover{opacity:.85}
-
-
-
-/* ── scenario card ── */
-.scenario{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:22px}
-.sc-card{background:var(--card);border:1px solid var(--border);border-radius:11px;padding:16px 18px}
-.sc-card.full{grid-column:1/-1}
-.sc-card.highlight{border-color:rgba(6,214,160,.4);background:rgba(6,214,160,.04)}
-.sc-title{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;
-          color:var(--accent);margin-bottom:6px}
-.sc-title.blue{color:var(--blue)}
-.sc-title.warn{color:var(--warn)}
-.sc-title.purple{color:var(--purple)}
-.sc-body{font-size:13px;color:var(--muted);line-height:1.65}
-.sc-body strong{color:var(--text)}
-.sc-body code{background:var(--bg);padding:1px 5px;border-radius:3px;
-              font-family:'Courier New',monospace;font-size:11px}
-.sc-compare{display:grid;grid-template-columns:1fr 1fr;gap:0;border-radius:9px;overflow:hidden;border:1px solid var(--border)}
-.sc-col{padding:12px 14px}
-.sc-col.bad{background:#fef2f2}.sc-col.good{background:#f0fdf4}
-.sc-col-title{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;margin-bottom:6px}
-.sc-col.bad .sc-col-title{color:#991b1b}.sc-col.good .sc-col-title{color:#166534}
-.sc-col ul{list-style:none;padding:0;font-size:12px;color:var(--muted);line-height:1.8}
-.sc-col.bad ul li::before{content:"✗ "}.sc-col.good ul li::before{content:"✓ "}
-.sc-stage{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:8px 0}
-.sc-box{background:var(--bg);border:1px solid var(--border);border-radius:6px;
-        padding:5px 10px;font-size:11px;font-family:'Courier New',monospace;color:var(--text)}
-.sc-box.hi{background:rgba(6,214,160,.1);border-color:rgba(6,214,160,.3);color:#065f46}
-.sc-arrow{color:var(--dim);font-size:14px;font-weight:700}
-.sc-stat{text-align:center}
-.sc-stat .big{font-size:28px;font-weight:700;font-family:'Courier New',monospace;line-height:1}
-.sc-stat .lbl{font-size:10px;text-transform:uppercase;letter-spacing:.05em;color:var(--dim);margin-top:2px}
-.sc-personas{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-top:8px}
-.sc-persona{border-radius:8px;padding:10px 10px 8px;border:1px solid transparent}
-.sc-persona.normal{background:#f0fdf4;border-color:#bbf7d0}
-.sc-persona.card{background:#eff6ff;border-color:#bfdbfe}
-.sc-persona.bust{background:#fff7ed;border-color:#fed7aa}
-.sc-persona.struct{background:#fdf4ff;border-color:#e9d5ff}
-.sc-persona .p-icon{font-size:18px;margin-bottom:4px}
-.sc-persona .p-name{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.04em}
-.sc-persona.normal .p-name{color:#166534}
-.sc-persona.card .p-name{color:#1e40af}
-.sc-persona.bust .p-name{color:#9a3412}
-.sc-persona.struct .p-name{color:#6b21a8}
-.sc-persona .p-stat{font-size:10px;color:var(--dim);margin-top:2px;line-height:1.5}
-
-/* ── footer ── */
-.ft{margin-top:32px;padding:14px 0;border-top:1px solid var(--border);
-    display:flex;justify-content:space-between;color:var(--dim);font-size:11px}
-
-/* ── Panel D extras ── */
-.p3 .qid{background:rgba(234,88,12,.12);color:#ea580c}
-tr.ml-row td{background:#f0fdf4;color:#166534}
-.wl-card{background:var(--card);border:1px solid var(--border);border-radius:11px;
-         padding:18px 22px;margin-bottom:20px}
-.wl-title{font-size:15px;font-weight:700;margin-bottom:3px}
-.wl-sub{font-size:12px;color:var(--dim);margin-bottom:14px;line-height:1.55}
-.wl-actions{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:14px}
-.btn-wl{background:linear-gradient(135deg,#ea580c,#d97706);color:#fff;border:0;
-        padding:9px 22px;border-radius:7px;font-size:13px;font-weight:700;
-        cursor:pointer;font-family:inherit;transition:.15s}
-.btn-wl:hover{opacity:.85}.btn-wl:disabled{opacity:.4;cursor:wait}
-.btn-rst{background:0;border:1px solid var(--border);color:var(--muted);
-         padding:8px 14px;border-radius:7px;font-size:12px;cursor:pointer;font-family:inherit}
-.btn-rst:hover{border-color:var(--danger);color:var(--danger)}
-.wl-stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(110px,1fr));gap:8px}
-.wsc{background:var(--bg);border:1px solid var(--border);border-radius:8px;
-     padding:8px 12px;text-align:center}
-.wsc .l{font-size:10px;text-transform:uppercase;letter-spacing:.5px;color:var(--dim)}
-.wsc .v{font-size:22px;font-weight:700;font-family:'Courier New',monospace;margin-top:2px}
-.wl-log{background:#0f172a;border-radius:8px;padding:10px 14px;font-family:'Courier New',monospace;
-        font-size:11px;line-height:1.7;max-height:160px;overflow-y:auto;
-        margin-top:12px;display:none}
-.wl-log.show{display:block}
-.wl-log .ok{color:#34d399}.wl-log .err{color:#f87171}.wl-log .info{color:#94a3b8}
-/* reset modal — normal-flow faux viewport, avoids position:fixed */
-.rst-wrap{display:none;min-height:180px;background:rgba(0,0,0,.45);border-radius:11px;
-          padding:20px;align-items:center;justify-content:center;margin-bottom:14px}
-.rst-wrap.show{display:flex}
-.rst-box{background:var(--card);border-radius:11px;padding:22px;max-width:400px;width:100%}
-.rst-box h3{font-size:15px;font-weight:700;margin-bottom:8px}
-.rst-box p{font-size:12px;color:var(--muted);margin-bottom:14px;line-height:1.6}
-.rst-btns{display:flex;gap:8px;flex-wrap:wrap}
-.rb-soft{background:rgba(251,191,36,.1);border:1px solid rgba(251,191,36,.4);color:var(--warn);
-         padding:7px 14px;border-radius:7px;cursor:pointer;font-size:12px;font-weight:600;font-family:inherit}
-.rb-hard{background:rgba(239,68,68,.08);border:1px solid rgba(239,68,68,.3);color:var(--danger);
-         padding:7px 14px;border-radius:7px;cursor:pointer;font-size:12px;font-weight:600;font-family:inherit}
-.rb-full{background:rgba(124,58,237,.08);border:1px solid rgba(124,58,237,.3);color:var(--purple);
-         padding:7px 14px;border-radius:7px;cursor:pointer;font-size:12px;font-weight:600;font-family:inherit}
-.rb-cancel{background:0;border:1px solid var(--border);color:var(--dim);
-           padding:7px 14px;border-radius:7px;cursor:pointer;font-size:12px;font-family:inherit}
+.empty{padding:30px 20px;text-align:center;color:var(--txm);font-size:13px}
 </style>
-</head><body>
+</head>
+<body>
 
-<!-- HEADER -->
-<div class="hdr">
-  <div class="hdr-left">
-    <svg class="logo-svg" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256">
-      <g transform="translate(-862,18)">
-        <path fill="#2a9993" d="M1060.7,2.12c-30.98,2.37-56.03,27.09-58.74,58.06-2.88,33.35,19.98,61.96,50.96,68.22v61.62c0,2.54-2.03,4.4-4.4,4.4h-16.76c-2.54,0-4.4-2.03-4.4-4.4v-44.35c0-7.28-5.92-13.37-13.37-13.37h-49.94c-7.28,0-13.37,5.92-13.37,13.37v44.35c0,2.54-2.03,4.4-4.4,4.4h-16.76c-2.37,0-4.4-2.03-4.4-4.4v-97.17l73.47-73.47c1.69-1.69,1.69-4.57,0-6.26l-11.85-11.85c-1.69-1.69-4.57-1.69-6.26,0l-125.27,125.27c-1.69,1.69-1.69,4.57,0,6.26l11.85,11.85c1.69,1.69,4.57,1.69,6.26,0l26.07-26.24v88.37c0,7.28,5.92,13.37,13.37,13.37h50.11c7.28,0,13.37-5.92,13.37-13.37v-44.35c0-2.54,2.03-4.4,4.4-4.4h16.76c2.37,0,4.4,2.03,4.4,4.4v44.35c0,7.28,5.92,13.37,13.37,13.37h50.11c7.28,0,13.37-5.92,13.37-13.37v-98.19c0-2.54-2.03-4.4-4.4-4.4h-7.45c-20.99,0-38.77-16.59-39.27-37.58-.51-21.67,17.44-39.61,39.11-39.1,20.99.34,37.58,18.28,37.58,39.27v123.41c0,2.54,2.03,4.4,4.4,4.4h16.76c2.54,0,4.4-2.03,4.4-4.4v-124.26c-.17-36.9-31.49-66.53-69.07-63.82Z"/>
-        <circle fill="#2a9993" cx="1065.61" cy="65.94" r="12.7"/>
-      </g>
-    </svg>
-    <div>
-      <h1>WarehousePG <span>AI Analytics</span></h1>
-      <div class="hdr-sub">Lab 3 — pgvector + MADlib + AI Factory · Meridian Bank · last 28 days</div>
-    </div>
+<nav class="nav">
+  <span class="nav-brand">EDB <span>WHPG</span></span>
+  <div class="nav-div"></div>
+  <span class="nav-title">Lab 2 - Iceberg vs Native WHPG</span>
+  <div class="nav-sp"></div>
+  <div class="nav-pill">
+    <span class="sdot" id="sdot"></span>
+    <span id="stxt">Connecting...</span>
   </div>
-  <div class="hdr-right">
-    <span class="dot-live"></span>
-    <div class="live-badge">LIVE</div>
-    <div id="conn">connecting…</div>
-  </div>
+</nav>
+
+<div class="tabs">
+  <button class="tab on" data-tab="0">Same SQL, Two Engines</button>
+  <button class="tab" data-tab="1">Speed Comparison</button>
+  <button class="tab warn-tab" data-tab="2">Check Understanding</button>
+  <button class="tab warn-tab" data-tab="3">Challenge</button>
+  <button class="tab" data-tab="4" style="margin-left:4px">SQL Editor</button>
 </div>
 
-<!-- TABS -->
-<div class="tabs" id="tabs">
-  <button class="tab on"  onclick="switchTab(0)">Part A: pgvector</button>
-  <button class="tab"     onclick="switchTab(1)">Part B: MADlib / SQL</button>
-  <button class="tab"     onclick="switchTab(2)">Part C: AI Factory</button>
-  <button class="tab"     onclick="switchTab(3)" style="border-color:rgba(167,139,250,.3);color:var(--purple)">SQL Editor</button>
-  <button class="tab"     onclick="switchTab(4)" style="border-color:rgba(234,88,12,.3);color:#ea580c">D: ML &#8594; Watchlist</button>
+<div class="page">
+
+  <div class="pane on" id="pane-0">
+    <p class="lead">Five queries. Each runs <strong>identical SQL</strong> against two storage backends -
+       Iceberg files on object storage (PGAA), and native AOCO segments on WHPG. Click
+       <strong>Run</strong> on any query to fire it on both engines and see results side-by-side.</p>
+    <div class="qgrid" id="qgrid"></div>
+  </div>
+
+  <div class="pane" id="pane-1">
+    <p class="lead">Hit <strong>Run All</strong> - every query runs on both engines (parallel within each side).
+       The bars show per-query timings; the totals at the top compare wall-clock time.</p>
+    <div class="run-bar">
+      <button class="run-btn" id="run-all-btn" onclick="runAll()">Run All Queries</button>
+      <span id="run-status" style="font-size:12.5px;color:var(--txs)"></span>
+    </div>
+    <div class="totals" id="totals" style="display:none">
+      <div class="tot nat"><span class="tot-l">Native (AOCO) Wall</span><span class="tot-v" id="tot-nat">-</span></div>
+      <div class="tot ice"><span class="tot-l">Iceberg (PGAA) Wall</span><span class="tot-v" id="tot-ice">-</span></div>
+      <div class="tot"><span class="tot-l">Speedup</span><span class="tot-v" id="tot-spd" style="color:var(--warn)">-</span></div>
+    </div>
+    <div class="bars" id="bars"><div class="empty">Run the queries to see the comparison.</div></div>
+  </div>
+
+  <div class="pane" id="pane-2">
+    <p class="lead">Two questions to surface what stuck. <strong>Talk to the person next to you</strong> -
+       compare answers, then click "Reveal" to see what we're listening for.</p>
+    <div class="check-grid" id="check-grid"></div>
+  </div>
+
+  <div class="pane" id="pane-3">
+    <p class="lead">Your turn to write SQL. Below is a partially-completed query - fill in the missing
+       <strong>JOIN condition</strong>, then click <strong>Check</strong> to validate or <strong>Run</strong>
+       to execute it against the live Iceberg dataset.</p>
+    <div class="ch-card" id="ch-card"></div>
+  </div>
+
+  <div class="pane" id="pane-4">
+    <p class="lead">Run any <code>SELECT</code>, <code>WITH</code>, or <code>EXPLAIN</code> against the live dataset.
+       Use either Iceberg names (<code>customers_iceberg</code>, <code>orders_iceberg</code>, ...) or
+       schema-qualified native names (<code>demo.customers</code>, ...).</p>
+    <textarea id="sqled" spellcheck="false"
+      style="width:100%;min-height:160px;background:#F8FAFA;border:1px solid var(--bdr);border-radius:8px;padding:14px;font-family:var(--mono);font-size:12.5px;color:var(--tx);resize:vertical;line-height:1.6">SELECT category, COUNT(DISTINCT oi.order_id) AS orders,
+       ROUND(SUM(oi.quantity * oi.unit_price)::numeric, 2) AS revenue
+FROM   products_iceberg p
+JOIN   order_items_iceberg oi ON p.product_id = oi.product_id
+GROUP  BY 1
+ORDER  BY revenue DESC;</textarea>
+    <div style="margin-top:12px;display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+      <button class="run-btn" onclick="runSqlEditor()">Run Query</button>
+      <span id="sqled-status" style="font-size:12px;color:var(--txs);font-family:var(--mono)"></span>
+    </div>
+    <div id="sqled-result" style="margin-top:14px"></div>
+  </div>
+
 </div>
-
-<div class="main" id="main">
-
-  <!-- Query panels injected by JS (pnl-0, pnl-1, pnl-2) -->
-
-  <!-- SQL EDITOR -->
-  <div class="pnl" id="pnl-3">
-    <div class="sec-hdr">
-      <span class="n">Q</span><h2>SQL Editor</h2>
-      <div class="d">Run any SELECT against the live dataset</div>
-    </div>
-    <textarea class="sqled" id="sqlin" spellcheck="false">SELECT note_id, account_id, queue,
-    LEFT(narrative, 80) AS narrative, persona, severity
-FROM bfsi_demo.case_embeddings
-LIMIT 20;</textarea>
-    <button class="runbtn" onclick="runSQL()">▶ Run Query</button>
-    <span id="sqlt" style="margin-left:12px"></span>
-    <div style="margin-top:14px;overflow-x:auto;max-height:500px;overflow-y:auto" id="sqlr"></div>
-  </div>
-
-
-  <!-- Panel D: ML → Watchlist (static; query cards injected by buildPanels) -->
-  <div class="pnl" id="pnl-4">
-    <div class="sec-hdr">
-      <span class="n" style="background:linear-gradient(135deg,#ea580c,#d97706)">D</span>
-      <h2>ML &#8594; Watchlist</h2>
-      <div class="d">Write K-Means results back to fraud_watchlists · Query 1A before vs after ML update</div>
-    </div>
-
-    <!-- Reset info box -->
-    <div style="background:#fef9f0;border:1px solid rgba(234,88,12,.25);border-radius:11px;padding:14px 18px;margin-bottom:16px;font-size:12px;line-height:1.7">
-      <div style="font-weight:700;color:#ea580c;margin-bottom:6px">&#9432; What to reset if Inserted = 0</div>
-      <div style="color:var(--muted)">
-        If the Refresh shows <strong>Inserted 0</strong>, those accounts are already in the watchlist from a previous run.<br>
-        Run this in psql to soft-reset (safe — just expires the flags, you can re-refresh immediately):<br>
-        <code style="background:var(--bg);padding:3px 8px;border-radius:4px;font-family:'Courier New',monospace;font-size:11px;display:inline-block;margin-top:4px">
-          UPDATE bfsi_demo.fraud_watchlists SET active=FALSE, last_seen=NOW() WHERE feed_name='MADlib K-Means' AND active=TRUE;
-        </code><br>
-        Then click <strong>Run Refresh</strong> again — D1 will show the gap, D2 will show them filled.
-      </div>
-    </div>
-
-    <!-- Watchlist pipeline card -->
-    <div class="wl-card">
-      <div class="wl-title">ML Watchlist Pipeline</div>
-      <div class="wl-sub">
-        <b>Step 1</b>: Run D1 to see fraud transactions <em>not yet</em> in the watchlist (the gap MADlib found).<br>
-        <b>Step 2</b>: Click <strong>Run Refresh</strong> — writes K-Means results to fraud_watchlists.<br>
-        <b>Step 3</b>: Re-run D1 (should now show 0) and run D2 to see all flagged transactions with color coding.
-      </div>
-      <div class="wl-actions">
-        <button class="btn-wl"  id="btn-wl-refresh" onclick="wlRefresh()">&#9654; Run Refresh</button>
-        <span id="wl-status" style="font-size:13px;color:var(--dim)">Not yet run this session</span>
-      </div>
-      <div class="wl-stats">
-        <div class="wsc"><div class="l">Inserted</div><div class="v" id="wl-ins" style="color:var(--accent)">—</div></div>
-        <div class="wsc"><div class="l">Expired</div> <div class="v" id="wl-exp" style="color:var(--warn)">—</div></div>
-        <div class="wsc"><div class="l">Time</div>    <div class="v" id="wl-ms"  style="color:var(--blue)">—</div></div>
-        <div class="wsc"><div class="l">ML Flags</div><div class="v" id="wl-tot" style="color:#ea580c">—</div></div>
-      </div>
-      <div class="wl-log" id="wl-log"></div>
-    </div>
-
-    <!-- Query cards injected by buildPanels (D1, D2, D3) -->
-    <div class="sbar">
-      <div class="sstat"><div class="l">Queries</div><div class="v" style="color:var(--accent)">2</div></div>
-      <div class="sstat"><div class="l">Completed</div><div class="v" style="color:var(--blue)" id="done-3">0</div></div>
-      <div class="sstat"><div class="l">Total Time</div><div class="v" style="color:var(--warn)" id="tms-3">—</div></div>
-      <button class="rabtn" id="rabtn-3" onclick="runPanel(3)">&#9654; Run All 2</button>
-    </div>
-    <div class="qgrid" id="pnl-4-qgrid"></div>
-  </div>
-
-  <div class="ft">
-    <div>EDB WarehousePG — Lab 3: AI-Powered Analytics + ML Watchlist</div>
-    <div style="font-family:'Courier New',monospace">pgvector + MADlib + AI Factory + ML&#8594;Watchlist</div>
-  </div>
-</div><!-- /main -->
 
 <script>
-const PANELS  = {{ panels|tojson }};
-const QUERIES = {{ queries|tojson }};
-const results = {};
+const NATIVE_SCHEMA = '__NATIVE_SCHEMA__';
+const fmtMs = ms => ms == null ? '-' : ms < 1000 ? Math.round(ms) + 'ms' : (ms/1000).toFixed(2) + 's';
+const fmtN  = n  => n == null ? '-' : n >= 1e6 ? (n/1e6).toFixed(1) + 'M' : n >= 1e3 ? (n/1e3).toFixed(1) + 'K' : String(n);
+const esc   = s  => String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 
-// ── health check ──────────────────────────────────────────────────────────
-fetch('/api/health').then(r=>r.json()).then(d=>{
-  const el = document.getElementById('conn');
-  el.textContent  = d.status==='ok' ? 'Connected' : 'Error: '+d.error;
-  el.style.color  = d.status==='ok' ? '#34d399' : '#ef4444';
-}).catch(()=>{
-  document.getElementById('conn').textContent='Offline';
-  document.getElementById('conn').style.color='#ef4444';
+let QUERIES = {};
+let CHECK = [];
+let CHALLENGE = {};
+
+document.querySelectorAll('.tab').forEach(t => {
+  t.addEventListener('click', () => {
+    document.querySelectorAll('.tab').forEach(x => x.classList.toggle('on', x === t));
+    document.querySelectorAll('.pane').forEach(p =>
+      p.classList.toggle('on', p.id === 'pane-' + t.dataset.tab));
+  });
 });
 
-// ── helpers ───────────────────────────────────────────────────────────────
-function esc(s){ return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
-function fmtMs(ms){ return ms<1000 ? ms+'ms' : (ms/1000).toFixed(1)+'s'; }
-function tbl(rows){
-  if(!rows||!rows.length)
-    return '<div class="empty">No results — data may need a reload (timestamps expired, 06_ai_analytics.sql not run, or 07_kmeans_fallback.sql not run)</div>';
-  const ks=Object.keys(rows[0]);
-  let h='<table><thead><tr>'+ks.map(k=>'<th>'+esc(k)+'</th>').join('')+'</tr></thead><tbody>';
-  rows.forEach(r=>{ h+='<tr>'+ks.map(k=>'<td>'+(r[k]!=null?esc(String(r[k])):'—')+'</td>').join('')+'</tr>'; });
-  return h+'</tbody></table>';
-}
-
-// ── build query panels ────────────────────────────────────────────────────
-function qCards(qs, pi){
-  let h='';
-  qs.forEach(q=>{
-    h += `<div class="qcard p${pi}" id="qc-${q.id}">
-      <div class="qbar" onclick="toggle('${q.id}')">
-        <span class="qid">${q.id.toUpperCase()}</span>
-        <div style="flex:1"><div class="qname">${esc(q.name)}</div><div class="qdesc">${esc(q.desc)}</div></div>
-        <span class="qtm" id="qt-${q.id}"></span>
-        <button class="rbtn" id="rb-${q.id}" onclick="event.stopPropagation();runQ('${q.id}')">Run</button>
-      </div>
-      <div class="qbody" data-pi="${pi}">
-        <div class="qsql">${esc(q.sql)}</div>
-        <div class="qactions">
-          <button class="rbtn" onclick="runQ('${q.id}')">&#9654; Run</button>
-          <button class="rbtn" onclick="copyQ('${q.id}')" style="background:var(--bdim);color:var(--blue);border-color:rgba(59,130,246,.3)">Copy SQL</button>
-          <button class="rbtn" onclick="toEditor('${q.id}')" style="background:rgba(167,139,250,.1);color:var(--purple);border-color:rgba(167,139,250,.3)">Edit in SQL</button>
-        </div>
-        <div class="qres" id="qr-${q.id}"></div>
-      </div>
-    </div>`;
-  });
-  return h;
-}
-
-const SCENARIO_HTML = {
-  0: `<div class="scenario">
-    <div class="sc-card full highlight">
-      <div class="sc-title">&#128270; The problem — Part A: pgvector</div>
-      <div class="sc-body">Analysts write keyword searches like <code>WHERE narrative LIKE '%structuring%'</code>. Fraud rings use different words for the same behaviour — <em>sub-threshold splits, layering, smurfing, rapid pass-through</em>. Keyword search misses <strong>70–80% of fraud</strong>.<br><br>
-      pgvector stores each case note as a 32-dimension vector encoding <strong>meaning, not words</strong>. A single <code>&lt;=&gt;</code> cosine distance operator finds semantically similar notes across all phrasing variants — no UDF, no regex, no re-indexing as language evolves.</div>
-    </div>
-    <div class="sc-card">
-      <div class="sc-title blue">WITHOUT pgvector</div>
-      <div class="sc-col bad" style="border-radius:8px;padding:10px 14px">
-        <ul><li>Keyword regex — misses phrasing variants</li><li>New attack = new rules written manually</li><li>30% fraud coverage</li><li>Export to Pinecone / Weaviate (data movement)</li></ul>
-      </div>
-    </div>
-    <div class="sc-card">
-      <div class="sc-title" style="color:var(--accent)">WITH pgvector (WHPG native)</div>
-      <div class="sc-col good" style="border-radius:8px;padding:10px 14px">
-        <ul><li>Semantic similarity — finds meaning, not words</li><li>New phrasings caught automatically</li><li>95% fraud coverage</li><li>Native operator in the same database — zero data movement</li></ul>
-      </div>
-    </div>
-  </div>`,
-
-  1: `<div class="scenario">
-    <div class="sc-card full highlight">
-      <div class="sc-title">&#129504; The problem — Part B: MADlib K-Means</div>
-      <div class="sc-body">You can't write rules for fraud you haven't seen yet. MADlib runs <strong>K-Means clustering in-database</strong> on 6 behavioural features extracted from ~50K accounts across 13M transactions — no labels required. The algorithm discovers fraud rings automatically by grouping accounts with statistically similar spend patterns.<br><br>
-      <strong>No data ever leaves WarehousePG.</strong> On Snowflake or Databricks you'd export to SageMaker, train externally, re-import results. Here: one SQL call, same engine, same second.</div>
-    </div>
-    <div class="sc-card">
-      <div class="sc-title warn">Traditional pipeline</div>
-      <div class="sc-stage">
-        <span class="sc-box">Warehouse</span><span class="sc-arrow">→</span>
-        <span class="sc-box">Export ETL</span><span class="sc-arrow">→</span>
-        <span class="sc-box">SageMaker</span><span class="sc-arrow">→</span>
-        <span class="sc-box">Re-import</span><span class="sc-arrow">→</span>
-        <span class="sc-box">App</span>
-      </div>
-      <div class="sc-body" style="font-size:12px;margin-top:6px">6 stages · 3 vendors · 2 security reviews · hours of lag</div>
-    </div>
-    <div class="sc-card">
-      <div class="sc-title" style="color:var(--accent)">WHPG in-database ML</div>
-      <div class="sc-stage">
-        <span class="sc-box hi">account_features</span><span class="sc-arrow">→</span>
-        <span class="sc-box hi">MADlib K-Means</span><span class="sc-arrow">→</span>
-        <span class="sc-box hi">kmeans_labeled</span>
-      </div>
-      <div class="sc-body" style="font-size:12px;margin-top:6px">1 engine · 1 SQL call · 0 data exports · &lt; 5 seconds</div>
-    </div>
-    <div class="sc-card full">
-      <div class="sc-title purple">6 behavioural features fed to K-Means</div>
-      <div class="sc-body" style="margin-bottom:10px">Each account becomes a point in 6-dimensional feature space. The algorithm finds natural clusters — fraud rings self-identify by proximity.</div>
-      <div style="display:grid;grid-template-columns:repeat(6,1fr);gap:8px;text-align:center">
-        <div style="background:var(--bg);border-radius:7px;padding:8px 6px"><div style="font-size:18px">&#128200;</div><div style="font-size:10px;font-weight:600;margin-top:3px">txn_count</div><div style="font-size:10px;color:var(--dim)">How active?</div></div>
-        <div style="background:var(--bg);border-radius:7px;padding:8px 6px"><div style="font-size:18px">&#127978;</div><div style="font-size:10px;font-weight:600;margin-top:3px">distinct_merchants</div><div style="font-size:10px;color:var(--dim)">How many merchants?</div></div>
-        <div style="background:var(--bg);border-radius:7px;padding:8px 6px"><div style="font-size:18px">&#128181;</div><div style="font-size:10px;font-weight:600;margin-top:3px">total_amount</div><div style="font-size:10px;color:var(--dim)">How much spend?</div></div>
-        <div style="background:var(--bg);border-radius:7px;padding:8px 6px"><div style="font-size:18px">&#127922;</div><div style="font-size:10px;font-weight:600;margin-top:3px">merchant_entropy</div><div style="font-size:10px;color:var(--dim)">How scattered?</div></div>
-        <div style="background:var(--bg);border-radius:7px;padding:8px 6px"><div style="font-size:18px">&#128101;</div><div style="font-size:10px;font-weight:600;margin-top:3px">mcc_spread</div><div style="font-size:10px;color:var(--dim)">Merchant diversity?</div></div>
-        <div style="background:var(--bg);border-radius:7px;padding:8px 6px"><div style="font-size:18px">&#128202;</div><div style="font-size:10px;font-weight:600;margin-top:3px">amount_cv</div><div style="font-size:10px;color:var(--dim)">Amount consistency?</div></div>
-      </div>
-      <div class="sc-personas">
-        <div class="sc-persona normal"><div class="p-icon">&#10003;</div><div class="p-name">Normal</div><div class="p-stat">~50K accounts<br>6 merchants · $2.3K avg</div></div>
-        <div class="sc-persona card"><div class="p-icon">&#128269;</div><div class="p-name">Card-Testing</div><div class="p-stat">~40 accounts<br>600 merchants · tiny tickets</div></div>
-        <div class="sc-persona bust"><div class="p-icon">&#128228;</div><div class="p-name">Bust-Out</div><div class="p-stat">~30 accounts<br>9 merchants · $1.5M spend</div></div>
-        <div class="sc-persona struct"><div class="p-icon">&#129302;</div><div class="p-name">Structuring</div><div class="p-stat">~40 accounts<br>1 merchant · $4.7K fixed</div></div>
-      </div>
-    </div>
-  </div>`,
-
-  2: `<div class="scenario">
-    <div class="sc-card full highlight">
-      <div class="sc-title">&#127981; Part C: The AI Factory — pgvector + MADlib in ONE query</div>
-      <div class="sc-body">MADlib finds <strong>behavioural anomalies</strong> (accounts with extreme spend patterns). pgvector finds <strong>semantic matches</strong> (case notes with similar meaning). Join them — and the same fraud types surface from two completely independent signals in a single SQL statement.<br><br>
-      This is the critical limitation of competing platforms: <strong>Snowflake and Databricks cannot do this without exporting data to an external ML tool.</strong> In WarehousePG, both algorithms run where the data lives — no API, no data movement, no token cost until the very last mile.</div>
-    </div>
-    <div class="sc-card">
-      <div class="sc-title blue">Token funnel — why this matters for LLM cost</div>
-      <div class="sc-stage" style="flex-direction:column;align-items:flex-start;gap:6px">
-        <div style="display:flex;align-items:center;gap:8px"><span class="sc-box">13M rows</span><span class="sc-arrow">→</span><span style="font-size:11px;color:var(--dim)">MADlib K-Means · 0 tokens</span></div>
-        <div style="display:flex;align-items:center;gap:8px"><span class="sc-box hi">~26 anomalous accounts</span><span class="sc-arrow">→</span><span style="font-size:11px;color:var(--dim)">pgvector search · 0 tokens</span></div>
-        <div style="display:flex;align-items:center;gap:8px"><span class="sc-box hi">~40 related events</span><span class="sc-arrow">→</span><span style="font-size:11px;color:var(--dim)">LLM summary · ~2–4K tokens</span></div>
-      </div>
-    </div>
-    <div class="sc-card">
-      <div class="sc-title" style="color:var(--accent)">The competitive moat</div>
-      <div class="sc-body">
-        <strong>Snowflake / Databricks:</strong> export 13M rows → SageMaker → re-import → JOIN → 2–4 hours<br><br>
-        <strong>WarehousePG:</strong> <code>SELECT madlib.kmeanspp(...)</code> + <code>&lt;=&gt;</code> in one query → &lt; 5 seconds<br><br>
-        Cost grows with <em>findings</em>, not data size.
-      </div>
-    </div>
-  </div>`
-};
-
-function buildPanels(){
-  const main   = document.getElementById('main');
-  const anchor = document.getElementById('pnl-3');
-  PANELS.forEach((p, pi)=>{
-    const qs = QUERIES.filter(q=>q.panel===pi);
-    // Panel 3 (D) already has its wrapper HTML; just inject cards into the qgrid
-    if(pi===3){
-      const grid=document.getElementById('pnl-4-qgrid');
-      if(grid) grid.innerHTML=qCards(qs,pi);
-      return;
+async function ping() {
+  try {
+    const r = await fetch('/api/queries');
+    if (r.ok) {
+      document.getElementById('sdot').classList.add('on');
+      document.getElementById('stxt').textContent = 'Connected';
     }
-    let h = `<div class="pnl${pi===0?' on':''}" id="pnl-${pi}">`;
-    h += `<div class="sec-hdr"><span class="n">${p.icon}</span><h2>${p.name}</h2><div class="d">${esc(p.desc)}</div></div>`;
-    // inject scenario card if defined for this panel
-    if(SCENARIO_HTML[pi]) h += SCENARIO_HTML[pi];
-    h += `<div class="sbar">
-      <div class="sstat"><div class="l">Queries</div><div class="v" style="color:var(--accent)">${qs.length}</div></div>
-      <div class="sstat"><div class="l">Completed</div><div class="v" style="color:var(--blue)" id="done-${pi}">0</div></div>
-      <div class="sstat"><div class="l">Total Time</div><div class="v" style="color:var(--warn)" id="tms-${pi}">—</div></div>
-      <button class="rabtn" id="rabtn-${pi}" onclick="runPanel(${pi})">&#9654; Run All ${qs.length}</button>
-    </div>`;
-    h += `<div class="qgrid">${qCards(qs,pi)}</div></div>`;
+  } catch (e) {
+    document.getElementById('sdot').classList.add('err');
+    document.getElementById('stxt').textContent = 'DB unavailable';
+  }
+}
+
+function buildQueryCards() {
+  const grid = document.getElementById('qgrid');
+  grid.innerHTML = '';
+  Object.entries(QUERIES).forEach(([qid, q], i) => {
     const div = document.createElement('div');
-    div.innerHTML = h;
-    main.insertBefore(div.firstChild, anchor);
+    div.className = 'qcard'; div.id = 'qc-' + qid;
+    div.innerHTML =
+      '<div class="qhead" onclick="toggleCard(\'' + qid + '\')">' +
+        '<span class="qnum">' + (i+1) + '</span>' +
+        '<div class="qmeta"><div class="qname">' + esc(q.name) + '</div><div class="qdesc">' + esc(q.desc) + '</div></div>' +
+        '<div class="qtimes" id="qt-' + qid + '">' +
+          '<span class="tchip pending">native: -</span>' +
+          '<span class="tchip pending">iceberg: -</span>' +
+        '</div>' +
+        '<button class="qbtn" id="qb-' + qid + '" onclick="event.stopPropagation();runOne(\'' + qid + '\')">Run</button>' +
+      '</div>' +
+      '<div class="qbody">' +
+        '<div class="qsql-pair">' +
+          '<div class="qsql-side">' +
+            '<div class="qsql-lbl"><span class="cd ice"></span>Iceberg (PGAA) &mdash; runs on object storage</div>' +
+            '<div class="qsql">' + esc(q.sql) + '</div>' +
+          '</div>' +
+          '<div class="qsql-side">' +
+            '<div class="qsql-lbl"><span class="cd nat"></span>Native (AOCO) &mdash; auto-rewritten for ' + NATIVE_SCHEMA + '.*</div>' +
+            '<div class="qsql">' + esc(toNativeSql(q.sql)) + '</div>' +
+          '</div>' +
+        '</div>' +
+        '<div id="qr-' + qid + '"><div class="empty">Click Run to compare engines.</div></div>' +
+      '</div>';
+    grid.appendChild(div);
   });
 }
 
-function switchTab(i){
-  document.querySelectorAll('.tab').forEach((t,j)=>t.classList.toggle('on',j===i));
-  document.querySelectorAll('.pnl').forEach((p,j)=>p.classList.toggle('on',j===i));
+// Mirror of the server-side to_native() — keeps the SQL display in sync without an extra round-trip.
+function toNativeSql(sql) {
+  return sql
+    .replace(/customers_iceberg/g,   NATIVE_SCHEMA + '.customers')
+    .replace(/products_iceberg/g,    NATIVE_SCHEMA + '.products')
+    .replace(/orders_iceberg/g,      NATIVE_SCHEMA + '.orders')
+    .replace(/order_items_iceberg/g, NATIVE_SCHEMA + '.order_items')
+    .replace(/events_iceberg/g,      NATIVE_SCHEMA + '.events');
 }
-function toggle(id){ document.getElementById('qc-'+id)?.classList.toggle('open'); }
 
-// ── run query ─────────────────────────────────────────────────────────────
-async function runQ(id){
-  const btn=document.getElementById('rb-'+id);
-  btn.disabled=true; btn.textContent='…';
-  document.getElementById('qr-'+id).innerHTML='<div style="padding:20px;text-align:center"><div class="spinner"></div></div>';
-  document.getElementById('qc-'+id).classList.add('open');
-  try{
-    const r=await(await fetch('/api/run',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id})})).json();
-    results[id]=r;
-    const slow=r.ms>5000;
-    document.getElementById('qt-'+id).innerHTML=`<span class="t${slow?' slow':''}">${fmtMs(r.ms)}</span><span class="r" style="color:var(--dim);margin-left:6px">${r.rows} rows</span>`;
-    document.getElementById('qr-'+id).innerHTML=r.error
-      ?`<div style="color:var(--danger);padding:12px;font-family:'Courier New',monospace;font-size:12px">ERROR: ${esc(r.error)}</div>`
-      :tbl(r.data);
-  }catch(e){
-    document.getElementById('qr-'+id).innerHTML=`<div style="color:var(--danger);padding:12px">${e.message}</div>`;
+function toggleCard(qid) { document.getElementById('qc-' + qid).classList.toggle('open'); }
+
+function renderResultTable(res) {
+  if (res.error) return '<div style="padding:14px 16px;color:var(--err);font-family:var(--mono);font-size:11.5px">' + esc(res.error) + '</div>';
+  if (!res.rows || !res.rows.length) return '<div class="empty">No rows returned</div>';
+  return '<div class="qres"><table><thead><tr>' +
+    res.columns.map(c => '<th>' + esc(c) + '</th>').join('') +
+    '</tr></thead><tbody>' +
+    res.rows.map(r => '<tr>' + r.map(v => '<td>' + (v == null ? 'NULL' : esc(v)) + '</td>').join('') + '</tr>').join('') +
+    '</tbody></table></div>';
+}
+
+async function runOne(qid) {
+  const btn = document.getElementById('qb-' + qid);
+  const card = document.getElementById('qc-' + qid);
+  btn.disabled = true; btn.innerHTML = '<span class="spinner"></span>Running';
+  card.classList.add('open');
+  document.getElementById('qr-' + qid).innerHTML = '<div class="empty">Running on both engines...</div>';
+  try {
+    const r = await fetch('/api/compare/' + qid).then(x => x.json());
+    const nms = r.native.exec_time_ms || 0, ims = r.iceberg.exec_time_ms || 0;
+    document.getElementById('qt-' + qid).innerHTML =
+      '<span class="tchip nat">native: ' + fmtMs(nms) + '</span>' +
+      '<span class="tchip ice">iceberg: ' + fmtMs(ims) + '</span>';
+    document.getElementById('qr-' + qid).innerHTML =
+      '<div class="qcols">' +
+        '<div class="qcol">' +
+          '<div class="qcolh"><span class="cd nat"></span>Native AOCO - ' + fmtMs(nms) + ' &middot; ' + fmtN(r.native.row_count) + ' rows</div>' +
+          renderResultTable(r.native) +
+        '</div>' +
+        '<div class="qcol">' +
+          '<div class="qcolh"><span class="cd ice"></span>Iceberg (PGAA) - ' + fmtMs(ims) + ' &middot; ' + fmtN(r.iceberg.row_count) + ' rows</div>' +
+          renderResultTable(r.iceberg) +
+        '</div>' +
+      '</div>';
+  } catch (e) {
+    document.getElementById('qr-' + qid).innerHTML =
+      '<div style="padding:14px;color:var(--err)">Error: ' + esc(e.message) + '</div>';
   }
-  btn.disabled=false; btn.textContent='Run';
-  updatePanel(QUERIES.find(q=>q.id===id).panel);
+  btn.disabled = false; btn.textContent = 'Run';
 }
 
-async function runPanel(pi){
-  const btn=document.getElementById('rabtn-'+pi);
-  btn.disabled=true; btn.textContent='Running…';
-  for(const q of QUERIES.filter(q=>q.panel===pi)) await runQ(q.id);
-  btn.disabled=false; btn.textContent='▶ Run All '+QUERIES.filter(q=>q.panel===pi).length;
+async function runAll() {
+  const btn = document.getElementById('run-all-btn');
+  btn.disabled = true; btn.innerHTML = '<span class="spinner"></span>Running...';
+  document.getElementById('run-status').textContent = 'Executing on both engines...';
+  document.getElementById('bars').innerHTML = '<div class="empty">Running...</div>';
+  try {
+    const d = await fetch('/api/run_all').then(x => x.json());
+    renderBars(d);
+    document.getElementById('run-status').textContent = '';
+  } catch (e) {
+    document.getElementById('run-status').innerHTML =
+      '<span style="color:var(--err)">Error: ' + esc(e.message) + '</span>';
+  }
+  btn.disabled = false; btn.textContent = 'Run All Queries';
 }
 
-function updatePanel(pi){
-  const qs=QUERIES.filter(q=>q.panel===pi);
-  const done=qs.filter(q=>results[q.id]);
-  const ms=done.reduce((s,q)=>s+(results[q.id]?.ms||0),0);
-  document.getElementById('done-'+pi).textContent=done.length;
-  document.getElementById('tms-'+pi).textContent=done.length?fmtMs(Math.round(ms)):'—';
+function renderBars(d) {
+  const nat = d.native, ice = d.iceberg;
+  const nw = nat.wall_time_ms, iw = ice.wall_time_ms;
+  document.getElementById('totals').style.display = 'flex';
+  document.getElementById('tot-nat').textContent = fmtMs(nw);
+  document.getElementById('tot-ice').textContent = fmtMs(iw);
+  if (nw > 0 && iw > 0) {
+    const f = nw < iw ? (iw / nw).toFixed(2) + 'x faster (Native)'
+                      : (nw / iw).toFixed(2) + 'x faster (Iceberg)';
+    document.getElementById('tot-spd').textContent = f;
+  }
+  const allTimes = [...nat.queries, ...ice.queries].map(q => q.exec_time_ms || 0);
+  const mx = Math.max(...allTimes, 1);
+  const iceMap = Object.fromEntries(ice.queries.map(q => [q.id, q]));
+  const html = nat.queries.map(nq => {
+    const iq = iceMap[nq.id];
+    const nms = nq.exec_time_ms || 0, ims = (iq && iq.exec_time_ms) || 0;
+    const nPct = Math.max(2, Math.round(nms / mx * 100));
+    const iPct = Math.max(2, Math.round(ims / mx * 100));
+    // Flipped direction: bigger ratio = bigger gap = the slower engine's time / faster engine's time
+    let ratio = '';
+    if (nms > 0 && ims > 0) {
+      const r = (Math.max(nms, ims) / Math.min(nms, ims)).toFixed(1);
+      const winner = nms < ims ? 'Native' : 'Iceberg';
+      ratio = '<span class="bratio">' + r + '&times; faster (' + winner + ')</span>';
+    } else {
+      ratio = '<span class="bratio dim">&mdash;</span>';
+    }
+    return '<div class="brow">' +
+      '<div class="bname">' + esc(nq.name) + '</div>' +
+      '<div class="bvis">' +
+        '<div class="bone"><span class="bone-lbl">NATIVE</span>' +
+          '<div class="bbar"><div class="bfill nat" style="width:' + nPct + '%"></div></div>' +
+          '<span class="btime">' + fmtMs(nms) + '</span>' +
+        '</div>' +
+        '<div class="bone"><span class="bone-lbl">ICEBERG</span>' +
+          '<div class="bbar"><div class="bfill ice" style="width:' + iPct + '%"></div></div>' +
+          '<span class="btime">' + fmtMs(ims) + '</span>' +
+        '</div>' +
+      '</div>' +
+      ratio +
+      '</div>';
+  }).join('');
+  document.getElementById('bars').innerHTML = html;
 }
 
-function copyQ(id){ navigator.clipboard.writeText(QUERIES.find(q=>q.id===id).sql+';'); }
-function toEditor(id){
-  document.getElementById('sqlin').value=QUERIES.find(q=>q.id===id).sql+';';
-  switchTab(3);
+function buildCheck() {
+  const grid = document.getElementById('check-grid');
+  grid.innerHTML = '';
+  CHECK.forEach((q, i) => {
+    const div = document.createElement('div');
+    div.className = 'qq ' + q.kind;
+    div.innerHTML =
+      '<div class="qq-head">Question ' + (i+1) + ' &mdash; ' + q.kind + '</div>' +
+      '<div class="qq-body">' +
+        '<div class="qq-title">' + esc(q.title) + '</div>' +
+        '<div class="qq-ask">' + esc(q.ask) + '</div>' +
+        '<button class="reveal-btn" onclick="this.parentElement.querySelector(\'.listen\').classList.toggle(\'on\');this.textContent=this.textContent.startsWith(\'Reveal\')?\'Hide answer\':\'Reveal answer\'">Reveal answer</button>' +
+        '<div class="listen"><div class="listen-l">What we\'re listening for</div>' + esc(q.listen) + '</div>' +
+      '</div>';
+    grid.appendChild(div);
+  });
 }
 
-// ── SQL editor ────────────────────────────────────────────────────────────
-async function runSQL(){
-  const sql=document.getElementById('sqlin').value;
-  document.getElementById('sqlr').innerHTML='<div style="padding:20px;text-align:center"><div class="spinner"></div></div>';
-  document.getElementById('sqlt').innerHTML='';
-  try{
-    const r=await(await fetch('/api/sql',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sql})})).json();
-    if(r.error){
-      document.getElementById('sqlr').innerHTML=`<div style="color:var(--danger);padding:16px;font-family:'Courier New',monospace;font-size:12px">ERROR: ${esc(r.error)}</div>`;
+function buildChallenge() {
+  const tmplHtml = esc(CHALLENGE.template).replace(
+    /\/\* FILL IN THE JOIN CONDITION \*\//g,
+    '<span class="blank">[ FILL IN ]</span>');
+  document.getElementById('ch-card').innerHTML =
+    '<div class="ch-head">' +
+      '<div class="ch-title">Challenge: ' + esc(CHALLENGE.title) + '</div>' +
+      '<div class="ch-context">' + esc(CHALLENGE.context) + '</div>' +
+    '</div>' +
+    '<div class="ch-body">' +
+      '<div class="ch-tmpl">' + tmplHtml + '</div>' +
+      '<label style="font-size:12px;font-weight:600;color:var(--txs);margin-bottom:6px;display:block">Your JOIN condition:</label>' +
+      '<input class="ch-input" id="ch-input" placeholder="e.g. table_a.col = table_b.col" />' +
+      '<div class="ch-actions">' +
+        '<button class="run-btn" onclick="checkChallenge()">Check Answer</button>' +
+        '<button class="qbtn" onclick="runChallenge()">Run It</button>' +
+        '<button class="reveal-btn" onclick="document.getElementById(\'ch-solution\').classList.toggle(\'on\')">Reveal Solution</button>' +
+      '</div>' +
+      '<div class="ch-feedback" id="ch-feedback"></div>' +
+      '<div id="ch-result"></div>' +
+      '<div class="ch-solution" id="ch-solution">' +
+        '<div class="ch-solution-l">Solution</div>' +
+        '<code>' + esc(CHALLENGE.solution || '') + '</code>' +
+        '<p style="margin-top:10px;font-size:12px;line-height:1.6;color:var(--txs)">' + esc(CHALLENGE.why_it_matters || '') + '</p>' +
+      '</div>' +
+    '</div>';
+}
+
+async function checkChallenge() {
+  const ans = document.getElementById('ch-input').value.trim();
+  if (!ans) return;
+  const r = await fetch('/api/challenge/check', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({answer: ans})
+  }).then(x => x.json());
+  const fb = document.getElementById('ch-feedback');
+  fb.classList.add('on');
+  if (r.correct) {
+    fb.className = 'ch-feedback on ok';
+    fb.innerHTML = '<strong>Correct!</strong> ' + esc(r.why);
+  } else {
+    fb.className = 'ch-feedback on no';
+    fb.innerHTML = 'Not quite. Try again &mdash; hint: products and order_items share <code style="background:#fff;padding:1px 5px;border-radius:3px;font-family:var(--mono)">product_id</code>.';
+  }
+}
+
+async function runChallenge() {
+  const ans = document.getElementById('ch-input').value.trim();
+  if (!ans) {
+    document.getElementById('ch-result').innerHTML = '<div style="margin-top:14px;padding:12px;color:var(--err);font-size:13px">Enter a JOIN condition first.</div>';
+    return;
+  }
+  document.getElementById('ch-result').innerHTML = '<div style="margin-top:14px;padding:12px;color:var(--txm);font-size:13px"><span class="spinner" style="border-top-color:var(--teal)"></span>Running...</div>';
+  try {
+    const r = await fetch('/api/challenge/run', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({join_clause: ans})
+    }).then(x => x.json());
+    if (r.error) {
+      document.getElementById('ch-result').innerHTML = '<div style="margin-top:14px;padding:12px;color:var(--err);font-family:var(--mono);font-size:11.5px">' + esc(r.error) + '</div>';
       return;
     }
-    const slow=r.ms>5000;
-    document.getElementById('sqlt').innerHTML=`<span style="background:var(--adim);color:var(--accent);padding:3px 10px;border-radius:4px;font-size:11px;font-family:'Courier New',monospace;font-weight:600">${fmtMs(r.ms)}</span><span style="color:var(--dim);font-size:12px;margin-left:6px">${r.rows} rows</span>`;
-    document.getElementById('sqlr').innerHTML=tbl(r.data);
-  }catch(e){
-    document.getElementById('sqlr').innerHTML=`<div style="color:var(--danger);padding:16px">${e.message}</div>`;
+    const res = r.result;
+    document.getElementById('ch-result').innerHTML =
+      '<div style="margin-top:14px;border:1px solid var(--bdr);border-radius:6px;overflow:hidden">' +
+        '<div class="qcolh"><span class="cd ice"></span>Result &mdash; ' + fmtMs(res.exec_time_ms) + ' &middot; ' + fmtN(res.row_count) + ' rows</div>' +
+        renderResultTable(res) +
+      '</div>';
+  } catch (e) {
+    document.getElementById('ch-result').innerHTML = '<div style="margin-top:14px;padding:12px;color:var(--err);font-size:13px">Error: ' + esc(e.message) + '</div>';
   }
 }
 
-
-// ── Panel D: ML Watchlist ────────────────────────────────────────────────
-function wlLog(msg, cls='info'){
-  const box=document.getElementById('wl-log');
-  box.classList.add('show');
-  const d=document.createElement('div'); d.className=cls;
-  const ts=new Date().toLocaleTimeString('en-GB',{hour12:false});
-  d.textContent=`[${ts}] ${msg}`;
-  box.appendChild(d); box.scrollTop=box.scrollHeight;
-}
-
-function fmtN(n){
-  n=Number(n);
-  if(n>=1e6) return(n/1e6).toFixed(1)+'M';
-  if(n>=1e3) return(n/1e3).toFixed(1)+'K';
-  return n.toLocaleString();
-}
-
-async function wlRefresh(){
-  const btn=document.getElementById('btn-wl-refresh');
-  const st =document.getElementById('wl-status');
-  btn.disabled=true; btn.textContent='Running…';
-  st.textContent='Refreshing…'; st.style.color='var(--warn)';
-  document.getElementById('wl-log').innerHTML='';
-  wlLog('Step 1: Expire existing MADlib K-Means flags…');
-  try{
-    const r=await(await fetch('/api/watchlist/refresh',{method:'POST'})).json();
-    if(!r.ok){ wlLog('ERROR: '+r.error,'err'); st.textContent='Error'; st.style.color='var(--danger)'; btn.disabled=false; btn.textContent='&#9654; Run Refresh'; return; }
-    wlLog(`  ✓ Reset ${r.reset} existing flags (${r.reset_ms}ms)`,'ok');
-    wlLog('Step 2: INSERT fresh from kmeans_assignments…');
-    wlLog(`  ✓ Inserted ${r.inserted} new flags (${r.insert_ms}ms)`,'ok');
-    wlLog('Step 3: Expire accounts that left fraud clusters…');
-    wlLog(`  ✓ Expired ${r.expired} stale flags (${r.expire_ms}ms)`,'ok');
-    wlLog(`Done in ${r.total_ms}ms`,'ok');
-    document.getElementById('wl-ins').textContent=fmtN(r.inserted);
-    document.getElementById('wl-exp').textContent=fmtN(r.expired);
-    document.getElementById('wl-ms').textContent =r.total_ms+'ms';
-    const tot=(r.summary||[]).filter(s=>s.feed_name==='MADlib K-Means').reduce((s,x)=>s+(x.active_flags||0),0);
-    document.getElementById('wl-tot').textContent=fmtN(tot);
-    wlLog(''); (r.summary||[]).forEach(s=>wlLog(`  ${s.feed_name} / ${s.category}: ${s.active_flags} active`));
-    wlLog(''); wlLog('Run D1 — should show 0 unflagged accounts. Run D2 to see all flagged transactions.');
-    st.textContent='✓ Complete'; st.style.color='var(--accent)';
-    btn.disabled=false; btn.textContent='&#9654; Run Refresh';
-    await runQ('d1');
-    await runQ('d2');
-  }catch(e){
-    wlLog('Network error: '+e.message,'err');
-    st.textContent='Error'; st.style.color='var(--danger)';
-    btn.disabled=false; btn.textContent='&#9654; Run Refresh';
+async function runSqlEditor() {
+  const sql = document.getElementById('sqled').value.trim();
+  const status = document.getElementById('sqled-status');
+  const out = document.getElementById('sqled-result');
+  if (!sql) { status.textContent = 'Enter a query first.'; return; }
+  status.innerHTML = '<span class="spinner"></span>Running...';
+  out.innerHTML = '';
+  try {
+    const r = await fetch('/api/sql', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({sql})
+    });
+    const d = await r.json();
+    if (d.error) {
+      status.innerHTML = '<span style="color:var(--err)">Error</span>';
+      out.innerHTML = '<div style="padding:12px;color:var(--err);font-family:var(--mono);font-size:12px;background:var(--err-l);border-radius:6px">' + esc(d.error) + '</div>';
+      return;
+    }
+    status.innerHTML = fmtMs(d.exec_time_ms) + ' &middot; ' + fmtN(d.row_count) + ' rows';
+    out.innerHTML = renderResultTable(d);
+  } catch (e) {
+    status.innerHTML = '<span style="color:var(--err)">Error: ' + esc(e.message) + '</span>';
   }
 }
 
-
-
-// ── tbl override: support optional row highlight function ─────────────────
-const _tbl_orig=tbl;
-function tblHL(rows, hlFn){
-  if(!rows||!rows.length) return '<div class="empty">No results — run the ML Watchlist Refresh first, then re-run this query.</div>';
-  const ks=Object.keys(rows[0]);
-  let h='<table><thead><tr>'+ks.map(k=>'<th>'+esc(k)+'</th>').join('')+'</tr></thead><tbody>';
-  rows.forEach(r=>{
-    const cls=hlFn?hlFn(r):'';
-    h+=`<tr${cls?' class="'+cls+'"':''}>` +ks.map(k=>'<td>'+(r[k]!=null?esc(String(r[k])):'—')+'</td>').join('')+'</tr>';
-  });
-  return h+'</tbody></table>';
-}
-
-// patch runQ to highlight d2 rows
-const _runQ_orig=runQ;
-async function runQ(id){
-  const btn=document.getElementById('rb-'+id);
-  btn.disabled=true; btn.textContent='…';
-  document.getElementById('qr-'+id).innerHTML='<div style="padding:20px;text-align:center"><div class="spinner"></div></div>';
-  document.getElementById('qc-'+id).classList.add('open');
-  try{
-    const r=await(await fetch('/api/run',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id})})).json();
-    results[id]=r;
-    const slow=r.ms>5000;
-    document.getElementById('qt-'+id).innerHTML=`<span class="t${slow?' slow':''}">${fmtMs(r.ms)}</span><span class="r" style="color:var(--dim);margin-left:6px">${r.rows} rows</span>`;
-    const hlFn = id==='d1'
-      ? (row=>'unflagged-row')  // all D1 rows are unflagged — highlight orange
-      : id==='d2'
-      ? (row=>{
-          const src=(row.source||'').toString();
-          if(src.includes('ML')) return 'ml-row';     // green: new ML accounts
-          return 'bin-row';                            // blue: original BIN matches
-        })
-      : null;
-    document.getElementById('qr-'+id).innerHTML=r.error
-      ?`<div style="color:var(--danger);padding:12px;font-family:'Courier New',monospace;font-size:12px">ERROR: ${esc(r.error)}</div>`
-      :tblHL(r.data, hlFn);
-  }catch(e){
-    document.getElementById('qr-'+id).innerHTML=`<div style="color:var(--danger);padding:12px">${e.message}</div>`;
+async function init() {
+  await ping();
+  try {
+    QUERIES = await fetch('/api/queries').then(r => r.json());
+    CHECK = await fetch('/api/check').then(r => r.json());
+    CHALLENGE = await fetch('/api/challenge').then(r => r.json());
+    buildQueryCards();
+    buildCheck();
+    buildChallenge();
+  } catch (e) {
+    console.error('Init failed:', e);
   }
-  btn.disabled=false; btn.textContent='Run';
-  updatePanel(QUERIES.find(q=>q.id===id).panel);
 }
-
-// ── init ──────────────────────────────────────────────────────────────────
-buildPanels();
-
+init();
 </script>
-</body></html>"""
-if __name__ == "__main__":
+</body>
+</html>
+"""
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description='PGAA Lab 3 Dashboard')
+    parser.add_argument('--port', type=int,
+                        default=int(os.environ.get('PORT', 5000)),
+                        help='Port to listen on (default: 5000, or PORT env var)')
+    parser.add_argument('--host', default=os.environ.get('HOST', '0.0.0.0'),
+                        help='Host to bind to (default: 0.0.0.0)')
+    parser.add_argument('--debug', action='store_true', help='Enable Flask debug mode')
+    return parser.parse_args()
+
+
+if __name__ == '__main__':
+    args = parse_args()
     print(f"""
-╔══════════════════════════════════════════════════════════╗
-║  Lab 3 — AI Analytics Dashboard (STREAMLINED)           ║
-║  DB: {DB['host']}:{DB['port']}/{DB['dbname']}
-║  Queries: {len(QUERIES)} (focused on VALUE demonstration)
-║  http://0.0.0.0:5002                                    ║
-╚══════════════════════════════════════════════════════════╝
-    """)
-    app.run(host="0.0.0.0", port=5002, debug=False)
++-----------------------------------------------------+
+|  PGAA Lab 3 Dashboard - Iceberg vs Native WHPG     |
+|  DB:     {DB_CONFIG['host']}:{DB_CONFIG['port']}/{DB_CONFIG['database']}
+|  Schema: native = {NATIVE_SCHEMA}.*  |  iceberg = *_iceberg
+|  Listen: http://{args.host}:{args.port}
++-----------------------------------------------------+
+""")
+    app.run(host=args.host, port=args.port, debug=args.debug, threaded=True)
