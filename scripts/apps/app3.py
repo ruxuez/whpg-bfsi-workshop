@@ -68,38 +68,47 @@ SQL_1A_BEFORE = """
 -- These accounts were detected by MADlib but haven't been written back yet.
 -- Run ML Watchlist Refresh above, then re-run this — rows should disappear.
 WITH ml_fraud_accounts AS (
-    SELECT ka.account_id,
-           CASE ka.cluster_id
-             WHEN 1 THEN 'compromised_bin'
-             WHEN 3 THEN 'structuring'
-             WHEN 5 THEN 'velocity_abuse'
-           END AS ml_category,
-           CASE ka.cluster_id
-             WHEN 1 THEN 87 WHEN 3 THEN 85 WHEN 5 THEN 75
-           END AS ml_confidence
-    FROM bfsi_demo.kmeans_assignments ka
-    WHERE ka.cluster_id IN (1,3,5)
+    SELECT 
+        kl.account_id,
+        kl.inferred_label,
+        -- Map ML labels to watchlist categories
+        CASE kl.inferred_label
+            WHEN 'CARD-TESTING' THEN 'compromised_bin'
+            WHEN 'BUST-OUT' THEN 'velocity_abuse'
+            WHEN 'STRUCTURING' THEN 'structuring'
+        END AS ml_category,
+        -- Confidence scores by fraud type
+        CASE kl.inferred_label
+            WHEN 'CARD-TESTING' THEN 87
+            WHEN 'BUST-OUT' THEN 85
+            WHEN 'STRUCTURING' THEN 90
+        END AS ml_confidence
+    FROM bfsi_demo.kmeans_labeled kl
+    WHERE kl.inferred_label IN ('CARD-TESTING', 'BUST-OUT', 'STRUCTURING')
 )
-SELECT t.account_id,
-       mf.ml_category                AS fraud_type_detected_by_ml,
-       mf.ml_confidence              AS confidence,
-       COUNT(*)                      AS transactions,
-       ROUND(SUM(t.amount),2)        AS total_exposure,
-       MIN(t.ts)                     AS first_txn,
-       MAX(t.ts)                     AS last_txn,
-       'NOT IN watchlist'            AS watchlist_status
+SELECT 
+    t.account_id,
+    mf.inferred_label             AS fraud_persona,
+    mf.ml_category                AS fraud_type_detected_by_ml,
+    mf.ml_confidence              AS confidence,
+    COUNT(*)                      AS transactions,
+    ROUND(SUM(t.amount), 2)       AS total_exposure,
+    MIN(t.ts)                     AS first_txn,
+    MAX(t.ts)                     AS last_txn,
+    'NOT IN watchlist'            AS watchlist_status
 FROM bfsi_demo.transactions t
 JOIN ml_fraud_accounts mf ON t.account_id = mf.account_id
 WHERE t.ts >= '2026-06-01'::timestamp
   AND NOT EXISTS (
-        SELECT 1 FROM bfsi_demo.fraud_watchlists w
-        WHERE  w.single_account = t.account_id
-          AND  w.feed_name = 'MADlib K-Means'
-          AND  w.active    = TRUE
+        SELECT 1 
+        FROM bfsi_demo.fraud_watchlists w
+        WHERE w.single_account = t.account_id
+          AND w.feed_name = 'MADlib K-Means'
+          AND w.active = TRUE
       )
-GROUP BY t.account_id, mf.ml_category, mf.ml_confidence
+GROUP BY t.account_id, mf.inferred_label, mf.ml_category, mf.ml_confidence
 ORDER BY total_exposure DESC
-LIMIT 20
+LIMIT 20;
 """
 
 SQL_1A_AFTER = """
