@@ -127,9 +127,8 @@ CHECK_QUESTIONS = [
         'title': 'How does WHPG query Iceberg data without loading it into the database first?',
         'ask': "You just ran SQL directly against Iceberg tables stored in MinIO object storage. "
                "What technology lets WHPG read external lakehouse data as if it were native tables?",
-        'listen': "PGAA (Postgres AI & Analytics) exposes Iceberg tables as foreign tables via the foreign data wrapper (FDW) interface. "
+        'listen': "PGAA (Postgres AI & Analytics) exposes Iceberg tables as External tables and leverage separate analytics engine to query Data. "
                   "The DirectScan vectorized engine reads Parquet files directly from object storage, pushing down predicates and projections. "
-                  "The MPP executor distributes the scan across segments in parallel - same query planner, different storage backend.",
     },
     {
         'kind': 'practical',
@@ -137,7 +136,7 @@ CHECK_QUESTIONS = [
         'ask': "Traditional databases require ETL to load external data before querying. You just ran complex analytics "
                "queries (multi-table JOINs, aggregations) on data that lives in object storage. Why is this a big deal?",
         'listen': "No ETL overhead - query the lakehouse directly where it lives. PGAA's DirectScan uses columnar vectorized "
-                  "execution on Parquet, so you get near-native performance without data movement. Query times in the 2-5 second "
+                  "execution on Parquet, so you get near-native performance without data movement. Query times in the 1-2 seconds "
                   "range for complex multi-table JOINs on external data means you can do real analytics on your data lake without "
                   "copying it into the warehouse first. This is lakehouse federation in action.",
     },
