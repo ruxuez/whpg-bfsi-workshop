@@ -9,6 +9,7 @@ In this lab, you will use **pgvector** for semantic fraud narrative search and *
 3. Watch **MADlib unsupervised clustering** automatically discover **4 fraud personas**
 4. Experience the **AI Factory** - both systems validating each other in one SQL query
 
+## ⚠️ DO NOT HIT "Next" button without instructions ! ⚠️
 ---
 
 ## The Three-Part Journey
@@ -25,7 +26,7 @@ In this lab, you will use **pgvector** for semantic fraud narrative search and *
 
 ---
 
-### Part B: Demonstrating MADlib Value  
+### Part B: Demonstrating MADlib Value
 **The Power:** Unsupervised learning discovers patterns automatically - no labels, no rules, just math.
 
 | Query | What It Shows |
@@ -38,7 +39,7 @@ In this lab, you will use **pgvector** for semantic fraud narrative search and *
 ---
 
 ### Part C: The AI Factory (Validation Through Agreement)
-**The Proof:** When two independent AI systems find the same fraud patterns, confidence is high.
+**The Proof:** When two independent AI systems find the same threats, confidence is high.
 
 | Query | What It Shows |
 | :--- | :--- |
@@ -49,26 +50,34 @@ In this lab, you will use **pgvector** for semantic fraud narrative search and *
 
 ---
 
+### Part D: ML → Watchlist (Closing the Loop)
+**The Power:** MADlib doesn't just discover fraud—it predicts who should be on your watchlist **before** manual investigation.
+
+| Query | What It Shows |
+| :--- | :--- |
+| **D1: ML Fraud Gap** | Shows transactions from accounts MADlib flagged as fraud but are NOT yet in your fraud_watchlists. These are **predictive alerts** - the ML found them, but your operational system hasn't caught up yet. |
+| **D2: Extended Watchlist Query** | After running "Refresh Watchlist", Query 1A from Lab 1 now includes **both** traditional BIN-range matches AND ML-discovered accounts. One query, two fraud detection methods working together. |
+
+**Key Insight:** Traditional fraud watchlists are **reactive** - you add a BIN after it's compromised. MADlib clustering is **predictive** - it flags accounts exhibiting fraud-like behavior patterns before they hit your watchlist. The gap between D1 (before refresh) and D2 (after refresh) shows ML discovering fraud your existing rules missed.
+
+**Why This Matters:** In production, you'd run MADlib clustering nightly on the previous day's transactions. By morning, your fraud analysts see a refreshed watchlist that includes behavioral anomalies detected by ML - often catching fraud rings 2-3 weeks before traditional rule-based systems. No Python export, no external ML platform, no data movement - just SQL writing directly back to your operational fraud_watchlists table.
+
+---
+
 ## Lab Setup
 
 ### Prerequisites
-Data was already loaded in Lab 1. This lab extracts AI/ML features from that existing transaction data.
+Data was already loaded in Lab 1. This lab extracts AI/ML features from that existing data.
 
 **Embedded Fraud Personas:**
 The data contains 4 behavioral patterns:
-- **Normal (70%)**: Baseline card activity  
+- **Normal (70%)**: Baseline card activity
 - **Card-Testing (12%)**: Penny auths - hundreds of merchants, tiny amounts ($0.40-$4)
-- **Bust-Out (8%)**: Credit abuse - massive spend ($800-$5000), few merchants  
+- **Bust-Out (8%)**: Credit abuse - massive spend ($800-$5000), few merchants
 - **Structuring (10%)**: AML evasion - sub-$10k wires, consistent amounts, high-risk countries
 
-### Prepare Terminal Tabs
-
-Prepare 1 Shell Tab:
-
-Connection to cdw environment shell (WarehousePG Tab):
-```bash
-docker exec -u gpadmin -w /home/gpadmin -it cdw /bin/bash
-```
+> [!NOTE]
+> Execute following from the [button label="⚠️WarehousePG Tab"](tab-0).
 
 ---
 
@@ -76,30 +85,30 @@ docker exec -u gpadmin -w /home/gpadmin -it cdw /bin/bash
 
 ### 1.1 Open psql and Clean Up
 
-```bash
+```run
 psql demo
 ```
 
-```sql
+Prepares a clean slate and enables pgvector for vector operations.
+
+```run
 SET search_path TO bfsi_demo, public;
 
--- Clean up any existing ML tables
 DROP TABLE IF EXISTS bfsi_demo.kmeans_assignments CASCADE;
-DROP TABLE IF EXISTS bfsi_demo.account_features_agg CASCADE;
+DROP TABLE IF EXISTS bfsi_demo.account_features_norm CASCADE;
 DROP TABLE IF EXISTS bfsi_demo.account_features CASCADE;
 DROP TABLE IF EXISTS bfsi_demo.case_embeddings CASCADE;
+DROP INDEX  IF EXISTS bfsi_demo.idx_case_embedding_hnsw CASCADE;
 
 -- Enable pgvector extension
 CREATE EXTENSION IF NOT EXISTS vector;
-```
-
-**What this does:** Prepares a clean slate and enables pgvector for vector operations.
-
----
+````
 
 ### 1.2 Create Narrative Embeddings Table
 
-```sql
+Creates a table where each fraud narrative will have a 32-dimensional vector representation.
+
+```run
 CREATE TABLE bfsi_demo.case_embeddings (
     note_id      BIGINT,
     account_id   BIGINT,
@@ -112,25 +121,25 @@ CREATE TABLE bfsi_demo.case_embeddings (
     embedding    vector(32)     -- 32-dimensional feature vector
 ) DISTRIBUTED BY (note_id);
 ```
-
-**What this does:** Creates a table where each fraud narrative will have a 32-dimensional vector representation.
-
-**Why vectors?** In production, you'd use a sentence-transformer model (e.g., all-MiniLM-L6-v2) to convert text to embeddings. Here we create feature-based vectors from narrative characteristics (keywords, queue, severity, fraud indicators).
+> [!NOTE]
+> **Why vectors?** In production, you'd use a sentence-transformer model (e.g., all-MiniLM-L6-v2) to convert text to embeddings. Here we create feature-based vectors from message characteristics (program type, keywords, severity).
 
 ---
 
 ### 1.3 Generate Embeddings from Case Narratives
 
-**⚠️ LONG QUERY - Copy the entire block:**
+- Converts ~200K fraud case narratives into 32-dimensional vectors
+- Each vector dimension represents a feature (queue, BIN, keywords, severity)
+- Enables semantic similarity search: "find narratives similar to this fraud pattern"
 
-```sql
-INSERT INTO bfsi_demo.case_embeddings 
+```run,wrap
+INSERT INTO bfsi_demo.case_embeddings
     (note_id, account_id, card_bin, analyst, queue, severity, narrative, persona, embedding)
-SELECT 
+SELECT
     note_id, account_id, card_bin, analyst, queue, severity, narrative, persona, embedding
 FROM (
-    SELECT 
-        note_id, 
+    SELECT
+        note_id,
         account_id,
         card_bin,
         analyst,
@@ -138,21 +147,21 @@ FROM (
         severity,
         LEFT(narrative, 500) AS narrative,
         -- Classify each narrative into a persona for lab validation
-        CASE 
+        CASE
             -- CARD-TESTING: penny auth keywords
-            WHEN narrative ILIKE '%penny%' OR narrative ILIKE '%small auth%' 
+            WHEN narrative ILIKE '%penny%' OR narrative ILIKE '%small auth%'
               OR narrative ILIKE '%test%' OR narrative ILIKE '%validate%'
               OR narrative ILIKE '%checking%' OR narrative ILIKE '%live%'
               OR narrative ILIKE '%micro%' OR narrative ILIKE '%sub-dollar%'
             THEN 'card_testing'
             -- BUST-OUT: credit abuse keywords
-            WHEN narrative ILIKE '%limit%' OR narrative ILIKE '%ceiling%' 
+            WHEN narrative ILIKE '%limit%' OR narrative ILIKE '%ceiling%'
               OR narrative ILIKE '%ramp%' OR narrative ILIKE '%drain%'
               OR narrative ILIKE '%max%' OR narrative ILIKE '%electronics%'
               OR narrative ILIKE '%luxury%' OR narrative ILIKE '%consume%'
             THEN 'bust_out'
             -- STRUCTURING: AML evasion keywords
-            WHEN narrative ILIKE '%structure%' OR narrative ILIKE '%below%' 
+            WHEN narrative ILIKE '%structure%' OR narrative ILIKE '%below%'
               OR narrative ILIKE '%threshold%' OR narrative ILIKE '%wire%'
               OR narrative ILIKE '%offshore%' OR narrative ILIKE '%layer%'
               OR narrative ILIKE '%$9,%' OR narrative ILIKE '%similar-sized%'
@@ -203,43 +212,44 @@ LIMIT 200000;
 
 ANALYZE bfsi_demo.case_embeddings;
 ```
-
-**What this does:** 
-- Converts ~200K fraud case narratives into 32-dimensional vectors
-- Each vector dimension represents a feature (queue, BIN, keywords, severity)
-- Enables semantic similarity search: "find narratives similar to this fraud pattern"
-
 **How it works:** When you search for narratives similar to "Card testing with penny authorizations", pgvector computes cosine distance between vectors and returns the closest matches - even if they use different phrases like "sub-dollar auth validation" or "micro-charge sweeping".
-
-**Expected time:** 1-2 minutes
-
-**Expected output:** "ANALYZE" completes, ~200K rows inserted
 
 ---
 
 ### 1.4 Add Diverse Sample Narratives for Demo Quality
 
+Adds 20+ manually crafted messages with diverse phrasings to ensure Query A2 shows clear variety (not just one repeated message).
+
 Run the diversity enhancement script:
-```sql
+```run
 \i /scripts/sql/08_add_diverse_narratives.sql
 ```
-
-**What this does:** Adds 20+ manually crafted fraud narratives with diverse phrasings to ensure Query A2 shows clear variety (not just one repeated message).
 
 **Sample narratives added:**
 - CARD-TESTING: "Penny authorization testing", "Micro-charge sweeping", "Sub-dollar auth burst", "Validation probing"
 - BUST-OUT: "Limit ramped to ceiling", "Credit line drained", "Luxury goods spend-up", "Electronics purchase surge"
 - STRUCTURING: "Sub-$10k wire pattern", "Just-below-threshold transfers", "Layered offshore movement", "Smurfing detected"
 
-**Expected time:** 10 seconds
-
 ---
 
 ## Step 2: Build MADlib Features for Behavioral Clustering
 
-### 2.1 Create Account Behavioral Features
+### 2.1 Create Netflow Behavioral Features
 
-```sql
+Creates one row per account with **7 behavioral features**:
+
+| Feature | What It Detects | Fraud Signature |
+|---------|----------------|------------------|
+| `txn_count` | Transaction volume | High = active testing |
+| `distinct_merchants` | Merchant diversity | **High (>500) = CARD-TESTING** |
+| `distinct_mccs` | MCC variety | High = testing across categories |
+| `total_amount` | Total spend | **High (>$100k) = BUST-OUT** |
+| `avg_amount` | Average ticket | Low (<$5) = testing; High (>$2k) = bust-out |
+| `stddev_amount` | Amount variance | High = normal; Low = structuring |
+| `amount_cv` | Coefficient of variation | **Low (<0.1) = STRUCTURING** |
+| `merchant_concentration` | Merchant ratio | High = testing; Low = bust-out |
+
+```run,wrap
 CREATE TABLE bfsi_demo.account_features AS
 SELECT
     account_id,
@@ -266,192 +276,272 @@ DISTRIBUTED BY (account_id);
 ANALYZE bfsi_demo.account_features;
 ```
 
-**What this does:** 
-Creates one row per account with **7 behavioral features**:
-
-| Feature | What It Detects | Fraud Signature |
-|---------|----------------|------------------|
-| `txn_count` | Transaction volume | High = active testing |
-| `distinct_merchants` | Merchant diversity | **High (>500) = CARD-TESTING** |
-| `distinct_mccs` | MCC variety | High = testing across categories |
-| `total_amount` | Total spend | **High (>$100k) = BUST-OUT** |
-| `avg_amount` | Average ticket | Low (<$5) = testing; High (>$2k) = bust-out |
-| `stddev_amount` | Amount variance | High = normal; Low = structuring |
-| `amount_cv` | Coefficient of variation | **Low (<0.1) = STRUCTURING** |
-| `merchant_concentration` | Merchant ratio | High = testing; Low = bust-out |
-
-**Expected output:** ~50K account profiles
-
-**Expected time:** 30-60 seconds
-
 ---
 
 ## Step 3: Run MADlib K-Means Clustering
 
-### 3.1 Normalize Features & Prepare for K-Means
+### Step 3.1:  Normalize Features (Z-Score Standardization)
 
-First, normalize features to [0,1] range so all features have comparable scales:
+- Converts all 6 features to z-scores (standard deviations from mean)
+- Puts features on comparable scales for distance calculations
+- Creates one normalized feature vector per account
 
-```sql
--- Normalize features using min-max scaling
+```run,wrap
 CREATE TABLE bfsi_demo.account_features_norm AS
-WITH bounds AS (
-    SELECT
-        MIN(txn_count) AS min_tc, MAX(txn_count) AS max_tc,
-        MIN(distinct_merchants) AS min_dm, MAX(distinct_merchants) AS max_dm,
-        MIN(distinct_mccs) AS min_mc, MAX(distinct_mccs) AS max_mc,
-        MIN(total_amount) AS min_ta, MAX(total_amount) AS max_ta,
-        MIN(merchant_concentration) AS min_mcon, MAX(merchant_concentration) AS max_mcon,
-        MIN(COALESCE(amount_cv,0)) AS min_cv, MAX(COALESCE(amount_cv,0)) AS max_cv
-    FROM bfsi_demo.account_features
-)
 SELECT
-    f.account_id,
-    ((f.txn_count - b.min_tc)::numeric / NULLIF(b.max_tc - b.min_tc, 0))::float8 AS n_txn_count,
-    ((f.distinct_merchants - b.min_dm)::numeric / NULLIF(b.max_dm - b.min_dm, 0))::float8 AS n_distinct_merchants,
-    ((f.distinct_mccs - b.min_mc)::numeric / NULLIF(b.max_mc - b.min_mc, 0))::float8 AS n_distinct_mccs,
-    ((f.total_amount - b.min_ta) / NULLIF(b.max_ta - b.min_ta, 0))::float8 AS n_total_amount,
-    ((f.merchant_concentration - b.min_mcon) / NULLIF(b.max_mcon - b.min_mcon, 0))::float8 AS n_merchant_concentration,
-    ((COALESCE(f.amount_cv,0) - b.min_cv) / NULLIF(b.max_cv - b.min_cv, 0))::float8 AS n_amount_cv
-FROM bfsi_demo.account_features f CROSS JOIN bounds b
+    account_id,
+    ARRAY[
+        (txn_count - (SELECT AVG(txn_count) FROM bfsi_demo.account_features)) /
+            NULLIF((SELECT STDDEV(txn_count) FROM bfsi_demo.account_features), 0),
+
+        (distinct_merchants - (SELECT AVG(distinct_merchants) FROM bfsi_demo.account_features)) /
+            NULLIF((SELECT STDDEV(distinct_merchants) FROM bfsi_demo.account_features), 0),
+
+        (distinct_mccs - (SELECT AVG(distinct_mccs) FROM bfsi_demo.account_features)) /
+            NULLIF((SELECT STDDEV(distinct_mccs) FROM bfsi_demo.account_features), 0),
+
+        (total_amount - (SELECT AVG(total_amount) FROM bfsi_demo.account_features)) /
+            NULLIF((SELECT STDDEV(total_amount) FROM bfsi_demo.account_features), 0),
+
+        (merchant_concentration - (SELECT AVG(merchant_concentration) FROM bfsi_demo.account_features)) /
+            NULLIF((SELECT STDDEV(merchant_concentration) FROM bfsi_demo.account_features), 0),
+
+        (COALESCE(amount_cv, 0) - (SELECT AVG(COALESCE(amount_cv, 0)) FROM bfsi_demo.account_features)) /
+            NULLIF((SELECT STDDEV(COALESCE(amount_cv, 0)) FROM bfsi_demo.account_features), 0)
+    ]::double precision[] AS features
+FROM bfsi_demo.account_features
 DISTRIBUTED BY (account_id);
 
 ANALYZE bfsi_demo.account_features_norm;
 ```
 
-**What this does:** Scales all features to [0,1] range so large values (like $100M spend) don't dominate distance calculations over small values (like CV=0.03).
+### Step 3.2:  Run MADlib K-Means++ Clustering
 
----
-
-### 3.2 Create Feature Vectors for MADlib
-
-Prepare feature vectors as float8[] arrays (MADlib's required format):
-
-```sql
-CREATE TABLE bfsi_demo.km_points AS
-SELECT account_id,
-       ARRAY[n_txn_count, n_distinct_merchants, n_distinct_mccs, 
-             n_total_amount, n_merchant_concentration, n_amount_cv]::float8[] AS features
-FROM bfsi_demo.account_features_norm
-DISTRIBUTED BY (account_id);
-```
-
-**What this does:** Converts 6 normalized columns into a single array column for MADlib.
-
----
-
-### 3.3 Run K-Means Clustering & Assign Labels
-
-**⚠️ LONG QUERY - This is the heart of MADlib clustering:**
-
-```sql
+**⚠️ This is the heart of MADlib clustering - see how it works:**
+Enable MADlib and run K-means++ with k=6 clusters:
+```run,wrap
 CREATE TABLE bfsi_demo.kmeans_assignments AS
 WITH model AS (
     -- Train K-means++ model (MADlib built-in function)
     SELECT centroids
     FROM madlib.kmeanspp(
-        'bfsi_demo.km_points',              -- source table
-        'features',                         -- feature column name
+        'bfsi_demo.account_features_norm',  -- source table
+        'features',                         -- feature column
         6,                                  -- k clusters (allows separation of fraud types)
         'madlib.squared_dist_norm2',        -- Euclidean distance
         'madlib.avg',                       -- centroid aggregate
         50,                                 -- max iterations
-        0.001                               -- convergence threshold
+        0.001::double precision             -- convergence threshold
     )
+),
+-- Unpack the 2-D centroid array into one row per cluster
+centroids AS (
+    SELECT
+        i - 1 AS cluster_id,
+        ARRAY[
+            m.centroids[i][1],  -- normalized txn_count
+            m.centroids[i][2],  -- normalized distinct_merchants
+            m.centroids[i][3],  -- normalized distinct_mccs
+            m.centroids[i][4],  -- normalized total_amount
+            m.centroids[i][5],  -- normalized merchant_concentration
+            m.centroids[i][6]   -- normalized amount_cv
+        ]::double precision[] AS centroid
+    FROM model m, generate_series(1, 6) AS i
 ),
 -- Assign each account to nearest cluster
 assignments AS (
-    SELECT 
-        p.account_id,
-        (madlib.closest_column(m.centroids, p.features)).column_id::int AS cluster_id
-    FROM bfsi_demo.km_points p
-    CROSS JOIN model m
-),
--- Profile each cluster's characteristics
-cluster_profile AS (
-    SELECT 
-        a.cluster_id,
-        AVG(f.distinct_merchants) AS avg_merchants,
-        AVG(f.total_amount) AS avg_spend,
-        AVG(COALESCE(f.amount_cv, 0)) AS avg_cv
-    FROM assignments a
-    JOIN bfsi_demo.account_features f USING (account_id)
-    GROUP BY a.cluster_id
-),
--- Label clusters based on behavioral signatures
-labeled AS (
-    SELECT 
-        cluster_id,
-        CASE
-            -- CARD-TESTING: Extreme merchant diversity (even diluted by normal accounts)
-            WHEN avg_merchants > 1000 THEN 'CARD-TESTING'
-            
-            -- STRUCTURING: Ultra-high spend + low CV (consistent amounts)
-            WHEN avg_cv < 0.15 AND avg_spend > 10000000 THEN 'STRUCTURING'
-            
-            -- BUST-OUT: Ultra-high spend without low CV
-            WHEN avg_spend > 10000000 THEN 'BUST-OUT'
-            
-            -- NORMAL: Everything else (baseline behavior)
-            ELSE 'NORMAL'
-        END AS inferred_label
-    FROM cluster_profile
+    SELECT
+        n.account_id,
+        c.cluster_id,
+        ROW_NUMBER() OVER (
+            PARTITION BY n.account_id
+            ORDER BY madlib.dist_norm2(n.features, c.centroid)
+        ) AS rn
+    FROM bfsi_demo.account_features_norm n
+    CROSS JOIN centroids c
 )
-SELECT a.account_id, a.cluster_id, l.inferred_label
-FROM assignments a
-JOIN labeled l USING (cluster_id)
+SELECT account_id, cluster_id
+FROM assignments
+WHERE rn = 1
 DISTRIBUTED BY (account_id);
 
 ANALYZE bfsi_demo.kmeans_assignments;
 ```
 
-**What this does:**
-1. **Trains K-means++** with k=6 clusters using MADlib's built-in `kmeanspp()` function
-2. **Assigns accounts** to nearest cluster using `closest_column()` 
-3. **Profiles clusters** by computing average merchants, spend, and CV per cluster
-4. **Labels clusters** based on fraud signatures:
-   - Card-testing: >1,000 merchants (catches 51K merchant accounts even if mixed)
-   - Structuring: >$10M spend + CV<0.15 (consistent amounts)
-   - Bust-out: >$10M spend without low CV
-   - Normal: everything else
+> [!NOTE]
+> **What this does:** K-means assigns each account to one of 6 clusters based on behavioral similarity. The cluster_id numbers (0-5) are arbitrary and will vary between runs - that's normal!
 
-**Expected time:** 1-2 minutes
+### Step 3.3: Profile Clusters and Assign Labels
 
-**Expected output:**
+Now inspect what each cluster represents and assign meaningful labels:
 
+```run,wrap
+WITH cluster_profile AS (
+    -- Compute average characteristics for each cluster
+    SELECT
+        a.cluster_id,
+        COUNT(*) AS accounts,
+        ROUND(AVG(f.distinct_merchants), 1) AS avg_merchants,
+        ROUND(AVG(f.total_amount), 0) AS avg_spend,
+        ROUND(AVG(COALESCE(f.amount_cv, 0)), 3) AS avg_cv
+    FROM bfsi_demo.kmeans_assignments a
+    JOIN bfsi_demo.account_features f USING (account_id)
+    GROUP BY a.cluster_id
+)
+SELECT
+    cluster_id,
+    accounts,
+    avg_merchants,
+    avg_spend,
+    avg_cv,
+    -- Interpret what each cluster represents
+    CASE
+        -- CARD-TESTING: Extreme merchant diversity (>1000 merchants)
+        WHEN avg_merchants > 1000 THEN 'CARD-TESTING'
+
+        -- STRUCTURING: Ultra-high spend + low CV (consistent amounts)
+        WHEN avg_cv < 0.15 AND avg_spend > 10000000 THEN 'STRUCTURING'
+
+        -- BUST-OUT: Ultra-high spend without low CV
+        WHEN avg_spend > 10000000 THEN 'BUST-OUT'
+
+        -- NORMAL: Everything else (baseline behavior)
+        ELSE 'NORMAL'
+    END AS inferred_label
+FROM cluster_profile
+ORDER BY cluster_id;
 ```
-cluster_id | member_count | pct_of_total
------------+--------------+--------------
-         0 |        22000 |         44.0
-         1 |        14000 |         28.0
-         2 |         8000 |         16.0
-         3 |         6000 |         12.0
-```
 
-**Key observation:** K-means will find 3-4 normal clusters (natural variation) plus 1-2 fraud clusters (extreme outliers).
-
-**Expected time:** 30-60 seconds
-
-**What you should see:**
-- **Cluster 3 (110 accounts)**: Extreme outlier with 2,011 merchants, $5M spend, $4,228 ticket
-  - This is **25× more merchants** and **157× more spend** than normal!
-  - Clear BUST-OUT pattern: high spend, high ticket, many merchants
-- **Clusters 0, 1, 2**: Normal baseline accounts (~79 merchants, ~$32k spend each)
-  - K-means split normal accounts into sub-clusters (natural variance)
-
-**Why only 1 fraud cluster?** The seed data may have concentrated fraud patterns into one dominant type. This is realistic - in production, you might find 1-2 dominant fraud patterns among thousands of normal accounts.
+> [!IMPORTANT]
+> **Look for extreme outliers:**
+> - **CARD-TESTING**: ~20 accounts with ~50,000 merchants (vs ~60 for normal)
+> - **BUST-OUT**: ~15 accounts with ~$100M spend (vs ~$25K for normal)
+> - **STRUCTURING**: ~20 accounts with ~$245M spend + CV near 0.03 (vs 0.5-0.6 for normal)
+> - **NORMAL**: ~50,000 accounts split into 3-4 natural sub-groups
+>
+> **Note the cluster_id for each fraud type** - you'll need this for the next step!
 
 ---
 
-## Step 4: Visualize Clusters (Optional)
+### Step 3.4: Create Labeled View
 
-### Option A: MADlib Cluster Explorer
+Create a view that adds labels to cluster assignments (no UPDATE needed - labels computed dynamically):
 
-```bash
-python3.9 /scripts/apps/dashboard.py
+```run,wrap
+CREATE OR REPLACE VIEW bfsi_demo.kmeans_labeled AS
+WITH cluster_profile AS (
+    -- Compute average characteristics for each cluster
+    SELECT
+        a.cluster_id,
+        AVG(f.distinct_merchants) AS avg_merchants,
+        AVG(f.total_amount) AS avg_spend,
+        AVG(COALESCE(f.amount_cv, 0)) AS avg_cv
+    FROM bfsi_demo.kmeans_assignments a
+    JOIN bfsi_demo.account_features f USING (account_id)
+    GROUP BY a.cluster_id
+),
+cluster_labels AS (
+    -- Assign labels based on behavioral signatures
+    SELECT
+        cluster_id,
+        CASE
+            WHEN avg_merchants > 1000 THEN 'CARD-TESTING'
+            WHEN avg_cv < 0.15 AND avg_spend > 10000000 THEN 'STRUCTURING'
+            WHEN avg_spend > 10000000 THEN 'BUST-OUT'
+            ELSE 'NORMAL'
+        END AS inferred_label
+    FROM cluster_profile
+)
+SELECT
+    a.account_id,
+    a.cluster_id,
+    cl.inferred_label
+FROM bfsi_demo.kmeans_assignments a
+JOIN cluster_labels cl USING (cluster_id);
 ```
 
-**Access:** http://localhost:5003
+> [!NOTE]
+> **Why a VIEW?** This keeps clustering (Step 3.2) separate from interpretation (Step 3.4). Labels are always computed from actual cluster characteristics, so they never get stale!
+
+### Step 3.5: Verify Final Results
+
+Check label distribution:
+
+```run
+SELECT inferred_label, COUNT(*) AS accounts
+FROM bfsi_demo.kmeans_labeled
+GROUP BY 1
+ORDER BY
+    CASE inferred_label
+        WHEN 'CARD-TESTING' THEN 1
+        WHEN 'BUST-OUT' THEN 2
+        WHEN 'STRUCTURING' THEN 3
+        WHEN 'NORMAL' THEN 4
+    END;
+```
+
+View detailed cluster profiles:
+
+```run
+SELECT
+    a.cluster_id,
+    a.inferred_label,
+    COUNT(*) AS member_count,
+    ROUND(AVG(f.txn_count), 1) AS avg_txns,
+    ROUND(AVG(f.distinct_merchants), 1) AS avg_merchants,
+    ROUND(AVG(f.merchant_concentration), 3) AS avg_concentration,
+    ROUND(AVG(f.total_amount), 0) AS avg_total_spend,
+    ROUND(AVG(f.avg_amount), 2) AS avg_ticket,
+    ROUND(AVG(COALESCE(f.amount_cv, 0)), 3) AS avg_amount_cv
+FROM bfsi_demo.kmeans_labeled a
+JOIN bfsi_demo.account_features f USING (account_id)
+GROUP BY 1, 2
+ORDER BY
+    CASE a.inferred_label
+        WHEN 'CARD-TESTING' THEN 1
+        WHEN 'BUST-OUT' THEN 2
+        WHEN 'STRUCTURING' THEN 3
+        WHEN 'NORMAL' THEN 4
+    END;
+```
+
+> [!IMPORTANT]
+> **Understanding K-Means Non-Determinism**
+>
+> K-means clustering is **non-deterministic** - each run may produce different `cluster_id` assignments (0-5). This is normal and expected! The algorithm randomly initializes cluster centers, so:
+>
+> - **Cluster IDs vary**: What's cluster 3 in your run might be cluster 1 in another attendee's run
+> - **Labels stay meaningful**: The `inferred_label` column interprets each cluster's characteristics, so you'll always see CARD-TESTING, BUST-OUT, STRUCTURING, and NORMAL
+> - **Extreme outliers stand out**: Look for dramatic differences - 50,000× more merchants, 4,000× higher spend, CV near zero
+>
+> **What to expect:**
+> - **20 CARD-TESTING accounts**: ~50K merchants/account (vs ~60 for normal)
+> - **15 BUST-OUT accounts**: ~$100M spend/account (vs ~$25K for normal)
+> - **20 STRUCTURING accounts**: ~$245M spend/account, CV~0.03 (vs 0.5-0.6 for normal)
+> - **~50,000 NORMAL accounts**: Baseline behavior, split into 3-4 natural sub-groups
+>
+> **Note**: Sometimes K-means may merge similar fraud types (e.g., bust-out + structuring) into one cluster if they're close in feature space. This is a realistic ML outcome - unsupervised learning finds patterns, but doesn't always perfectly separate every fraud type.
+
+
+Quit WarehousePG:
+```run
+\quit
+```
+
+---
+
+## Step 4: Visualize Clusters
+
+Launch the application by running the following command in the terminal:
+
+```run
+python3.9 /scripts/apps/dashboard.py
+```
+Access the UI: Click the [button label="⚠️MADlib Dashboard Tab"](tab-1) at the top of your lab environment .
+
+Explore the Data: Use the dropdown menus to change the scatter plot axes.
+
+This allows you to visualize how different dimensions (like total_amount vs. distinct_merchants) impact the formation of the 4 behavioral clusters.
 
 **Features:**
 - Scatter plot: choose X/Y axes (e.g., `total_amount` vs `distinct_merchants`)
@@ -460,40 +550,39 @@ python3.9 /scripts/apps/dashboard.py
 
 **Try this:** Select `total_amount` (X) vs `distinct_merchants` (Y) - you'll see 4 distinct clusters:
 
-- 🟢 Green cluster near origin (0,0): Normal transactions - moderate spend, moderate merchants
-- 🔴 Red dot at ~3,500 merchants, low spend: CARD-TESTING - Every transaction is a different merchant testing card validity
-- 🔴 Red dot at ~$100k spend, few merchants: BUST-OUT - Massive spend concentrated at a handful of merchants
-- 🔵 Blue cluster: STRUCTURING - Consistent amounts, offshore wires
+- Cluster near origin (0,0): Normal transactions - moderate spend, moderate merchants
+- At ~3,500 merchants, low spend: CARD-TESTING - Every transaction is a different merchant testing card validity
+- At ~$100k spend, few merchants: BUST-OUT - Massive spend concentrated at a handful of merchants
+- Ccluster: STRUCTURING - Consistent amounts, offshore wires
 
-Press `CTRL+C` to quit when done.
+Once finished, you can go back to [button label="⚠️WarehousePG Tab"](tab-0) and Press `CTRL+C` to quit application:
 
 ---
 
 ## Step 5: Launch the AI Factory Dashboard
 
-```bash
-python3.9 /scripts/apps/app3.py
-```
+1.  **Launch the AI Dashboard: [button label="⚠️WarehousePG Tab"](tab-0)
+    ```run
+    python3.9 /scripts/apps/app2.py
+    ```
+2.  Go to [button label="⚠️AI Analytics Tab"](tab-2)
+3.  Execute different queries
 
-**Access:** http://localhost:5002
-
-### Execute the 6 Queries
-
-**Panel A: pgvector Value**
+### Panel A: pgvector Value
 
 **Query A1: The Keyword Search Problem**
 - Shows: `LIKE '%card testing%'` → 320K results, but `LIKE '%bust out%'` → 0 results
 - **Observation:** Same fraud category, different terminology = missed!
 - **Lesson:** Keyword search is fragile
 
-**Query A2: pgvector Finds Fraud by MEANING**
+**Query A2: pgvector Finds Threats by MEANING**
 - Shows: 15+ semantically similar fraud narratives
 - **Observation:** "Penny authorization testing", "Limit ramped to ceiling", "Sub-$10k wire pattern" - all found WITHOUT exact keywords!
 - **Lesson:** Semantic search understands meaning
 
 ---
 
-**Panel B: MADlib Value**
+### Panel B: MADlib Value
 
 **Query B1: MADlib Discovered 4 Fraud Personas**
 - Shows: 5 clusters with their characteristics
@@ -502,19 +591,19 @@ python3.9 /scripts/apps/app3.py
 
 **Query B2: The Dramatic Differences**
 - Shows: Quantified separation between clusters
-- **Observation:** 
-  - BUST-OUT cluster (110 accounts): 2,011 merchants (25× normal), $5M spend (157× normal!), $4,228 ticket (10× normal)
-  - NORMAL clusters: ~79 merchants, ~$32k spend, ~$400 ticket
-  - The fraud cluster is an extreme outlier across ALL features
-- **Lesson:** These aren't subtle - they're mathematically undeniable (25× and 157× differences!)
+- **Observation:**
+  - CARD-TESTING: 3,456 avg merchants (2,841x more than normal!)
+  - BUST-OUT: $48,725 avg spend (97x more than normal!)
+  - STRUCTURING: amount_cv = 0.08 (zero variance = consistent wires)
+- **Lesson:** These aren't subtle - they're mathematically undeniable
 
 ---
 
-**Panel C: The AI Factory**
+### The AI Factory
 
 **Query C1: Fraud Pattern Correlation**
 - Shows: How MADlib and pgvector independently found the SAME 3 fraud types
-- **Observation:** 
+- **Observation:**
   - CARD-TESTING: 6K accounts (3,456 merchants - MADlib) + 320K narratives ("testing" - pgvector)
   - BUST-OUT: 4K accounts ($48K avg - MADlib) + 160K narratives ("limit drained" - pgvector)
   - STRUCTURING: 5K accounts (CV<0.1 - MADlib) + 200K narratives ("sub-$10k" - pgvector)
@@ -522,103 +611,27 @@ python3.9 /scripts/apps/app3.py
 
 **Query C2: Why This Matters**
 - Shows: Comparison of traditional warehouse vs WarehousePG
-- **Observation:** 
+- **Observation:**
   - Traditional: Export → Python → Train → Upload → Join (hours)
   - WarehousePG: One SQL query (<5 seconds on 13M transactions)
 - **Lesson:** In-database ML eliminates "data movement tax"
 
 ---
 
-## Deliverables
-
-### 1. Query A1 Screenshot: Keyword Search Limitations
-- Run Query A1
-- **Screenshot showing:** found_card_testing = 320,456, found_bust_out = 0
-- **Write:** "Keyword search found 320K 'card testing' narratives but 0 'bust out' narratives - both card fraud, just different words!"
-
-### 2. Query A2 Screenshot: Semantic Search Success  
-- Run Query A2
-- **Screenshot showing:** 15+ diverse narratives (penny auth, limit drained, sub-$10k wires, etc.)
-- **Write:** "pgvector found all these fraud narratives semantically - different phrases, same fraud pattern!"
-
-### 3. Query B2 Screenshot: Dramatic Differences
-- Run Query B2
-- **Screenshot showing:** CARD-TESTING 3,456 merchants (2,841× ratio), BUST-OUT $48,725
-- **Write:** "MADlib discovered CARD-TESTING with 2,841× more merchants and BUST-OUT with $48K average - impossible to miss!"
-
-### 4. Query C1 Screenshot: The AI Factory
-- Run Query C1  
-- **Screenshot showing:** Both systems detected CARD-TESTING, BUST-OUT, STRUCTURING
-- **Write:** "MADlib found behavioral anomalies, pgvector found semantic fraud narratives - both systems agree!"
-
-### 5. Technical Reflection (250-300 words)
-
-**Answer these questions:**
-
-**A. Why is semantic search better than keyword search for fraud detection?**
-- Reference your A1 vs A2 screenshots
-- Explain the brittleness problem with fraud terminology
-- Give specific examples from your results
-
-**B. What makes MADlib clustering powerful for fraud discovery?**
-- Reference your B2 screenshot (2,841×, $48K numbers)
-- Explain "unsupervised" - no labeled fraud training data needed
-- Why are the differences mathematically undeniable?
-
-**C. Why combine MADlib and pgvector for fraud validation?**
-- Reference your C1 screenshot
-- Explain "behavioral + semantic = validation"
-- Why is agreement between independent systems important?
-
-**D. Why is in-database ML better than Python export for fraud detection?**
-- Time: 5 seconds vs hours
-- Complexity: one query vs multi-step pipeline
-- Movement: transaction data stays in database (compliance/security)
-
-**Template to get you started:**
-
-> "Query A1 revealed the fragility of keyword search for fraud detection: searching for 'card testing' found 320,456 narratives, but 'bust out' found zero - both describe card fraud but use different terminology. Query A2's pgvector semantic search solved this by finding [list specific examples from your screenshot] - all semantically similar fraud narratives discovered without exact keyword matches.
->
-> Query B2 showed MADlib's power through mathematical certainty: the CARD-TESTING cluster averaged 3,456 merchants (2,841 times more than normal) while the BUST-OUT cluster averaged $48,725 in spend (97 times more than normal). The STRUCTURING cluster showed amount_cv of 0.08, indicating zero variance - textbook structuring behavior. These aren't subtle anomalies requiring expert interpretation - they're statistically undeniable. MADlib discovered these fraud patterns unsupervised, without any labeled training data or manually-tuned thresholds.
->
-> Query C1 demonstrated the AI Factory concept for fraud validation: MADlib found 6,012 CARD-TESTING accounts with extreme merchant counts (behavioral anomaly), while pgvector found 320,456 case narratives saying 'penny authorization', 'micro-charge', 'validation testing' (semantic evidence). When both independent AI systems detect the same fraud patterns, confidence is high. MADlib tells us WHO is fraudulent based on transaction behavior, pgvector tells us WHAT the fraud analyst documented.
->
-> The in-database advantage is critical for financial services: traditional warehouses require exporting 13M sensitive transactions to Python, training models offline, uploading results, then joining back - taking hours and raising compliance concerns. WarehousePG runs both AI engines (MADlib + pgvector) in one SQL query in under 5 seconds. No data movement, no ETL pipeline, no PII exposure. The AI Factory proves that keeping ML in-database delivers both speed and security advantages for fraud detection."
-
----
-
 ## Key Takeaways
 
-**Why This Lab Matters:**
+### Why This Lab Matters
 
 1. **Keyword Search Fails:** Missing one fraud term = missing fraud patterns
-2. **Semantic Search Wins:** Finds fraud by meaning, catches terminology variations  
+2. **Semantic Search Wins:** Finds fraud by meaning, catches terminology variations
 3. **MADlib Discovers:** Unsupervised clustering finds fraud humans might miss
-4. **Statistics Don't Lie:** 2,841× merchants and $48K spend differences are undeniable
+4. **Statistics Don't Lie:** 2,841x merchants and $48K spend differences are undeniable
 5. **Validation Through Agreement:** Two independent systems confirming = high confidence
 6. **In-Database Speed:** Seconds vs hours - no Python export tax
 7. **Compliance Advantage:** Transaction data never leaves the database
 
-**Real-World Impact:**
+### Real-World Impact
 
 In a fraud operations center, you can't predict every way a fraud analyst might describe suspicious activity. pgvector semantic search solves this. You can't manually set thresholds for every possible fraud pattern across millions of accounts. MADlib clustering discovers them automatically. And you can't afford hours of ETL latency or PII data movement. In-database ML delivers answers in seconds while maintaining compliance.
 
 This is the future of financial analytics: **AI that runs where the sensitive data lives.**
-
-**Fraud Detection Value:**
-- CARD-TESTING: Catch card validation schemes before mass fraud
-- BUST-OUT: Identify credit abuse before charge-offs
-- STRUCTURING: Detect AML violations and file SARs faster
-- All discovered automatically, validated by two independent AI systems
-
----
-
-## Next Steps
-
-After completing this lab, you understand:
-- ✅ How pgvector semantic search finds fraud by meaning
-- ✅ How MADlib clustering discovers fraud personas automatically
-- ✅ Why combining behavioral + semantic AI creates validation
-- ✅ Why in-database ML is faster and more secure than external Python
-
-**Congratulations!** You've experienced the AI Factory for fraud detection on WarehousePG.
