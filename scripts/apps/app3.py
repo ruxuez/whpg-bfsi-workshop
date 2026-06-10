@@ -1,26 +1,25 @@
 #!/usr/bin/env python3
 """
-PGAA Lab 3 Dashboard - Iceberg vs Native WHPG (Workshop Edition)
+PGAA Lab 3 Dashboard - Lakehouse Analytics with Iceberg (Workshop Edition)
 
-Trimmed from 8 queries / benchmark-heavy to 5 queries / 4 lab-aligned tabs:
-  1. Same SQL, Two Engines  - side-by-side runner, one click each
-  2. Speed Comparison       - clean bar chart, no winner splash
-  3. Comprehension Check    - 2 discussion questions with reveal-answer
-  4. Challenge              - fill-in-the-blank SQL with reveal solution
+Demonstrates querying Iceberg data directly from object storage with good performance:
+  1. Query Lakehouse Data  - run analytics queries on Iceberg tables
+  2. Performance Results   - see execution times (this is impressive for external data!)
+  3. Comprehension Check   - discussion questions with reveal-answer
+  4. Challenge             - fill-in-the-blank SQL with solution
 
 USAGE
   pip3 install flask psycopg2-binary
-  python3 pgaa_dashboard_app.py                 # default: port 5000
-  python3 pgaa_dashboard_app.py --port 5050     # specific port
-  PORT=5050 python3 pgaa_dashboard_app.py       # via env var
+  python3 app3.py                 # default: port 5000
+  python3 app3.py --port 5050     # specific port
+  PORT=5050 python3 app3.py       # via env var
 
 DB OVERRIDES (env vars):
   WHPG_HOST, WHPG_PORT, WHPG_DB, WHPG_USER, WHPG_PASS
-  WHPG_NATIVE_SCHEMA   (default: demo)  - schema where native tables live
 """
 
 import os, time, argparse, concurrent.futures
-import psycopg2, psycopg2.extras
+import psycopg2
 from flask import Flask, jsonify, Response, request
 
 app = Flask(__name__)
@@ -32,7 +31,6 @@ DB_CONFIG = {
     'user':     os.environ.get('WHPG_USER', 'gpadmin'),
     'password': os.environ.get('WHPG_PASS', ''),
 }
-NATIVE_SCHEMA = os.environ.get('WHPG_NATIVE_SCHEMA', 'demo')
 
 
 def query(sql):
@@ -45,15 +43,6 @@ def query(sql):
     cols = [d[0] for d in cur.description] if cur.description else []
     cur.close(); conn.close()
     return {'columns': cols, 'rows': rows, 'row_count': len(rows), 'exec_time_ms': ms}
-
-
-def to_native(sql):
-    return (sql
-            .replace('customers_iceberg',   f'{NATIVE_SCHEMA}.customers')
-            .replace('products_iceberg',    f'{NATIVE_SCHEMA}.products')
-            .replace('orders_iceberg',      f'{NATIVE_SCHEMA}.orders')
-            .replace('order_items_iceberg', f'{NATIVE_SCHEMA}.order_items')
-            .replace('events_iceberg',      f'{NATIVE_SCHEMA}.events'))
 
 
 QUERIES = {
@@ -135,22 +124,22 @@ LIMIT  30''',
 CHECK_QUESTIONS = [
     {
         'kind': 'concept',
-        'title': 'Why did the same SQL just run on two completely different storage systems?',
-        'ask': "You ran identical SQL against Iceberg files on object storage and against native AOCO segments. "
-               "What does WHPG do under the hood that lets one engine read both?",
-        'listen': "PGAA exposes Iceberg tables as Postgres foreign tables - the planner sees them as just-another-relation. "
-                  "The MPP executor handles parallel scan whether the data lives on segments (AOCO) or on S3 (Parquet). "
-                  "Same SQL, same planner, same parallelism - just a different scan operator.",
+        'title': 'How does WHPG query Iceberg data without loading it into the database first?',
+        'ask': "You just ran SQL directly against Iceberg tables stored in MinIO object storage. "
+               "What technology lets WHPG read external lakehouse data as if it were native tables?",
+        'listen': "PGAA (Postgres AI & Analytics) exposes Iceberg tables as foreign tables via the foreign data wrapper (FDW) interface. "
+                  "The DirectScan vectorized engine reads Parquet files directly from object storage, pushing down predicates and projections. "
+                  "The MPP executor distributes the scan across segments in parallel - same query planner, different storage backend.",
     },
     {
         'kind': 'practical',
-        'title': 'Which query had the biggest gap between Iceberg and native - and why?',
-        'ask': "Look at your benchmark numbers. Which of the 5 queries showed the largest speed difference between "
-               "Iceberg and native AOCO? Why that query specifically?",
-        'listen': "Daily Dashboard (5-table JOIN) typically has the biggest gap. Reason: AOCO is column-stored "
-                  "and DISTRIBUTED BY, so multi-table joins stay co-located on segments. "
-                  "Iceberg via PGAA reads Parquet from object storage - every JOIN side comes back over the network "
-                  "before the planner can match rows. The more JOINs, the wider the gap.",
+        'title': 'Why is this performance impressive for external data?',
+        'ask': "Traditional databases require ETL to load external data before querying. You just ran complex analytics "
+               "queries (multi-table JOINs, aggregations) on data that lives in object storage. Why is this a big deal?",
+        'listen': "No ETL overhead - query the lakehouse directly where it lives. PGAA's DirectScan uses columnar vectorized "
+                  "execution on Parquet, so you get near-native performance without data movement. Query times in the 2-5 second "
+                  "range for complex multi-table JOINs on external data means you can do real analytics on your data lake without "
+                  "copying it into the warehouse first. This is lakehouse federation in action.",
     },
 ]
 
@@ -172,18 +161,16 @@ GROUP  BY p.product_id, p.name, p.category
 ORDER  BY revenue DESC
 LIMIT  5''',
     'solution': 'p.product_id = oi.product_id',
-    'why_it_matters': "products and order_items share product_id - that's the natural join key. "
-                      "On native AOCO, if both tables are DISTRIBUTED BY (product_id), the join runs locally on each "
-                      "segment with no Motion. On Iceberg, the same join still works - but data has to come back from "
-                      "object storage before the segments can match rows.",
+    'why_it_matters': "products and order_items share product_id as the natural join key. "
+                      "This query runs directly on Iceberg data in object storage (MinIO) - no ETL, no data copying. "
+                      "PGAA's DirectScan handles the JOIN across Parquet files with vectorized execution, demonstrating "
+                      "that you can run complex analytics on your data lakehouse without moving data into the warehouse.",
 }
 
 
 @app.route('/')
 def index():
-    # Inject server-side config into the HTML so the JS knows the schema
-    html = DASHBOARD_HTML.replace('__NATIVE_SCHEMA__', NATIVE_SCHEMA)
-    return Response(html, mimetype='text/html')
+    return Response(DASHBOARD_HTML, mimetype='text/html')
 
 
 @app.route('/api/queries')
@@ -229,58 +216,53 @@ def run_challenge():
         return jsonify({'error': str(e), 'sql': sql}), 500
 
 
-@app.route('/api/compare/<qid>')
-def compare(qid):
+@app.route('/api/run/<qid>')
+def run_query(qid):
     if qid not in QUERIES:
         return jsonify({'error': 'Not found'}), 404
     q = QUERIES[qid]
-    try:    ice = query(q['sql'])
-    except Exception as e: ice = {'error': str(e), 'exec_time_ms': 0}
-    try:    nat = query(to_native(q['sql']))
-    except Exception as e: nat = {'error': str(e), 'exec_time_ms': 0}
-    return jsonify({'name': q['name'], 'iceberg': ice, 'native': nat})
+    try:
+        result = query(q['sql'])
+        return jsonify({'name': q['name'], 'result': result})
+    except Exception as e:
+        return jsonify({'error': str(e), 'exec_time_ms': 0}), 500
 
 
 @app.route('/api/run_all')
 def run_all():
-    def run_one(qid, q, mode):
+    def run_one(qid, q):
         try:
-            r = query(to_native(q['sql']) if mode == 'native' else q['sql'])
+            r = query(q['sql'])
             return {'id': qid, 'name': q['name'], 'exec_time_ms': r['exec_time_ms'],
                     'row_count': r['row_count']}
         except Exception as e:
             return {'id': qid, 'name': q['name'], 'error': str(e), 'exec_time_ms': 0}
 
     order = list(QUERIES.keys())
-    def run_batch(mode):
-        t0 = time.perf_counter()
-        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as ex:
-            futs = {ex.submit(run_one, qid, q, mode): qid for qid, q in QUERIES.items()}
-            res = [f.result() for f in concurrent.futures.as_completed(futs)]
-        wall = round((time.perf_counter() - t0) * 1000, 2)
-        res.sort(key=lambda x: order.index(x['id']))
-        return res, wall
+    t0 = time.perf_counter()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as ex:
+        futs = {ex.submit(run_one, qid, q): qid for qid, q in QUERIES.items()}
+        results = [f.result() for f in concurrent.futures.as_completed(futs)]
+    wall = round((time.perf_counter() - t0) * 1000, 2)
+    results.sort(key=lambda x: order.index(x['id']))
 
-    nat_res, nat_wall = run_batch('native')
-    ice_res, ice_wall = run_batch('iceberg')
     return jsonify({
-        'native':  {'queries': nat_res, 'wall_time_ms': nat_wall},
-        'iceberg': {'queries': ice_res, 'wall_time_ms': ice_wall},
+        'queries': results,
+        'wall_time_ms': wall,
+        'total_queries': len(results)
     })
 
 
 @app.route('/api/diag')
 def diag():
-    out = {'native_schema': NATIVE_SCHEMA, 'iceberg_tables': [],
-           'native_tables': [], 'errors': []}
+    out = {'iceberg_tables': [], 'errors': []}
     for t in ['customers', 'products', 'orders', 'order_items', 'events']:
-        for label, name in [('iceberg', f'{t}_iceberg'),
-                            ('native',  f'{NATIVE_SCHEMA}.{t}')]:
-            try:
-                r = query(f'SELECT COUNT(*) FROM {name}')
-                out[f'{label}_tables'].append({'table': name, 'rows': r['rows'][0][0]})
-            except Exception as e:
-                out['errors'].append({'table': name, 'error': str(e)})
+        name = f'{t}_iceberg'
+        try:
+            r = query(f'SELECT COUNT(*) FROM {name}')
+            out['iceberg_tables'].append({'table': name, 'rows': r['rows'][0][0]})
+        except Exception as e:
+            out['errors'].append({'table': name, 'error': str(e)})
     return jsonify(out)
 
 
@@ -307,7 +289,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-<title>Lab 3 - Iceberg vs Native WHPG</title>
+<title>Lab 3 - Lakehouse Analytics with Iceberg</title>
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet"/>
 <style>
 :root{
@@ -475,7 +457,7 @@ tr:last-child td{border-bottom:none}
 <nav class="nav">
   <span class="nav-brand">EDB <span>WHPG</span></span>
   <div class="nav-div"></div>
-  <span class="nav-title">Lab 2 - Iceberg vs Native WHPG</span>
+  <span class="nav-title">Lab 3 - Lakehouse Analytics with Iceberg</span>
   <div class="nav-sp"></div>
   <div class="nav-pill">
     <span class="sdot" id="sdot"></span>
@@ -484,8 +466,8 @@ tr:last-child td{border-bottom:none}
 </nav>
 
 <div class="tabs">
-  <button class="tab on" data-tab="0">Same SQL, Two Engines</button>
-  <button class="tab" data-tab="1">Speed Comparison</button>
+  <button class="tab on" data-tab="0">Query Lakehouse Data</button>
+  <button class="tab" data-tab="1">Performance Results</button>
   <button class="tab warn-tab" data-tab="2">Check Understanding</button>
   <button class="tab warn-tab" data-tab="3">Challenge</button>
   <button class="tab" data-tab="4" style="margin-left:4px">SQL Editor</button>
@@ -494,25 +476,26 @@ tr:last-child td{border-bottom:none}
 <div class="page">
 
   <div class="pane on" id="pane-0">
-    <p class="lead">Five queries. Each runs <strong>identical SQL</strong> against two storage backends -
-       Iceberg files on object storage (PGAA), and native AOCO segments on WHPG. Click
-       <strong>Run</strong> on any query to fire it on both engines and see results side-by-side.</p>
+    <p class="lead">Five analytics queries running directly on <strong>Iceberg tables stored in MinIO object storage</strong>.
+       No ETL, no data loading - just pure SQL against your data lakehouse. Click <strong>Run</strong> to execute
+       and see the results. Notice the query times - <strong>this is impressive for external data!</strong></p>
     <div class="qgrid" id="qgrid"></div>
   </div>
 
   <div class="pane" id="pane-1">
-    <p class="lead">Hit <strong>Run All</strong> - every query runs on both engines (parallel within each side).
-       The bars show per-query timings; the totals at the top compare wall-clock time.</p>
+    <p class="lead">Hit <strong>Run All</strong> to execute all five queries on the Iceberg lakehouse data concurrently.
+       Watch the execution times - these queries are running on data stored in object storage (MinIO), not in the database.
+       <strong>Sub-second to few-second response times on external data = lakehouse federation working.</strong></p>
     <div class="run-bar">
       <button class="run-btn" id="run-all-btn" onclick="runAll()">Run All Queries</button>
       <span id="run-status" style="font-size:12.5px;color:var(--txs)"></span>
     </div>
     <div class="totals" id="totals" style="display:none">
-      <div class="tot nat"><span class="tot-l">Native (AOCO) Wall</span><span class="tot-v" id="tot-nat">-</span></div>
-      <div class="tot ice"><span class="tot-l">Iceberg (PGAA) Wall</span><span class="tot-v" id="tot-ice">-</span></div>
-      <div class="tot"><span class="tot-l">Speedup</span><span class="tot-v" id="tot-spd" style="color:var(--warn)">-</span></div>
+      <div class="tot ice"><span class="tot-l">Total Wall Time</span><span class="tot-v" id="tot-wall">-</span></div>
+      <div class="tot"><span class="tot-l">Queries Run</span><span class="tot-v" id="tot-count" style="color:var(--teal-d)">-</span></div>
+      <div class="tot"><span class="tot-l">Data Source</span><span class="tot-v" id="tot-src" style="color:var(--txs);font-size:14px">MinIO/S3</span></div>
     </div>
-    <div class="bars" id="bars"><div class="empty">Run the queries to see the comparison.</div></div>
+    <div class="bars" id="bars"><div class="empty">Run the queries to see performance metrics.</div></div>
   </div>
 
   <div class="pane" id="pane-2">
@@ -549,7 +532,6 @@ ORDER  BY revenue DESC;</textarea>
 </div>
 
 <script>
-const NATIVE_SCHEMA = '__NATIVE_SCHEMA__';
 const fmtMs = ms => ms == null ? '-' : ms < 1000 ? Math.round(ms) + 'ms' : (ms/1000).toFixed(2) + 's';
 const fmtN  = n  => n == null ? '-' : n >= 1e6 ? (n/1e6).toFixed(1) + 'M' : n >= 1e3 ? (n/1e3).toFixed(1) + 'K' : String(n);
 const esc   = s  => String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
@@ -590,36 +572,19 @@ function buildQueryCards() {
         '<span class="qnum">' + (i+1) + '</span>' +
         '<div class="qmeta"><div class="qname">' + esc(q.name) + '</div><div class="qdesc">' + esc(q.desc) + '</div></div>' +
         '<div class="qtimes" id="qt-' + qid + '">' +
-          '<span class="tchip pending">native: -</span>' +
-          '<span class="tchip pending">iceberg: -</span>' +
+          '<span class="tchip pending">time: -</span>' +
         '</div>' +
         '<button class="qbtn" id="qb-' + qid + '" onclick="event.stopPropagation();runOne(\'' + qid + '\')">Run</button>' +
       '</div>' +
       '<div class="qbody">' +
-        '<div class="qsql-pair">' +
-          '<div class="qsql-side">' +
-            '<div class="qsql-lbl"><span class="cd ice"></span>Iceberg (PGAA) &mdash; runs on object storage</div>' +
-            '<div class="qsql">' + esc(q.sql) + '</div>' +
-          '</div>' +
-          '<div class="qsql-side">' +
-            '<div class="qsql-lbl"><span class="cd nat"></span>Native (AOCO) &mdash; auto-rewritten for ' + NATIVE_SCHEMA + '.*</div>' +
-            '<div class="qsql">' + esc(toNativeSql(q.sql)) + '</div>' +
-          '</div>' +
+        '<div style="margin-bottom:14px">' +
+          '<div class="qsql-lbl" style="margin-bottom:6px"><span class="cd ice"></span>Iceberg Query &mdash; runs directly on MinIO object storage</div>' +
+          '<div class="qsql">' + esc(q.sql) + '</div>' +
         '</div>' +
-        '<div id="qr-' + qid + '"><div class="empty">Click Run to compare engines.</div></div>' +
+        '<div id="qr-' + qid + '"><div class="empty">Click Run to execute this query.</div></div>' +
       '</div>';
     grid.appendChild(div);
   });
-}
-
-// Mirror of the server-side to_native() — keeps the SQL display in sync without an extra round-trip.
-function toNativeSql(sql) {
-  return sql
-    .replace(/customers_iceberg/g,   NATIVE_SCHEMA + '.customers')
-    .replace(/products_iceberg/g,    NATIVE_SCHEMA + '.products')
-    .replace(/orders_iceberg/g,      NATIVE_SCHEMA + '.orders')
-    .replace(/order_items_iceberg/g, NATIVE_SCHEMA + '.order_items')
-    .replace(/events_iceberg/g,      NATIVE_SCHEMA + '.events');
 }
 
 function toggleCard(qid) { document.getElementById('qc-' + qid).classList.toggle('open'); }
@@ -639,23 +604,17 @@ async function runOne(qid) {
   const card = document.getElementById('qc-' + qid);
   btn.disabled = true; btn.innerHTML = '<span class="spinner"></span>Running';
   card.classList.add('open');
-  document.getElementById('qr-' + qid).innerHTML = '<div class="empty">Running on both engines...</div>';
+  document.getElementById('qr-' + qid).innerHTML = '<div class="empty">Running query on Iceberg data...</div>';
   try {
-    const r = await fetch('/api/compare/' + qid).then(x => x.json());
-    const nms = r.native.exec_time_ms || 0, ims = r.iceberg.exec_time_ms || 0;
+    const r = await fetch('/api/run/' + qid).then(x => x.json());
+    if (r.error) throw new Error(r.error);
+    const ms = r.result.exec_time_ms || 0;
     document.getElementById('qt-' + qid).innerHTML =
-      '<span class="tchip nat">native: ' + fmtMs(nms) + '</span>' +
-      '<span class="tchip ice">iceberg: ' + fmtMs(ims) + '</span>';
+      '<span class="tchip ice">time: ' + fmtMs(ms) + '</span>';
     document.getElementById('qr-' + qid).innerHTML =
-      '<div class="qcols">' +
-        '<div class="qcol">' +
-          '<div class="qcolh"><span class="cd nat"></span>Native AOCO - ' + fmtMs(nms) + ' &middot; ' + fmtN(r.native.row_count) + ' rows</div>' +
-          renderResultTable(r.native) +
-        '</div>' +
-        '<div class="qcol">' +
-          '<div class="qcolh"><span class="cd ice"></span>Iceberg (PGAA) - ' + fmtMs(ims) + ' &middot; ' + fmtN(r.iceberg.row_count) + ' rows</div>' +
-          renderResultTable(r.iceberg) +
-        '</div>' +
+      '<div style="border:1px solid var(--bdr);border-radius:6px;overflow:hidden">' +
+        '<div class="qcolh"><span class="cd ice"></span>Result from Iceberg (PGAA) - ' + fmtMs(ms) + ' &middot; ' + fmtN(r.result.row_count) + ' rows</div>' +
+        renderResultTable(r.result) +
       '</div>';
   } catch (e) {
     document.getElementById('qr-' + qid).innerHTML =
@@ -667,7 +626,7 @@ async function runOne(qid) {
 async function runAll() {
   const btn = document.getElementById('run-all-btn');
   btn.disabled = true; btn.innerHTML = '<span class="spinner"></span>Running...';
-  document.getElementById('run-status').textContent = 'Executing on both engines...';
+  document.getElementById('run-status').textContent = 'Executing all queries on Iceberg data...';
   document.getElementById('bars').innerHTML = '<div class="empty">Running...</div>';
   try {
     const d = await fetch('/api/run_all').then(x => x.json());
@@ -681,46 +640,29 @@ async function runAll() {
 }
 
 function renderBars(d) {
-  const nat = d.native, ice = d.iceberg;
-  const nw = nat.wall_time_ms, iw = ice.wall_time_ms;
+  const queries = d.queries;
+  const wall = d.wall_time_ms;
   document.getElementById('totals').style.display = 'flex';
-  document.getElementById('tot-nat').textContent = fmtMs(nw);
-  document.getElementById('tot-ice').textContent = fmtMs(iw);
-  if (nw > 0 && iw > 0) {
-    const f = nw < iw ? (iw / nw).toFixed(2) + 'x faster (Native)'
-                      : (nw / iw).toFixed(2) + 'x faster (Iceberg)';
-    document.getElementById('tot-spd').textContent = f;
-  }
-  const allTimes = [...nat.queries, ...ice.queries].map(q => q.exec_time_ms || 0);
+  document.getElementById('tot-wall').textContent = fmtMs(wall);
+  document.getElementById('tot-count').textContent = d.total_queries;
+
+  const allTimes = queries.map(q => q.exec_time_ms || 0);
   const mx = Math.max(...allTimes, 1);
-  const iceMap = Object.fromEntries(ice.queries.map(q => [q.id, q]));
-  const html = nat.queries.map(nq => {
-    const iq = iceMap[nq.id];
-    const nms = nq.exec_time_ms || 0, ims = (iq && iq.exec_time_ms) || 0;
-    const nPct = Math.max(2, Math.round(nms / mx * 100));
-    const iPct = Math.max(2, Math.round(ims / mx * 100));
-    // Flipped direction: bigger ratio = bigger gap = the slower engine's time / faster engine's time
-    let ratio = '';
-    if (nms > 0 && ims > 0) {
-      const r = (Math.max(nms, ims) / Math.min(nms, ims)).toFixed(1);
-      const winner = nms < ims ? 'Native' : 'Iceberg';
-      ratio = '<span class="bratio">' + r + '&times; faster (' + winner + ')</span>';
-    } else {
-      ratio = '<span class="bratio dim">&mdash;</span>';
-    }
+  const html = queries.map(q => {
+    const ms = q.exec_time_ms || 0;
+    const pct = Math.max(2, Math.round(ms / mx * 100));
+    const status = q.error ? '<span style="color:var(--err);font-size:11px">Error</span>' :
+                             '<span class="btime">' + fmtMs(ms) + '</span>';
     return '<div class="brow">' +
-      '<div class="bname">' + esc(nq.name) + '</div>' +
+      '<div class="bname">' + esc(q.name) + '</div>' +
       '<div class="bvis">' +
-        '<div class="bone"><span class="bone-lbl">NATIVE</span>' +
-          '<div class="bbar"><div class="bfill nat" style="width:' + nPct + '%"></div></div>' +
-          '<span class="btime">' + fmtMs(nms) + '</span>' +
-        '</div>' +
-        '<div class="bone"><span class="bone-lbl">ICEBERG</span>' +
-          '<div class="bbar"><div class="bfill ice" style="width:' + iPct + '%"></div></div>' +
-          '<span class="btime">' + fmtMs(ims) + '</span>' +
+        '<div class="bone" style="grid-template-columns:80px 1fr 100px">' +
+          '<span class="bone-lbl">ICEBERG</span>' +
+          '<div class="bbar"><div class="bfill ice" style="width:' + pct + '%"></div></div>' +
+          status +
         '</div>' +
       '</div>' +
-      ratio +
+      '<span style="font-size:11.5px;color:var(--txm)">' + fmtN(q.row_count || 0) + ' rows</span>' +
       '</div>';
   }).join('');
   document.getElementById('bars').innerHTML = html;
@@ -878,9 +820,9 @@ if __name__ == '__main__':
     args = parse_args()
     print(f"""
 +-----------------------------------------------------+
-|  PGAA Lab 3 Dashboard - Iceberg vs Native WHPG     |
+|  PGAA Lab 3 Dashboard - Lakehouse Analytics        |
 |  DB:     {DB_CONFIG['host']}:{DB_CONFIG['port']}/{DB_CONFIG['database']}
-|  Schema: native = {NATIVE_SCHEMA}.*  |  iceberg = *_iceberg
+|  Tables: *_iceberg (Iceberg tables on MinIO)
 |  Listen: http://{args.host}:{args.port}
 +-----------------------------------------------------+
 """)

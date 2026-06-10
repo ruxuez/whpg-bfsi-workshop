@@ -2,6 +2,7 @@
 
 This lab demonstrates **Lakehouse Federation** by querying **Apache Iceberg** tables stored in MinIO object storage directly from WarehousePG. You'll see how **PGAA DirectScan** enables analytics on external data without ETL, achieving impressive performance for lakehouse queries. Then you'll learn how to materialize hot data into native **WHPG AOCO** tables when maximum performance is needed.
 
+## ⚠️ DO NOT HIT "Next" button without instructions ! ⚠️
 ---
 
 ## Context
@@ -27,24 +28,13 @@ Five analytical queries demonstrate lakehouse federation capabilities:
 
 ---
 
-### Tabs preparation
-
-Prepare 2 Shell Tabs:
-- Your local host under this repo (Terminal Tab)
-- Connection to `cdw` envionment shell (WarehousePG Tab):
-```bash
-docker exec -u gpadmin -w /home/gpadmin -it cdw /bin/bash
-```
-
----
-
-##  Hands-On
+## Hands-On
 
 ---
 
 ## Phase 1: Query the Data Lakehouse
 
-### 0. Check Iceberg Catalog (**⚠️Terminal Tab**)
+### 0. Check Iceberg Catalog ([button label="⚠️MinIO Tab"](tab-0))
 
 > [!NOTE]
 > Minio credentials
@@ -53,54 +43,49 @@ docker exec -u gpadmin -w /home/gpadmin -it cdw /bin/bash
 
 Check Iceberg Data exists in MinIO:
 
-* Connect to Minio container
-```bash
-docker exec -it minio bash
-```
-
 * Set Alias of MinIO
-```bash
+```run
 mc alias set local http://minio:9000 minioadmin minioadmin
 ```
 * View bucket
-```bash
+```run
 mc ls local/
 ```
 * View bucket content
-```bash
+```run
 mc ls local/whpg-lakehouse
 ```
 * Check Iceberg files
-```bash
+```run
 mc ls --recursive local/whpg-lakehouse
 ```
 
 
 
 
-### 1. Initialize the Analytics Engine (**⚠️WarehousePG Tab**)
+### 1. Initialize the Analytics Engine ([button label="⚠️WarehousePG Tab"](tab-1))
 
 Explore PGAA and PGFS in WarehousePG:
 
 Run following in demo database:
-```bash
+```run
 psql demo
 ```
 
 Before running the benchmarks, you must enable the **Postgres AI & Analytics (PGAA)** extension.
-```sql
+```run
 CREATE EXTENSION IF NOT EXISTS pgaa CASCADE;
 ```
 This activates the high-performance FDW and the vectorized **DirectScan** executor.
 
 ---
 
-### 2. PGFS Storage Location (**⚠️WarehousePG Tab**)
+### 2. PGFS Storage Location ([button label="⚠️WarehousePG Tab"](tab-1))
 
 #### STEP 1: Create the connection to MinIO
 First, we define where the Iceberg data lives. The **Postgres File System (PGFS)** handles the low-level connectivity to S3-compatible storage like MinIO.
 
-```sql
+```run
 SELECT pgfs.create_storage_location(
     name        => 'minio_iceberg',
     url         => 's3://whpg-lakehouse/iceberg',
@@ -109,7 +94,7 @@ SELECT pgfs.create_storage_location(
 );
 ```
 * Verify the location
-```sql
+```run
 SELECT * FROM pgfs.list_storage_locations();
 ```
 > [!NOTE]
@@ -122,7 +107,7 @@ Now, we create foreign tables using the **PGAA** access method. Note that we don
 
 **This is where the magic happens** - these tables point to data in MinIO, not in the database!
 
-```sql
+```run
 DROP TABLE IF EXISTS customers_iceberg;
 CREATE TABLE customers_iceberg ()
 USING PGAA WITH (
@@ -165,7 +150,8 @@ USING PGAA WITH (
 ```
 
 * Verify Row Counts - Make sure data is accessible
-``` sql
+
+``` run
 SELECT 'customers_iceberg' AS tbl, COUNT(*) FROM customers_iceberg
 UNION ALL SELECT 'products_iceberg',    COUNT(*) FROM products_iceberg
 UNION ALL SELECT 'orders_iceberg',      COUNT(*) FROM orders_iceberg
@@ -178,19 +164,16 @@ ORDER BY 2 DESC;
 
 ---
 
-### 3. Run Analytics on Lakehouse Data (**⚠️Terminal Tab**)
+### 3. Run Analytics on Lakehouse Data ([button label="⚠️Terminal Tab"](tab-2))
 
 Now let's see these queries in action!
 
 1. **Start the Dashboard:**
-   ```bash
+   ```run
    python3.9 /scripts/apps/app3.py
    ```
 
-2. **Access the Interface:** Open in your browser
-   ```
-   http://localhost:5000
-   ```
+2. **Access the Interface:** ([button label="⚠️Lakehouse Federation Tab"](tab-3))
 
 3. **Try Some Queries:**
    - Click **"Run"** on individual queries in the "Query Lakehouse Data" tab
@@ -213,12 +196,12 @@ Now let's see these queries in action!
 
 When you need maximum performance for frequently-accessed data, materialize it into native WHPG tables.
 
-### 4. Create Native WHPG Tables from Iceberg (**⚠️WarehousePG Tab**)
+### 4. Create Native WHPG Tables from Iceberg ([button label="⚠️WarehousePG Tab"](tab-1))
 Now let's materialize the Iceberg data into native WarehousePG tables using **Append-Only Columnar (AOCO)** storage with **ZSTD** compression.
 
 **Notice:** We're using `CREATE TABLE ... AS SELECT * FROM <iceberg_table>` - direct data movement from lakehouse to warehouse!
 
-```sql
+```run
 CREATE SCHEMA IF NOT EXISTS demo;
 
 DROP TABLE IF EXISTS demo.customers CASCADE;
@@ -300,10 +283,10 @@ INSERT INTO demo.events SELECT * FROM events_iceberg;
 ANALYZE demo.events;
 ```
 
-### 5. Verify Data Parity (**⚠️WarehousePG Tab**)
+### 5. Verify Data Parity ([button label="⚠️WarehousePG Tab"](tab-1))
 Run the verification to ensure the lakehouse data was correctly materialized into native tables:
 
-```sql
+```run
 SELECT
     rpad(tbl, 14) as table_name,
     ice as iceberg_count,
@@ -340,14 +323,14 @@ ORDER BY ice DESC;
 ---
 
 ### 6. Check Understanding
-In the dashboard app, go to the **"Check Understanding"** tab. Discuss the two questions with a colleague, then click "Reveal" to see the answers.
+In the dashboard app ([button label="⚠️Lakehouse Federation Tab"](tab-3)), go to the **"Check Understanding"** tab. Discuss the two questions with a colleague, then click "Reveal" to see the answers.
 
 ### 7. Challenge: Find the top 5 products by revenue
 
-In the dashboard app, go to the **"Challenge"** tab and complete the SQL query by filling in the missing JOIN condition.
+In the dashboard app ([button label="⚠️Lakehouse Federation Tab"](tab-3)), go to the **"Challenge"** tab and complete the SQL query by filling in the missing JOIN condition.
 
-**Bonus:** Try running the same query against the native tables by replacing `_iceberg` with `demo.` prefix:
-```sql
+**Bonus:** Try running the same query against the native tables ([button label="⚠️WarehousePG Tab"](tab-1)) by replacing `_iceberg` with `demo.` prefix:
+```run
 -- Compare: Iceberg vs Native
 SELECT p.product_id,
        p.name        AS product_name,
@@ -375,3 +358,6 @@ Compare the execution times and observe the performance characteristics!
 4. ✅ Understand when to use lakehouse vs warehouse storage
 
 **Key Takeaway:** WHPG gives you **flexibility** - query your lakehouse where it lives, materialize when performance matters, or use both together in hybrid queries.
+
+> [!WARNING]
+> ⚠️Please DON'T click on "Next" button now, wait for our instruction ! ⚠️
