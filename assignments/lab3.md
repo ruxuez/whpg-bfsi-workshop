@@ -209,11 +209,20 @@ Now let's see these queries in action!
 
 ---
 
+### 4. Check Understanding
+In the dashboard app, go to the **"Check Understanding"** tab. Discuss the two questions with a colleague, then click "Reveal" to see the answers.
+
+### 5. Challenge: Find the top 5 products by revenue
+
+In the dashboard app, go to the **"Challenge"** tab and complete the SQL query by filling in the missing JOIN condition.
+
+---
+
 ## Phase 2: Materialize Hot Data to Native Tables
 
 When you need maximum performance for frequently-accessed data, materialize it into native WHPG tables.
 
-### 4. Create Native WHPG Tables from Iceberg (**⚠️WarehousePG Tab**)
+### 6. Create Native WHPG Tables from Iceberg (**⚠️WarehousePG Tab**)
 Now let's materialize the Iceberg data into native WarehousePG tables using **Append-Only Columnar (AOCO)** storage with **ZSTD** compression.
 
 **Notice:** We're using `CREATE TABLE ... AS SELECT * FROM <iceberg_table>` - direct data movement from lakehouse to warehouse!
@@ -300,7 +309,7 @@ INSERT INTO demo.events SELECT * FROM events_iceberg;
 ANALYZE demo.events;
 ```
 
-### 5. Verify Data Parity (**⚠️WarehousePG Tab**)
+### 7. Verify Data Parity (**⚠️WarehousePG Tab**)
 Run the verification to ensure the lakehouse data was correctly materialized into native tables:
 
 ```sql
@@ -339,14 +348,9 @@ ORDER BY ice DESC;
 
 ---
 
-### 6. Check Understanding
-In the dashboard app, go to the **"Check Understanding"** tab. Discuss the two questions with a colleague, then click "Reveal" to see the answers.
+### 8. (Optional) Compare Performance
 
-### 7. Challenge: Find the top 5 products by revenue
-
-In the dashboard app, go to the **"Challenge"** tab and complete the SQL query by filling in the missing JOIN condition.
-
-**Bonus:** Try running the same query against the native tables by replacing `_iceberg` with `demo.` prefix:
+**Bonus:** Try running the same query against the native tables (**⚠️WarehousePG Tab**) by replacing `_iceberg` with `demo.` prefix:
 ```sql
 -- Compare: Iceberg vs Native
 SELECT p.product_id,

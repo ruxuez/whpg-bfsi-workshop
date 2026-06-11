@@ -1,6 +1,6 @@
 # Lab 1: Card Fraud & AML Analytics (WarehousePG)
 
-In this lab, you will explore the power of native **int8range**  operators in WarehousePG for financial services analytics. You will perform high-speed fraud detection on approximately 13 million card transactions, demonstrating how native range types  outperform standard cloud data warehouses.
+In this lab, you will explore the power of native **int8range** operators and **native JSONB** handling in WarehousePG for financial services analytics. You will perform high-speed fraud detection on approximately 13 million card transactions, demonstrating how native range types and **native JSON operators** (with GIN indexing) outperform standard cloud data warehouses that rely on VARIANT types or string parsing.
 
 ## ⚠️ DO NOT HIT "Next" button yet! Wait for your instructor! ⚠️
 
@@ -12,11 +12,24 @@ In this lab, you will explore the power of native **int8range**  operators in Wa
 * **Database:** `demo`
 
 ### Dashboard Content: 6 Queries Across 3 Panels
+
+**Panel 1: Card Transactions** (Native Types)
 | ID | Query | Key Demonstration |
 | :--- | :--- | :--- |
-| **1A** | **BIN Range Match** | `int8range <@` join — native containment vs string parsing |
-| **2A** | **Cross-Source Alert Correlation** | Links transactions + auth + device events |
-| **3A** | **Account Forensic Trace** | Trace account activity across ALL log sources |
+| **1A** | **Watchlist BIN Match** | Native `int8range` with `<@` operator — no string parsing needed |
+| **1C** | **High-Value Instant Payments (JSONB)** | **Native JSON operators** (`@>`, `@?`) with GIN index — impossible on VARIANT types! |
+
+**Panel 2: Case & Auth Analytics**
+| ID | Query | Key Demonstration |
+| :--- | :--- | :--- |
+| **2A** | **Case × Auth Correlation** | Join case narratives to auth decisions within 15-min window — replaces SIEM |
+| **2C** | **Event Volume Dashboard** | All 5 fact sources in one UNION — one engine, no Splunk |
+
+**Panel 3: BIN Inventory, Limits & Forensic Bonus**
+| ID | Query | Key Demonstration |
+| :--- | :--- | :--- |
+| **3C** | **Customer Risk Scorecard** | Per-customer risk scoring via fraud_risk_score() — worst-first review |
+| **4B** | **★ BONUS: Forensic Account Trace** | Trace account 105900001 across transactions, auth, device & wires in one query |
 
 ---
 

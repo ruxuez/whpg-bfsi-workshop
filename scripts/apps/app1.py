@@ -140,20 +140,20 @@ WHERE t.ts >= '2026-06-01'::timestamp
 GROUP BY 1, 2, 3, 4
 ORDER BY hit_count DESC LIMIT 20"""
     },
-#     {
-#         "id": "1c", "panel": 0,
-#         "name": "1C \u00b7 High-Value Instant Payments (JSONB + GIN)",
-#         "desc": "ISO 20022 message filter via @> + jsonpath @? \u2014 hits the GIN index, impossible on VARIANT",
-#         "sql": """SELECT t.account_id, t.amount,
-#     COALESCE(t.iso_msg #>> '{Cdtr,CtryOfRes}', t.beneficiary_country) AS bene_ctry,
-#     t.iso_msg #>> '{PmtTpInf,SvcLvl,Cd}'   AS svc_level,
-#     t.iso_msg #>> '{PmtTpInf,LclInstrm,Cd}' AS local_instr
-# FROM transactions t
-# WHERE t.iso_msg @> '{"PmtTpInf":{"SvcLvl":{"Cd":"SEPA"},"LclInstrm":{"Cd":"INST"}}}'
-#   AND t.iso_msg @? '$.IntrBkSttlmAmt ? (@.value > 9000)'
-#   AND t.ts >= '2026-06-01'::timestamp
-# ORDER BY t.amount DESC LIMIT 20"""
-#     },
+    {
+        "id": "1c", "panel": 0,
+        "name": "1C \u00b7 High-Value Instant Payments (JSONB + GIN)",
+        "desc": "ISO 20022 message filter via @> + jsonpath @? \u2014 hits the GIN index, impossible on VARIANT",
+        "sql": """SELECT t.account_id, t.amount,
+    COALESCE(t.iso_msg #>> '{Cdtr,CtryOfRes}', t.beneficiary_country) AS bene_ctry,
+    t.iso_msg #>> '{PmtTpInf,SvcLvl,Cd}'   AS svc_level,
+    t.iso_msg #>> '{PmtTpInf,LclInstrm,Cd}' AS local_instr
+FROM transactions t
+WHERE t.iso_msg @> '{"PmtTpInf":{"SvcLvl":{"Cd":"SEPA"},"LclInstrm":{"Cd":"INST"}}}'
+  AND t.iso_msg @? '$.IntrBkSttlmAmt ? (@.value > 9000)'
+  AND t.ts >= '2026-06-01'::timestamp
+ORDER BY t.amount DESC LIMIT 20"""
+    },
 
     # ── Panel 2: Case & Auth Analytics ───────────────────────────────────────
     {
@@ -175,42 +175,42 @@ AND c.ts BETWEEN a.ts - INTERVAL '5 minutes' AND a.ts + INTERVAL '10 minutes'
 GROUP BY 1, 2, 3, 4
 ORDER BY declines_nearby DESC LIMIT 30"""
     },
-#     {
-#         "id": "2c", "panel": 1,
-#         "name": "2C \u00b7 Event Volume Dashboard",
-#         "desc": "All 5 fact sources in one UNION \u2014 one engine, no Splunk",
-#         "sql": """SELECT 'transactions' AS source, COUNT(*) AS events
-#     FROM transactions WHERE ts >= '2026-06-01'::timestamp
-# UNION ALL SELECT 'device_events', COUNT(*)
-#     FROM device_events WHERE ts >= '2026-06-01'::timestamp
-# UNION ALL SELECT 'auth_decisions', COUNT(*)
-#     FROM auth_decisions WHERE ts >= '2026-06-01'::timestamp
-# UNION ALL SELECT 'case_narratives', COUNT(*)
-#     FROM case_narratives WHERE ts >= '2026-06-01'::timestamp
-# UNION ALL SELECT 'wire_events', COUNT(*)
-#     FROM wire_events WHERE ts >= '2026-06-01'::timestamp
-# ORDER BY events DESC"""
-#     },
+    {
+        "id": "2c", "panel": 1,
+        "name": "2C \u00b7 Event Volume Dashboard",
+        "desc": "All 5 fact sources in one UNION \u2014 one engine, no Splunk",
+        "sql": """SELECT 'transactions' AS source, COUNT(*) AS events
+    FROM transactions WHERE ts >= '2026-06-01'::timestamp
+UNION ALL SELECT 'device_events', COUNT(*)
+    FROM device_events WHERE ts >= '2026-06-01'::timestamp
+UNION ALL SELECT 'auth_decisions', COUNT(*)
+    FROM auth_decisions WHERE ts >= '2026-06-01'::timestamp
+UNION ALL SELECT 'case_narratives', COUNT(*)
+    FROM case_narratives WHERE ts >= '2026-06-01'::timestamp
+UNION ALL SELECT 'wire_events', COUNT(*)
+    FROM wire_events WHERE ts >= '2026-06-01'::timestamp
+ORDER BY events DESC"""
+    },
 
     # ── Panel 3: BIN Inventory, Limits & Forensic Bonus ──────────────────────
-#     {
-#         "id": "3c", "panel": 2,
-#         "name": "3C \u00b7 Customer Risk Scorecard",
-#         "desc": "Per-customer risk scoring via fraud_risk_score() \u2014 worst-first for review",
-#         "sql": """SELECT c.customer_name, c.segment,
-#     ROUND(AVG(k.decline_rate_pct), 2) AS avg_decline_pct,
-#     ROUND(AVG(k.fraud_bps), 1) AS avg_fraud_bps,
-#     ROUND(AVG(k.txn_velocity), 1) AS avg_velocity,
-#     ROUND(fraud_risk_score(AVG(k.avg_ticket), AVG(k.decline_rate_pct), AVG(k.fraud_bps)), 1) AS risk_score,
-#     rp.max_decline_rate
-# FROM customers c
-# JOIN risk_profiles rp ON c.customer_id = rp.customer_id AND rp.effective_to IS NULL
-# JOIN account_kpis k ON c.customer_id = k.customer_id
-# GROUP BY c.customer_name, c.segment, rp.max_decline_rate
-# ORDER BY risk_score DESC"""
-#     },
     {
-        "id": "3a", "panel": 2,
+        "id": "3c", "panel": 2,
+        "name": "3C \u00b7 Customer Risk Scorecard",
+        "desc": "Per-customer risk scoring via fraud_risk_score() \u2014 worst-first for review",
+        "sql": """SELECT c.customer_name, c.segment,
+    ROUND(AVG(k.decline_rate_pct), 2) AS avg_decline_pct,
+    ROUND(AVG(k.fraud_bps), 1) AS avg_fraud_bps,
+    ROUND(AVG(k.txn_velocity), 1) AS avg_velocity,
+    ROUND(fraud_risk_score(AVG(k.avg_ticket), AVG(k.decline_rate_pct), AVG(k.fraud_bps)), 1) AS risk_score,
+    rp.max_decline_rate
+FROM customers c
+JOIN risk_profiles rp ON c.customer_id = rp.customer_id AND rp.effective_to IS NULL
+JOIN account_kpis k ON c.customer_id = k.customer_id
+GROUP BY c.customer_name, c.segment, rp.max_decline_rate
+ORDER BY risk_score DESC"""
+    },
+    {
+        "id": "4b", "panel": 2,
         "name": "\u2605 BONUS \u00b7 Forensic Account Trace",
         "desc": "Trace account 105900001 across transactions, auth, device & wires in one query",
         "sql": """SELECT * FROM (
@@ -244,15 +244,22 @@ PANELS = [
 CHECK_QUESTIONS = [
     {
         "kind": "concept",
-        "title": "Why was card_bin <@ bin_range fast on 5M transactions?",
-        "ask": "You ran the watchlist join in roughly 1 second. Name three things that made that fast \u2014 that wouldn't be true on single-node Postgres or on Snowflake.",
-        "listen": "Native int8range type with a GiST index (no string parsing) \u00b7 MPP parallelism across all segments \u00b7 no UDF overhead \u2014 the containment operator is built into the planner",
+        "title": "What makes Query 1A's int8range join fast?",
+        "ask": "Query 1A matches card BINs against watchlist ranges using the <@ operator. "
+               "How is this different from string parsing or BETWEEN checks, and why is it faster?",
+        "listen": "int8range is a native Postgres type \u2014 <@ containment operator is built into the planner and uses GiST indexes. "
+                  "String parsing (SUBSTRING, CAST) or BETWEEN checks can't use indexes efficiently. "
+                  "Native types eliminate parsing overhead and enable index support. This is why Query 1A runs in ~1 second on 13M rows.",
     },
     {
         "kind": "practical",
-        "title": "If we changed transactions' distribution key\u2026",
-        "ask": "Today transactions is DISTRIBUTED BY (region_id). If we re-distributed it by card_bin instead, which Lab 1 query gets faster, and which gets slower?",
-        "listen": "Faster: 1A watchlist join \u2014 rows now co-located by card_bin, no Motion needed. Slower: any region rollup \u2014 the GROUP BY no longer aligns with distribution, forcing a Redistribute.",
+        "title": "How does data distribution speed up Query 1A's join?",
+        "ask": "Query 1A joins 13M transactions against watchlist BIN ranges. In WarehousePG, transactions are distributed "
+               "across 4 segments. How does this MPP architecture make the join faster than a single-node database?",
+        "listen": "Data is distributed across segments by distribution key (region_id). Each segment processes its local slice "
+                  "of ~3M rows in parallel. The join executes on all 4 segments simultaneously with no locking. "
+                  "Result: 4x parallelism. A single-node Postgres would process all 13M rows sequentially on one CPU. "
+                  "MPP + parallel execution = linear speedup.",
     },
 ]
 

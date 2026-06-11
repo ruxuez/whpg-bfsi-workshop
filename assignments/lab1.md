@@ -10,12 +10,25 @@ In this lab, you will explore the power of native **int8range** operators in War
 * **Database:** `demo`
 * **Schema:** `bfsi_demo`
 
-### Dashboard Content: 3 Core Queries
+### Dashboard Content: 6 Queries Across 3 Panels
+
+**Panel 1: Card Transactions**
 | ID | Query | Key Demonstration |
 | :--- | :--- | :--- |
-| **1A** | **BIN Range Match** | `int8range <@` join — native containment vs string parsing |
-| **2A** | **Cross-Source Alert Correlation** | Links transactions + auth + device events |
-| **3A** | **Account Forensic Trace** | Trace account activity across ALL log sources |
+| **1A** | **Watchlist BIN Match** | Expand int8range bands → equality hash join (no nested-loop GiST probe per row) |
+| **1C** | **High-Value Instant Payments** | ISO 20022 JSONB filter via @> + jsonpath @? — hits GIN index |
+
+**Panel 2: Case & Auth Analytics**
+| ID | Query | Key Demonstration |
+| :--- | :--- | :--- |
+| **2A** | **Case × Auth Correlation** | Join case narratives to auth decisions within 15-min window — replaces SIEM |
+| **2C** | **Event Volume Dashboard** | All 5 fact sources in one UNION — one engine, no Splunk |
+
+**Panel 3: BIN Inventory, Limits & Forensic Bonus**
+| ID | Query | Key Demonstration |
+| :--- | :--- | :--- |
+| **3C** | **Customer Risk Scorecard** | Per-customer risk scoring via fraud_risk_score() — worst-first review |
+| **4B** | **★ BONUS: Forensic Account Trace** | Trace account 105900001 across transactions, auth, device & wires in one query |
 
 ### Terminal Setup
 

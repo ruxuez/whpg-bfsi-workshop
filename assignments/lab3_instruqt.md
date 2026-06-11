@@ -192,11 +192,20 @@ Now let's see these queries in action!
 
 ---
 
+### 4. Check Understanding
+In the dashboard app ([button label="⚠️Lakehouse Federation Tab"](tab-3)), go to the **"Check Understanding"** tab. Discuss the two questions with a colleague, then click "Reveal" to see the answers.
+
+### 5. Challenge: Find the top 5 products by revenue
+
+In the dashboard app ([button label="⚠️Lakehouse Federation Tab"](tab-3)), go to the **"Challenge"** tab and complete the SQL query by filling in the missing JOIN condition.
+
+---
+
 ## Phase 2: Materialize Hot Data to Native Tables
 
 When you need maximum performance for frequently-accessed data, materialize it into native WHPG tables.
 
-### 4. Create Native WHPG Tables from Iceberg ([button label="⚠️WarehousePG Tab"](tab-1))
+### 6. Create Native WHPG Tables from Iceberg ([button label="⚠️WarehousePG Tab"](tab-1))
 Now let's materialize the Iceberg data into native WarehousePG tables using **Append-Only Columnar (AOCO)** storage with **ZSTD** compression.
 
 **Notice:** We're using `CREATE TABLE ... AS SELECT * FROM <iceberg_table>` - direct data movement from lakehouse to warehouse!
@@ -283,7 +292,7 @@ INSERT INTO demo.events SELECT * FROM events_iceberg;
 ANALYZE demo.events;
 ```
 
-### 5. Verify Data Parity ([button label="⚠️WarehousePG Tab"](tab-1))
+### 7. Verify Data Parity ([button label="⚠️WarehousePG Tab"](tab-1))
 Run the verification to ensure the lakehouse data was correctly materialized into native tables:
 
 ```run
@@ -314,38 +323,13 @@ ORDER BY ice DESC;
 
 | Storage Type | Best For | Performance | Use Cases |
 |--------------|----------|-------------|-----------|
-| **Iceberg Tables (Lakehouse)** | Ad-hoc analysis, data exploration, infrequent queries | Good (2-5s for complex queries) | Data science, exploratory analytics, shared datasets |
+| **Iceberg Tables (Lakehouse)** | Ad-hoc analysis, data exploration, infrequent queries | Good (1-2s for complex queries) | Data science, exploratory analytics, shared datasets |
 | **Native AOCO Tables (Warehouse)** | Frequent queries, dashboards, critical paths | Excellent (sub-second) | Production dashboards, high-concurrency workloads |
 | **Hybrid (Both)** | Best of both worlds | Flexible | Hot data native, cold data lakehouse |
 
 **The Power:** You can query both in the same SQL statement - join native and Iceberg tables together!
 
----
 
-### 6. Check Understanding
-In the dashboard app ([button label="⚠️Lakehouse Federation Tab"](tab-3)), go to the **"Check Understanding"** tab. Discuss the two questions with a colleague, then click "Reveal" to see the answers.
-
-### 7. Challenge: Find the top 5 products by revenue
-
-In the dashboard app ([button label="⚠️Lakehouse Federation Tab"](tab-3)), go to the **"Challenge"** tab and complete the SQL query by filling in the missing JOIN condition.
-
-**Bonus:** Try running the same query against the native tables ([button label="⚠️WarehousePG Tab"](tab-1)) by replacing `_iceberg` with `demo.` prefix:
-```run
--- Compare: Iceberg vs Native
-SELECT p.product_id,
-       p.name        AS product_name,
-       p.category,
-       SUM(oi.quantity)                                    AS units_sold,
-       ROUND(SUM(oi.quantity * oi.unit_price)::numeric, 2) AS revenue
-FROM   demo.products    p     -- Native table
-JOIN   demo.order_items oi    -- Native table
-       ON   p.product_id = oi.product_id
-GROUP  BY p.product_id, p.name, p.category
-ORDER  BY revenue DESC
-LIMIT  5;
-```
-
-Compare the execution times and observe the performance characteristics!
 
 ---
 
