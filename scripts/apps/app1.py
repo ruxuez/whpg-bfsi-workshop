@@ -235,7 +235,7 @@ ORDER BY risk_score DESC"""
 ]
 
 PANELS = [
-    {"name": "Card Transactions", "icon": "1", "desc": "Native JSONB & int8range operators on 31M+ transaction rows"},
+    {"name": "Card Transactions", "icon": "1", "desc": "Native JSONB & int8range operators on 5M+ transaction rows"},
     {"name": "Case & Auth Analytics", "icon": "2", "desc": "Cross-source correlation \u2014 replace your SIEM"},
     {"name": "BIN Inventory, Limits + Forensic Bonus", "icon": "3", "desc": "Customer risk scoring + multi-source account trace"},
 ]
@@ -243,23 +243,34 @@ PANELS = [
 # \u2500\u2500 Comprehension check questions (rendered as a tab in the dashboard) \u2500\u2500
 CHECK_QUESTIONS = [
     {
-        "kind": "concept",
-        "title": "What makes Query 1A's int8range join fast?",
-        "ask": "Query 1A matches card BINs against watchlist ranges using the <@ operator. "
-               "How is this different from string parsing or BETWEEN checks, and why is it faster?",
-        "listen": "int8range is a native Postgres type \u2014 <@ containment operator is built into the planner and uses GiST indexes. "
-                  "String parsing (SUBSTRING, CAST) or BETWEEN checks can't use indexes efficiently. "
-                  "Native types eliminate parsing overhead and enable index support. This is why Query 1A runs in ~1 second on 13M rows.",
+        "kind": "practical",
+        "title": "How does WarehousePG run Query 1A's join in parallel?",
+        "ask": "Query 1A joins ~5M transactions against the expanded watchlist BIN set on "
+               "`t.card_bin = wb.card_bin`. Transactions are distributed across the segments by "
+               "`region_id` \u2014 not by `card_bin`. So how does the planner parallelise this join "
+               "without shuffling all 5M rows across the interconnect?",
+        "listen": "The watch_bins CTE expands to only a few thousand discrete BINs \u2014 tiny. Because the join key "
+                  "(card_bin) is not the distribution key (region_id), the planner BROADCASTS that small set to every "
+                  "segment instead of redistributing the 5M-row transactions table. Faster: each segment hash-joins its "
+                  "local slice (~5M / number of segments) against the in-memory broadcast set and pre-aggregates "
+                  "COUNT / SUM / MIN / MAX locally, all segments in parallel; only the small grouped partials cross the "
+                  "interconnect to be merged. Slower: a single-node Postgres scans all 5M rows on one CPU. "
+                  "Key point \u2014 move the small side, keep the big table in place. That is what lets MPP scale.",
     },
     {
-        "kind": "practical",
-        "title": "How does data distribution speed up Query 1A's join?",
-        "ask": "Query 1A joins 13M transactions against watchlist BIN ranges. In WarehousePG, transactions are distributed "
-               "across 4 segments. How does this MPP architecture make the join faster than a single-node database?",
-        "listen": "Data is distributed across segments by distribution key (region_id). Each segment processes its local slice "
-                  "of ~3M rows in parallel. The join executes on all 4 segments simultaneously with no locking. "
-                  "Result: 4x parallelism. A single-node Postgres would process all 13M rows sequentially on one CPU. "
-                  "MPP + parallel execution = linear speedup.",
+        "kind": "concept",
+        "title": "Why can Query 1C's `@>` and `@?` filters use a GIN index?",
+        "ask": "Query 1C filters ISO 20022 messages with `iso_msg @> '{...}'` (containment) and "
+               "`iso_msg @? '$.IntrBkSttlmAmt ? (@.value > 9000)'` (jsonpath), then pulls fields out with `#>>`. "
+               "Which of these actually touch the GIN index, and why is this filter 'impossible on VARIANT'?",
+        "listen": "Both @> (containment) and @? (jsonpath exists) are GIN-indexable: a GIN index on iso_msg stores the "
+                  "document's keys and values as an inverted index, so these operators probe the index and visit only the "
+                  "handful of matching rows. Faster: the index turns 'find SEPA + INST messages with settlement > 9000' "
+                  "into a lookup instead of parsing 5M JSONB documents. The #>> path-extraction in the SELECT is NOT a search "
+                  "\u2014 it just pulls text values (Cdtr.CtryOfRes, SvcLvl.Cd, LclInstrm.Cd) out of the rows that already "
+                  "survived the filter. Slower / impossible on VARIANT: engines that store semi-structured data as an opaque "
+                  "VARIANT blob have no inverted index over its contents, so the same predicate degrades to a full scan plus "
+                  "per-row parse. Native JSONB + GIN is what makes the search indexable.",
     },
 ]
 
