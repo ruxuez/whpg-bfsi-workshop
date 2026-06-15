@@ -12,6 +12,12 @@ from flask import Flask, render_template_string, jsonify, request
 import psycopg2, psycopg2.extras
 
 app = Flask(__name__)
+# Keep SQL column order in JSON responses (older Flask sorts keys alphabetically,
+# which scrambles every result table in the UI)
+try:
+    app.json.sort_keys = False            # Flask >= 2.2
+except Exception:
+    app.config["JSON_SORT_KEYS"] = False  # older Flask
 
 DB = {
     "host":     os.environ.get("WHPG_HOST", "localhost"),
@@ -208,6 +214,7 @@ QUERIES = [
     {
         "id": "a1", "panel": 0,
         "name": "A1 - The Keyword Search Problem",
+        "expect": "Keyword hits ≈ 0–5, but actual_structuring_notes is in the hundreds. Keywords miss almost everything — that's the problem.",
         "desc": "LIKE '%structuring%' finds almost nothing, yet the structuring persona is everywhere - same behaviour, different words!",
         "sql": """SELECT
     'Keyword Search Results' AS search_method,
@@ -232,6 +239,7 @@ FROM bfsi_demo.case_embeddings"""
     {
         "id": "a2", "panel": 0,
         "name": "A2 - pgvector Finds Fraud by MEANING",
+        "expect": "15 notes, all ground_truth = structuring, similarity 0.85–0.99 — different wording, same fraud, found with one <=> operator.",
         "desc": "Find case notes similar to a known structuring narrative - semantic search surfaces related cases WITHOUT exact keywords!",
         "sql": """WITH reference_note AS (
     SELECT note_id, LEFT(narrative, 80) AS ref_note, embedding
@@ -272,6 +280,7 @@ LIMIT 15"""
     {
         "id": "b1", "panel": 1,
         "name": "B1 - MADlib Discovered the Fraud Personas",
+        "expect": "4 personas: NORMAL (~50K accts) plus 3 small fraud clusters. AVG_CV = how much an account's payment sizes vary (stddev/mean): humans \u2248 0.5\u20130.7, structuring mules near zero \u2014 robotic same-size payments just under $10K. NB: the label text is a heuristic; the cluster IDs (1/3/5 = the fraud ones) are the ground truth.",
         "desc": "K-Means clustering on 6 behavioural features - NO LABELS, finds fraud rings automatically",
         "sql": """SELECT
     a.cluster_id,
@@ -296,6 +305,7 @@ ORDER BY
     {
         "id": "b2", "panel": 1,
         "name": "B2 - The Dramatic Differences",
+        "expect": "CARD-TESTING ≈ 100× more merchants, BUST-OUT ≈ 650× more spend, STRUCTURING amount_cv ≈ 0.03 (robotic consistency).",
         "desc": "CARD-TESTING: many more merchants | BUST-OUT: far higher spend than a normal account",
         "sql": """WITH cluster_agg AS (
     SELECT
@@ -336,61 +346,55 @@ ORDER BY
     # ══════════════════════════════════════════════════════════════════════════
     {
         "id": "c1", "panel": 2,
-        "name": "C1 - The AI Factory: Fraud Pattern Correlation",
-        "desc": "MADlib finds behavioural clusters \u2192 pgvector finds semantic patterns \u2192 BOTH detect the SAME fraud types in ONE query!",
-        "sql": """WITH madlib_patterns AS (
-    SELECT
-        a.inferred_label AS fraud_type,
-        COUNT(*) AS accts,
-        ROUND(AVG(f.distinct_merchants), 0)     AS avg_merchants,
-        ROUND(AVG(f.total_amount)::numeric, 2)  AS avg_spend,
-        ROUND(AVG(f.amount_cv)::numeric, 4)     AS avg_cv
-    FROM bfsi_demo.kmeans_labeled a
-    JOIN bfsi_demo.account_features f ON a.account_id = f.account_id
-    WHERE a.inferred_label IN ('CARD-TESTING', 'BUST-OUT', 'STRUCTURING')
-    GROUP BY a.inferred_label
+        "name": "C1 - Cross-Check: Do Both Detectives Agree?",
+        "expect": "One row per fraud type. Read it as: \u201cMADlib flagged N accounts, the case notes flagged M, FOUND_BY_BOTH are the same accounts\u201d. pgvector's number is big by design (wide net); the bar shows how many of MADlib's suspects it confirms. A 0 row means K-Means didn't separate that cluster this run \u2014 itself a teachable point.",
+        "desc": "MADlib never reads text. pgvector never sees amounts. This query JOINs their suspect lists ON account_id \u2014 the overlap is the proof.",
+        "sql": """WITH madlib_suspects AS (
+    -- Detective 1: behaviour only (6 numeric features, zero text).
+    -- NB: K-Means is unsupervised; the label text is heuristic and varies
+    -- between runs ('STRUCTURING candidates', 'BUST-OUT cluster', ...) so we
+    -- match it tolerantly instead of by exact string.
+    SELECT DISTINCT account_id,
+           CASE
+               WHEN UPPER(inferred_label) LIKE '%STRUCT%'                 THEN 'STRUCTURING'
+               WHEN UPPER(inferred_label) LIKE '%BUST%'                   THEN 'BUST-OUT'
+               WHEN UPPER(inferred_label) LIKE '%CARD%'
+                 OR UPPER(inferred_label) LIKE '%TEST%'                   THEN 'CARD-TESTING'
+           END AS fraud_type
+    FROM bfsi_demo.kmeans_labeled
+    WHERE UPPER(inferred_label) LIKE '%STRUCT%'
+       OR UPPER(inferred_label) LIKE '%BUST%'
+       OR UPPER(inferred_label) LIKE '%CARD%'
+       OR UPPER(inferred_label) LIKE '%TEST%'
 ),
-pgvector_patterns AS (
-    SELECT
-        CASE
-            WHEN persona = 'card_testing' THEN 'CARD-TESTING'
-            WHEN persona = 'bust_out'     THEN 'BUST-OUT'
-            WHEN persona = 'structuring'  THEN 'STRUCTURING'
-        END AS fraud_type,
-        COUNT(*)                       AS notes,
-        COUNT(DISTINCT account_id)     AS accounts,
-        string_agg(DISTINCT queue, ', ') AS queues_seen
+pgvector_suspects AS (
+    -- Detective 2: case-note meaning only (32-D embeddings, zero amounts)
+    SELECT DISTINCT account_id,
+           CASE persona
+               WHEN 'card_testing' THEN 'CARD-TESTING'
+               WHEN 'bust_out'     THEN 'BUST-OUT'
+               WHEN 'structuring'  THEN 'STRUCTURING'
+           END AS fraud_type
     FROM bfsi_demo.case_embeddings
     WHERE persona IN ('card_testing', 'bust_out', 'structuring')
-    GROUP BY persona
 )
 SELECT
-    mp.fraud_type,
-    mp.accts::text || ' accounts (MADlib)'      AS behavioral_evidence,
-    mp.avg_merchants::text || ' avg merchants'  AS behavior_metric_1,
-    '$' || mp.avg_spend::text || ' avg spend'   AS behavior_metric_2,
-    pv.notes::text || ' notes (pgvector)'       AS semantic_evidence,
-    pv.queues_seen                              AS semantic_queues
-FROM madlib_patterns mp
-JOIN pgvector_patterns pv ON mp.fraud_type = pv.fraud_type
-WHERE mp.fraud_type IS NOT NULL
-ORDER BY mp.accts DESC"""
-    },
-    {
-        "id": "c2", "panel": 2,
-        "name": "C2 - Why This Matters",
-        "desc": "In traditional warehouses: export \u2192 train \u2192 join (hours). Here: ONE SQL query (<5 sec)",
-        "sql": """SELECT
-    'Traditional Warehouse (Snowflake/BigQuery)' AS approach,
-    'Export 13M rows \u2192 Python \u2192 train model \u2192 upload results \u2192 JOIN' AS workflow,
-    '2-4 hours' AS time,
-    'Requires data movement, external tools, model versioning' AS complexity
-UNION ALL
-SELECT
-    'EDB WarehousePG (In-Database ML)',
-    'MADlib K-Means + pgvector similarity search in ONE query',
-    '< 5 seconds',
-    'Zero data movement, SQL-native, no external dependencies'"""
+    COALESCE(m.fraud_type, p.fraud_type)  AS fraud_type,
+    COUNT(DISTINCT m.account_id)          AS madlib_accounts,
+    COUNT(DISTINCT p.account_id)          AS pgvector_accounts,
+    COUNT(DISTINCT CASE WHEN m.account_id IS NOT NULL
+                         AND p.account_id IS NOT NULL
+                        THEN m.account_id END) AS found_by_both,
+    ROUND(100.0 * COUNT(DISTINCT CASE WHEN m.account_id IS NOT NULL
+                                       AND p.account_id IS NOT NULL
+                                      THEN m.account_id END)
+          / NULLIF(COUNT(DISTINCT m.account_id), 0), 0) AS agreement_pct
+FROM madlib_suspects m
+FULL OUTER JOIN pgvector_suspects p
+  ON  m.account_id = p.account_id
+  AND m.fraud_type = p.fraud_type
+GROUP BY 1
+ORDER BY found_by_both DESC"""
     },
     # ══════════════════════════════════════════════════════════════════════════
     # Panel D: ML → Watchlist
@@ -399,12 +403,14 @@ SELECT
         "id": "d1", "panel": 3,
         "name": "D1 - ML Fraud Gap — Detected but NOT in Watchlist",
         "desc": "Transactions from K-Means fraud clusters that exist in transactions but are NOT yet flagged in fraud_watchlists. Run Refresh above, then re-run — should show 0 rows.",
+        "expect": "BEFORE the pipeline runs: a list of fraud accounts MADlib found that the watchlist hasn't caught yet. AFTER: 0 rows — gap closed.",
         "sql": SQL_1A_BEFORE,
     },
     {
         "id": "d2", "panel": 3,
         "name": "D2 - Query 1A Extended — BIN Ranges + ML Accounts",
         "desc": "After Refresh: BIN-match rows (blue) + ML K-Means account rows (green). Orange = high exposure. Run D1 first to see the gap, refresh, then run D2 to see them appear.",
+        "expect": "Blue rows = original BIN-range matches. Green rows = new ML-discovered accounts now protected by the same watchlist.",
         "sql": SQL_1A_AFTER,
     },
 ]
@@ -412,7 +418,7 @@ SELECT
 PANELS = [
     {"name": "pgvector",       "icon": "A", "desc": "Semantic search finds fraud by MEANING, not keywords"},
     {"name": "MADlib",         "icon": "B", "desc": "Unsupervised clustering discovers fraud personas automatically"},
-    {"name": "AI Factory",     "icon": "C", "desc": "Combine both in ONE query — impossible in traditional warehouses"},
+    {"name": "AI Factory",     "icon": "C", "desc": "Cross-check — do the numbers detective and the language detective point at the same accounts?"},
     {"name": "ML → Watchlist", "icon": "D", "desc": "Write K-Means results to fraud_watchlists · Query 1A before vs after"},
 ]
 
@@ -586,6 +592,21 @@ body{background:var(--bg);color:var(--text);font-family:system-ui,sans-serif}
 .pnl{display:none}.pnl.on{display:block;animation:fi .25s ease}
 @keyframes fi{from{opacity:0;transform:translateY(5px)}to{opacity:1;transform:none}}
 
+.stepn{display:inline-flex;width:17px;height:17px;border-radius:50%;background:var(--border);
+  color:var(--text);font-size:10px;font-weight:800;align-items:center;justify-content:center;margin-right:5px}
+.tab.on .stepn{background:var(--accent);color:#06281e}
+.tab.done::after{content:' \2713';color:var(--accent);font-weight:800}
+.qexpect{margin:8px 0 2px;padding:8px 12px;background:rgba(6,214,160,.06);
+  border:1px dashed rgba(6,214,160,.35);border-radius:7px;font-size:12px;line-height:1.55;color:var(--muted)}
+.qexpect b{color:var(--accent)}
+.nextbar{display:flex;justify-content:flex-end;margin-top:18px}
+.nextbtn{background:var(--text);color:var(--bg);border:0;padding:10px 22px;border-radius:8px;
+  font-size:13px;font-weight:700;cursor:pointer;font-family:inherit}
+.nextbtn:hover{opacity:.85}
+.wl-gap{display:flex;gap:10px;align-items:center;margin:10px 0;font-size:13px;flex-wrap:wrap}
+.wl-gap .g{background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:6px 14px;
+  font-family:'Courier New',monospace;font-weight:700;font-size:16px}
+.wl-gap .g.bad{color:#ea580c}.wl-gap .g.good{color:var(--accent)}
 /* ── section header ── */
 .sec-hdr{margin-bottom:20px}
 .sec-hdr .n{background:linear-gradient(135deg,var(--accent),var(--cyan));color:#fff;
@@ -705,6 +726,22 @@ tr.bin-row td{background:#eff6ff;color:#1e40af}           /* blue: original BIN 
 .sc-persona.struct .p-name{color:#6b21a8}
 .sc-persona .p-stat{font-size:10px;color:var(--dim);margin-top:2px;line-height:1.5}
 
+/* ── C1 correlation viz ── */
+.c1viz{display:flex;flex-direction:column;gap:10px;margin:6px 0 14px}
+.c1row{display:grid;grid-template-columns:130px 1fr 1.4fr 1fr;gap:14px;align-items:center;
+  background:var(--bg);border:1px solid var(--border);border-radius:10px;padding:12px 16px}
+.c1type{font-weight:800;font-size:13px}
+.c1side{text-align:center}
+.c1side .n{font-size:22px;font-weight:800;font-family:'Courier New',monospace}
+.c1side .l{font-size:10px;color:var(--dim);text-transform:uppercase;letter-spacing:.04em;line-height:1.4}
+.c1side.madlib .n{color:var(--blue)}
+.c1side.pgv .n{color:var(--purple)}
+.c1mid{text-align:center}
+.c1both{font-size:12px;font-weight:800;color:var(--accent)}
+.c1bar{height:8px;background:var(--border);border-radius:4px;margin:6px 0;overflow:hidden}
+.c1bar>div{height:100%;background:linear-gradient(90deg,#06d6a0,#34d399);border-radius:4px}
+.c1pct{font-size:11px;color:var(--muted)}
+.c1read{font-size:11.5px;color:var(--muted);font-style:italic;margin:0 0 10px}
 /* ── footer ── */
 .ft{margin-top:32px;padding:14px 0;border-top:1px solid var(--border);
     display:flex;justify-content:space-between;color:var(--dim);font-size:11px}
@@ -764,7 +801,7 @@ tr.ml-row td{background:#f0fdf4;color:#166534}
     </svg>
     <div>
       <h1>WarehousePG <span>AI Analytics</span></h1>
-      <div class="hdr-sub">Lab 2 — pgvector + MADlib + AI Factory · Meridian Bank · last 28 days</div>
+      <div class="hdr-sub">Lab 2 (guided) — Steps 1&#8594;4: pgvector &#8594; MADlib &#8594; AI Factory &#8594; ML Watchlist · Meridian Bank</div>
     </div>
   </div>
   <div class="hdr-right">
@@ -776,11 +813,11 @@ tr.ml-row td{background:#f0fdf4;color:#166534}
 
 <!-- TABS -->
 <div class="tabs" id="tabs">
-  <button class="tab on"  onclick="switchTab(0)">Part A: pgvector</button>
-  <button class="tab"     onclick="switchTab(1)">Part B: MADlib / SQL</button>
-  <button class="tab"     onclick="switchTab(2)">Part C: AI Factory</button>
-  <button class="tab"     onclick="switchTab(3)" style="border-color:rgba(167,139,250,.3);color:var(--purple)">SQL Editor</button>
-  <button class="tab"     onclick="switchTab(4)" style="border-color:rgba(234,88,12,.3);color:#ea580c">D: ML &#8594; Watchlist</button>
+  <button class="tab on" id="tabbtn-0" onclick="switchTab(0)"><span class="stepn">1</span> pgvector</button>
+  <button class="tab"    id="tabbtn-1" onclick="switchTab(1)"><span class="stepn">2</span> MADlib</button>
+  <button class="tab"    id="tabbtn-2" onclick="switchTab(2)"><span class="stepn">3</span> AI Factory</button>
+  <button class="tab"    id="tabbtn-4" onclick="switchTab(4)" style="border-color:rgba(234,88,12,.3);color:#ea580c"><span class="stepn">4</span> ML &#8594; Watchlist</button>
+  <button class="tab"    id="tabbtn-3" onclick="switchTab(3)" style="border-color:rgba(167,139,250,.3);color:var(--purple)">SQL Editor (free play)</button>
 </div>
 
 <div class="main" id="main">
@@ -808,7 +845,7 @@ LIMIT 20;</textarea>
     <div class="sec-hdr">
       <span class="n" style="background:linear-gradient(135deg,#ea580c,#d97706)">D</span>
       <h2>ML &#8594; Watchlist</h2>
-      <div class="d">Write K-Means results back to fraud_watchlists · Query 1A before vs after ML update</div>
+      <div class="d">One click: measure the gap &#8594; write K-Means results to fraud_watchlists &#8594; verify the gap is closed</div>
     </div>
 
     <!-- Reset info box -->
@@ -826,15 +863,22 @@ LIMIT 20;</textarea>
 
     <!-- Watchlist pipeline card -->
     <div class="wl-card">
-      <div class="wl-title">ML Watchlist Pipeline</div>
+      <div class="wl-title">ML &#8594; Watchlist Pipeline &mdash; one click</div>
       <div class="wl-sub">
-        <b>Step 1</b>: Run D1 to see fraud transactions <em>not yet</em> in the watchlist (the gap MADlib found).<br>
-        <b>Step 2</b>: Click <strong>Run Refresh</strong> — writes K-Means results to fraud_watchlists.<br>
-        <b>Step 3</b>: Re-run D1 (should now show 0) and run D2 to see all flagged transactions with color coding.
+        One button does everything: it measures the <b>gap</b> (fraud accounts MADlib found that the watchlist hasn't caught — query D1),
+        writes the K-Means results back to <code>fraud_watchlists</code>, then re-runs D1 and D2 so you see the gap close to <b>0</b>,
+        with the new ML accounts highlighted green in D2.
       </div>
       <div class="wl-actions">
-        <button class="btn-wl"  id="btn-wl-refresh" onclick="wlRefresh()">&#9654; Run Refresh</button>
+        <button class="btn-wl"  id="btn-wl-pipeline" onclick="wlPipeline()">&#9654; Run Full Pipeline</button>
+        <button class="btn-rst" id="btn-wl-refresh" onclick="wlRefresh()">Refresh only (advanced)</button>
         <span id="wl-status" style="font-size:13px;color:var(--dim)">Not yet run this session</span>
+      </div>
+      <div class="wl-gap" id="wl-gap" style="display:none">
+        <span>Unprotected fraud accounts:</span>
+        <span class="g bad"  id="wl-gap-before">—</span>
+        <span>&#8594; after pipeline &#8594;</span>
+        <span class="g good" id="wl-gap-after">—</span>
       </div>
       <div class="wl-stats">
         <div class="wsc"><div class="l">Inserted</div><div class="v" id="wl-ins" style="color:var(--accent)">—</div></div>
@@ -901,6 +945,7 @@ function qCards(qs, pi){
       </div>
       <div class="qbody" data-pi="${pi}">
         <div class="qsql">${esc(q.sql)}</div>
+        ${q.expect?`<div class="qexpect"><b>&#127919; What you should see:</b> ${esc(q.expect)}</div>`:''}
         <div class="qactions">
           <button class="rbtn" onclick="runQ('${q.id}')">&#9654; Run</button>
           <button class="rbtn" onclick="copyQ('${q.id}')" style="background:var(--bdim);color:var(--blue);border-color:rgba(59,130,246,.3)">Copy SQL</button>
@@ -982,9 +1027,11 @@ const SCENARIO_HTML = {
 
   2: `<div class="scenario">
     <div class="sc-card full highlight">
-      <div class="sc-title">&#127981; Part C: The AI Factory — pgvector + MADlib in ONE query</div>
-      <div class="sc-body">MADlib finds <strong>behavioural anomalies</strong> (accounts with extreme spend patterns). pgvector finds <strong>semantic matches</strong> (case notes with similar meaning). Join them — and the same fraud types surface from two completely independent signals in a single SQL statement.<br><br>
-      This is the critical limitation of competing platforms: <strong>Snowflake and Databricks cannot do this without exporting data to an external ML tool.</strong> In WarehousePG, both algorithms run where the data lives — no API, no data movement, no token cost until the very last mile.</div>
+      <div class="sc-title">&#128373; Part C: Two detectives, one suspect list</div>
+      <div class="sc-body">
+      <strong>Detective 1 — MADlib</strong>, the numbers detective: looks only at behaviour (6 numeric features). Never reads a word.<br>
+      <strong>Detective 2 — pgvector</strong>, the language detective: reads only the case notes. Never sees a transaction.<br><br>
+      C1 simply <strong>JOINs their suspect lists ON account_id</strong>. If two methods that share <em>no inputs</em> flag the <em>same account</em>, that's high-confidence fraud — and both detectives live inside WarehousePG. On Snowflake/Databricks this needs an export to an external ML tool.</div>
     </div>
     <div class="sc-card">
       <div class="sc-title blue">Token funnel — why this matters for LLM cost</div>
@@ -1026,7 +1073,10 @@ function buildPanels(){
       <div class="sstat"><div class="l">Total Time</div><div class="v" style="color:var(--warn)" id="tms-${pi}">—</div></div>
       <button class="rabtn" id="rabtn-${pi}" onclick="runPanel(${pi})">&#9654; Run All ${qs.length}</button>
     </div>`;
-    h += `<div class="qgrid">${qCards(qs,pi)}</div></div>`;
+    const NEXT = {0:[1,'Next: Step 2 — MADlib &#8594;'],1:[2,'Next: Step 3 — AI Factory &#8594;'],2:[4,'Next: Step 4 — ML &#8594; Watchlist &#8594;']};
+    h += `<div class="qgrid">${qCards(qs,pi)}</div>`;
+    if(NEXT[pi]) h += `<div class="nextbar"><button class="nextbtn" onclick="switchTab(${NEXT[pi][0]})">${NEXT[pi][1]}</button></div>`;
+    h += `</div>`;
     const div = document.createElement('div');
     div.innerHTML = h;
     main.insertBefore(div.firstChild, anchor);
@@ -1034,8 +1084,9 @@ function buildPanels(){
 }
 
 function switchTab(i){
-  document.querySelectorAll('.tab').forEach((t,j)=>t.classList.toggle('on',j===i));
-  document.querySelectorAll('.pnl').forEach((p,j)=>p.classList.toggle('on',j===i));
+  document.querySelectorAll('.tab').forEach(t=>t.classList.toggle('on',t.id==='tabbtn-'+i));
+  document.querySelectorAll('.pnl').forEach((p)=>p.classList.toggle('on',p.id==='pnl-'+i));
+  window.scrollTo({top:0});
 }
 function toggle(id){ document.getElementById('qc-'+id)?.classList.toggle('open'); }
 
@@ -1062,7 +1113,7 @@ async function runQ(id){
 
 async function runPanel(pi){
   const btn=document.getElementById('rabtn-'+pi);
-  btn.disabled=true; btn.textContent='Running…';
+  btn.disabled=true; btn.textContent='Refreshing…';
   for(const q of QUERIES.filter(q=>q.panel===pi)) await runQ(q.id);
   btn.disabled=false; btn.textContent='▶ Run All '+QUERIES.filter(q=>q.panel===pi).length;
 }
@@ -1073,6 +1124,9 @@ function updatePanel(pi){
   const ms=done.reduce((s,q)=>s+(results[q.id]?.ms||0),0);
   document.getElementById('done-'+pi).textContent=done.length;
   document.getElementById('tms-'+pi).textContent=done.length?fmtMs(Math.round(ms)):'—';
+  const tabIdx = pi===3?4:pi;  // panel 3 (D queries) lives in tab 4
+  const btn3=document.getElementById('tabbtn-'+tabIdx);
+  if(btn3) btn3.classList.toggle('done', done.length===qs.length && qs.length>0);
 }
 
 function copyQ(id){ navigator.clipboard.writeText(QUERIES.find(q=>q.id===id).sql+';'); }
@@ -1118,16 +1172,38 @@ function fmtN(n){
   return n.toLocaleString();
 }
 
+async function wlPipeline(){
+  const btn=document.getElementById('btn-wl-pipeline');
+  const gap=document.getElementById('wl-gap');
+  btn.disabled=true; btn.textContent='Running pipeline…';
+  document.getElementById('wl-log').innerHTML='';
+  wlLog('Pipeline step 1/3 — measuring the gap (running D1)…');
+  await runQ('d1');
+  const before=(results['d1']&&results['d1'].rows)||0;
+  document.getElementById('wl-gap-before').textContent=before;
+  document.getElementById('wl-gap-after').textContent='…';
+  gap.style.display='flex';
+  wlLog(`  &#8594; ${before} fraud account rows NOT yet in the watchlist`, before>0?'info':'ok');
+  if(before===0) wlLog('  (gap already 0 — accounts were flagged in a previous run; see the reset box above)','info');
+  wlLog('Pipeline step 2/3 — writing K-Means results to fraud_watchlists…');
+  await wlRefresh();          // refresh + auto re-run of D1 and D2
+  const after=(results['d1']&&results['d1'].rows)||0;
+  document.getElementById('wl-gap-after').textContent=after;
+  wlLog(`Pipeline step 3/3 — verified: gap ${before} \u2192 ${after}`, after===0?'ok':'err');
+  if(after===0) wlLog('Done — every account MADlib discovered is now on the live watchlist. Check the green rows in D2.','ok');
+  btn.disabled=false; btn.textContent='\u25B6 Run Full Pipeline';
+}
+
 async function wlRefresh(){
   const btn=document.getElementById('btn-wl-refresh');
   const st =document.getElementById('wl-status');
-  btn.disabled=true; btn.textContent='Running…';
+  btn.disabled=true; btn.textContent='Refreshing…';
   st.textContent='Refreshing…'; st.style.color='var(--warn)';
   document.getElementById('wl-log').innerHTML='';
   wlLog('Step 1: Expire existing MADlib K-Means flags…');
   try{
     const r=await(await fetch('/api/watchlist/refresh',{method:'POST'})).json();
-    if(!r.ok){ wlLog('ERROR: '+r.error,'err'); st.textContent='Error'; st.style.color='var(--danger)'; btn.disabled=false; btn.textContent='&#9654; Run Refresh'; return; }
+    if(!r.ok){ wlLog('ERROR: '+r.error,'err'); st.textContent='Error'; st.style.color='var(--danger)'; btn.disabled=false; btn.textContent='Refresh only (advanced)'; return; }
     wlLog(`  ✓ Reset ${r.reset} existing flags (${r.reset_ms}ms)`,'ok');
     wlLog('Step 2: INSERT fresh from kmeans_assignments…');
     wlLog(`  ✓ Inserted ${r.inserted} new flags (${r.insert_ms}ms)`,'ok');
@@ -1142,17 +1218,44 @@ async function wlRefresh(){
     wlLog(''); (r.summary||[]).forEach(s=>wlLog(`  ${s.feed_name} / ${s.category}: ${s.active_flags} active`));
     wlLog(''); wlLog('Run D1 — should show 0 unflagged accounts. Run D2 to see all flagged transactions.');
     st.textContent='✓ Complete'; st.style.color='var(--accent)';
-    btn.disabled=false; btn.textContent='&#9654; Run Refresh';
+    btn.disabled=false; btn.textContent='Refresh only (advanced)';
     await runQ('d1');
     await runQ('d2');
   }catch(e){
     wlLog('Network error: '+e.message,'err');
     st.textContent='Error'; st.style.color='var(--danger)';
-    btn.disabled=false; btn.textContent='&#9654; Run Refresh';
+    btn.disabled=false; btn.textContent='Refresh only (advanced)';
   }
 }
 
 
+
+// ── C1 correlation visual ─────────────────────────────────────────────────
+function renderC1(rows){
+  const fmt=v=>(v==null?'—':Number(v).toLocaleString());
+  let h='<div class="c1viz">';
+  rows.forEach(r=>{
+    const ml=Number(r.madlib_accounts)||0, both=Number(r.found_by_both)||0;
+    const pct=Math.max(0,Math.min(100,Number(r.agreement_pct)||0));
+    const ok=both>0;
+    h+=`<div class="c1row">
+      <div class="c1type">${esc(String(r.fraud_type??''))}</div>
+      <div class="c1side madlib"><div class="n">${fmt(r.madlib_accounts)}</div><div class="l">MADlib<br>behaviour</div></div>
+      <div class="c1mid">
+        <div class="c1both" ${ok?'':'style="color:#f59e0b"'}>${ok?'&#10003;':'&#9888;'} ${fmt(both)} found by BOTH</div>
+        <div class="c1bar"><div style="width:${pct}%"></div></div>
+        <div class="c1pct">${ok
+          ? pct+`% of MADlib's suspects confirmed independently by the case notes`
+          : (ml===0
+              ? `MADlib didn't label this cluster in this run — K-Means is unsupervised, labels drift (check B1)`
+              : `no overlap in this run`)}</div>
+      </div>
+      <div class="c1side pgv"><div class="n">${fmt(r.pgvector_accounts)}</div><div class="l">pgvector<br>case notes</div></div>
+    </div>`;
+  });
+  h+='</div><div class="c1read">pgvector casts a wide net (every account with matching notes); the bar measures how many of MADlib\'s precise suspects it independently confirms. Two methods, zero shared inputs — that\'s the trust signal. Raw result below.</div>';
+  return h;
+}
 
 // ── tbl override: support optional row highlight function ─────────────────
 const _tbl_orig=tbl;
@@ -1190,7 +1293,9 @@ async function runQ(id){
       : null;
     document.getElementById('qr-'+id).innerHTML=r.error
       ?`<div style="color:var(--danger);padding:12px;font-family:'Courier New',monospace;font-size:12px">ERROR: ${esc(r.error)}</div>`
-      :tblHL(r.data, hlFn);
+      :(id==='c1' && r.data.length && r.data[0].agreement_pct!==undefined
+          ? renderC1(r.data)+tblHL(r.data,null)
+          : tblHL(r.data, hlFn));
   }catch(e){
     document.getElementById('qr-'+id).innerHTML=`<div style="color:var(--danger);padding:12px">${e.message}</div>`;
   }
@@ -1206,7 +1311,7 @@ buildPanels();
 if __name__ == "__main__":
     print(f"""
 ╔══════════════════════════════════════════════════════════╗
-║  Lab 2 — AI Analytics Dashboard (STREAMLINED)           ║
+║  Lab 2 — AI Analytics Dashboard (GUIDED)              ║
 ║  DB: {DB['host']}:{DB['port']}/{DB['dbname']}
 ║  Queries: {len(QUERIES)} (focused on VALUE demonstration)
 ║  http://0.0.0.0:5002                                    ║
