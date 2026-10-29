@@ -167,7 +167,7 @@ AXIS_OPTIONS = [
     {"label": "Txn count",      "value": "txns"},
     {"label": "Distinct MCCs",  "value": "mccs"},
     {"label": "Distinct merchants", "value": "merchants"},
-    {"label": "Total spend",    "value": "spend"},
+    {"label": "Total amount",    "value": "spend"},
     {"label": "Avg ticket",     "value": "avg_ticket"},
     {"label": "Merchant concentration", "value": "merch_concentration"},
     {"label": "Stddev amount",  "value": "stddev_amount"},
