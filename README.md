@@ -15,7 +15,7 @@ Total: 4 primary segments. No mirrors for high availability.
 ## Prerequisites
 
 - EDB Subscription Token (set as environment variable)
-- Catalog component must be running (MinIO)
+- Catalog component must be running (RustFS)
 - Network: `converged-analytics-network` (created by catalog stack)
 
 ## Quick Start

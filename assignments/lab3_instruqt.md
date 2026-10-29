@@ -1,6 +1,6 @@
 # Lab 3: Lakehouse Federation & Analytics
 
-This lab demonstrates **Lakehouse Federation** by querying **Apache Iceberg** tables stored in MinIO object storage directly from WarehousePG. You'll see how **PGAA DirectScan** enables analytics on external data without ETL, achieving impressive performance for lakehouse queries. Then you'll learn how to materialize hot data into native **WHPG AOCO** tables when maximum performance is needed.
+This lab demonstrates **Lakehouse Federation** by querying **Apache Iceberg** tables stored in RustFS object storage directly from WarehousePG. You'll see how **PGAA DirectScan** enables analytics on external data without ETL, achieving impressive performance for lakehouse queries. Then you'll learn how to materialize hot data into native **WHPG AOCO** tables when maximum performance is needed.
 
 ## ⚠️ DO NOT HIT "Next" button without instructions ! ⚠️
 ---
@@ -34,30 +34,26 @@ Five analytical queries demonstrate lakehouse federation capabilities:
 
 ## Phase 1: Query the Data Lakehouse
 
-### 0. Check Iceberg Catalog ([button label="⚠️MinIO Tab"](tab-0))
+### 0. Check Iceberg Catalog ([button label="⚠️RustFS Tab"](tab-0))
 
 > [!NOTE]
-> Minio credentials
-> * `username`: minioadmin
-> * `password`: minioadmin
+> RustFS credentials
+> * `username`: rustfsadmin
+> * `password`: rustfsadmin
 
-Check Iceberg Data exists in MinIO:
+Check Iceberg Data exists in RustFS:
 
-* Set Alias of MinIO
-```run
-mc alias set local http://minio:9000 minioadmin minioadmin
-```
 * View bucket
 ```run
-mc ls local/
+aws s3 ls
 ```
 * View bucket content
 ```run
-mc ls local/whpg-lakehouse
+aws s3 ls s3://whpg-lakehouse/
 ```
 * Check Iceberg files
 ```run
-mc ls --recursive local/whpg-lakehouse
+aws s3 ls --recursive s3://whpg-lakehouse/
 ```
 
 
@@ -82,15 +78,15 @@ This activates the high-performance FDW and the vectorized **DirectScan** execut
 
 ### 2. PGFS Storage Location ([button label="⚠️WarehousePG Tab"](tab-1))
 
-#### STEP 1: Create the connection to MinIO
-First, we define where the Iceberg data lives. The **Postgres File System (PGFS)** handles the low-level connectivity to S3-compatible storage like MinIO.
+#### STEP 1: Create the connection to RustFS
+First, we define where the Iceberg data lives. The **Postgres File System (PGFS)** handles the low-level connectivity to S3-compatible storage like RustFS.
 
 ```run
 SELECT pgfs.create_storage_location(
-    name        => 'minio_iceberg',
+    name        => 'rustfs_iceberg',
     url         => 's3://whpg-lakehouse/iceberg',
-    options     => '{"endpoint": "http://minio:9000", "allow_http": "true"}',
-    credentials => '{"access_key_id": "minioadmin", "secret_access_key": "minioadmin"}'
+    options     => '{"endpoint": "http://rustfs:9000", "allow_http": "true"}',
+    credentials => '{"access_key_id": "rustfsadmin", "secret_access_key": "rustfsadmin"}'
 );
 ```
 * Verify the location
@@ -100,18 +96,18 @@ SELECT * FROM pgfs.list_storage_locations();
 > [!NOTE]
 > Clean up existing location if necessary.
 >
-> `SELECT pgfs.delete_storage_location('minio_iceberg');`
+> `SELECT pgfs.delete_storage_location('rustfs_iceberg');`
 
 #### STEP 2: Create PGAA Iceberg Tables
 Now, we create foreign tables using the **PGAA** access method. Note that we don't need to define columns manually; PGAA infers the schema directly from the Iceberg metadata.
 
-**This is where the magic happens** - these tables point to data in MinIO, not in the database!
+**This is where the magic happens** - these tables point to data in RustFS, not in the database!
 
 ```run
 DROP TABLE IF EXISTS customers_iceberg;
 CREATE TABLE customers_iceberg ()
 USING PGAA WITH (
-    pgaa.storage_location = 'minio_iceberg',
+    pgaa.storage_location = 'rustfs_iceberg',
     pgaa.path             = 'analytics/customers',
     pgaa.format           = 'iceberg'
 );
@@ -119,7 +115,7 @@ USING PGAA WITH (
 DROP TABLE IF EXISTS products_iceberg;
 CREATE TABLE products_iceberg ()
 USING PGAA WITH (
-    pgaa.storage_location = 'minio_iceberg',
+    pgaa.storage_location = 'rustfs_iceberg',
     pgaa.path             = 'analytics/products',
     pgaa.format           = 'iceberg'
 );
@@ -127,7 +123,7 @@ USING PGAA WITH (
 DROP TABLE IF EXISTS orders_iceberg;
 CREATE TABLE orders_iceberg ()
 USING PGAA WITH (
-    pgaa.storage_location = 'minio_iceberg',
+    pgaa.storage_location = 'rustfs_iceberg',
     pgaa.path             = 'analytics/orders',
     pgaa.format           = 'iceberg'
 );
@@ -135,7 +131,7 @@ USING PGAA WITH (
 DROP TABLE IF EXISTS order_items_iceberg;
 CREATE TABLE order_items_iceberg ()
 USING PGAA WITH (
-    pgaa.storage_location = 'minio_iceberg',
+    pgaa.storage_location = 'rustfs_iceberg',
     pgaa.path             = 'analytics/order_items',
     pgaa.format           = 'iceberg'
 );
@@ -143,7 +139,7 @@ USING PGAA WITH (
 DROP TABLE IF EXISTS events_iceberg;
 CREATE TABLE events_iceberg ()
 USING PGAA WITH (
-    pgaa.storage_location = 'minio_iceberg',
+    pgaa.storage_location = 'rustfs_iceberg',
     pgaa.path             = 'analytics/events',
     pgaa.format           = 'iceberg'
 );
@@ -160,7 +156,7 @@ UNION ALL SELECT 'events_iceberg',      COUNT(*) FROM events_iceberg
 ORDER BY 2 DESC;
 ```
 
-> **Key Point:** You just counted millions of rows stored in MinIO object storage - no data was loaded into the database!
+> **Key Point:** You just counted millions of rows stored in RustFS object storage - no data was loaded into the database!
 
 ---
 
@@ -181,7 +177,7 @@ Now let's see these queries in action!
    - Click the **"Run All Queries"** button in the "Performance Results" tab
 
 4. **What to Observe:**
-   - **These queries run directly on data in MinIO** (no ETL!)
+   - **These queries run directly on data in RustFS** (no ETL!)
    - DirectScan appears in EXPLAIN plans (vectorized execution)
    - Performance is impressive for external data:
      - Simple queries: sub-second

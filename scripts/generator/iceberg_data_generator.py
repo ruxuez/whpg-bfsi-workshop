@@ -5,7 +5,7 @@ Lab 2: Iceberg Data Generator for WHPG/PGAA Workshop
 ═══════════════════════════════════════════════════════════════════════════════
 
 Generates an e-commerce dataset (customers, products, orders, order_items,
-events) and writes to Apache Iceberg tables on a local MinIO instance.
+events) and writes to Apache Iceberg tables on a local RustFS instance.
 
 This data is used alongside the native WHPG network analytics tables
 to demonstrate federated queries across both storage tiers.
@@ -13,24 +13,23 @@ to demonstrate federated queries across both storage tiers.
 Prerequisites:
     pip install "pyiceberg[s3fs]" pyarrow --break-system-packages
 
-MinIO setup:
-    docker run -d --name minio -p 9000:9000 -p 9001:9001 \
-      -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin \
-      -v /data/minio:/data \
-      minio/minio server /data --console-address ":9001"
+RustFS setup:
+    docker run -d --name rustfs -p 9000:9000 -p 9001:9001 \
+      -e RUSTFS_ACCESS_KEY=rustfsadmin -e RUSTFS_SECRET_KEY=rustfsadmin \
+      -v /data/rustfs:/data \
+      rustfs/rustfs:latest /data
 
-    mc alias set local http://localhost:9000 minioadmin minioadmin
-    mc mb local/whpg-lakehouse
+    aws --endpoint-url http://localhost:9000 s3 mb s3://whpg-lakehouse
 
 Usage:
     python3 iceberg_data_generator.py
     python3 iceberg_data_generator.py --scale 10    # 10x data (10K customers, 50K orders...)
 
 Environment variables (all optional, defaults shown):
-    MINIO_ENDPOINT=http://minio:9000
-    MINIO_ACCESS_KEY=minioadmin
-    MINIO_SECRET_KEY=minioadmin
-    MINIO_BUCKET=whpg-lakehouse
+    S3_ENDPOINT=http://rustfs:9000
+    S3_ACCESS_KEY=rustfsadmin
+    S3_SECRET_KEY=rustfsadmin
+    S3_BUCKET=whpg-lakehouse
     CATALOG_DB=/home/gpadmin/iceberg_catalog.db
 """
 
@@ -56,13 +55,13 @@ from pyiceberg.transforms import DayTransform
 # CONFIGURATION — override via environment variables
 # ═════════════════════════════════════════════════════════════════════════════
 
-MINIO_ENDPOINT = os.environ.get("MINIO_ENDPOINT", "http://minio:9000")
-MINIO_ACCESS   = os.environ.get("MINIO_ACCESS_KEY", "minioadmin")
-MINIO_SECRET   = os.environ.get("MINIO_SECRET_KEY", "minioadmin")
-MINIO_BUCKET   = os.environ.get("MINIO_BUCKET", "whpg-lakehouse")
+S3_ENDPOINT = os.environ.get("S3_ENDPOINT", "http://rustfs:9000")
+S3_ACCESS   = os.environ.get("S3_ACCESS_KEY", "rustfsadmin")
+S3_SECRET   = os.environ.get("S3_SECRET_KEY", "rustfsadmin")
+S3_BUCKET   = os.environ.get("S3_BUCKET", "whpg-lakehouse")
 CATALOG_DB     = os.environ.get("CATALOG_DB", "/home/gpadmin/iceberg_catalog.db")
 
-WAREHOUSE = f"s3://{MINIO_BUCKET}/iceberg"
+WAREHOUSE = f"s3://{S3_BUCKET}/iceberg"
 NAMESPACE = "analytics"
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -186,9 +185,9 @@ def get_catalog():
         uri=f"sqlite:///{CATALOG_DB}",
         warehouse=WAREHOUSE,
         **{
-            "s3.endpoint":          MINIO_ENDPOINT,
-            "s3.access-key-id":     MINIO_ACCESS,
-            "s3.secret-access-key": MINIO_SECRET,
+            "s3.endpoint":          S3_ENDPOINT,
+            "s3.access-key-id":     S3_ACCESS,
+            "s3.secret-access-key": S3_SECRET,
             "s3.path-style-access": "true",
             "s3.region":            "us-east-1",
         },
@@ -356,30 +355,30 @@ def generate_events(n, num_customers, num_products):
 
 def generate_pgaa_sql(table_locations):
     return f"""-- ═══════════════════════════════════════════════════════════════════════════════
--- PGAA Foreign Tables for Iceberg Data on MinIO
+-- PGAA Foreign Tables for Iceberg Data on RustFS
 -- Generated: {datetime.now().isoformat()}
 -- ═══════════════════════════════════════════════════════════════════════════════
 
 -- 1. Create extension
 CREATE EXTENSION IF NOT EXISTS pgaa;
 
--- 2. Create server for MinIO/Iceberg
-DROP SERVER IF EXISTS iceberg_minio CASCADE;
+-- 2. Create server for RustFS/Iceberg
+DROP SERVER IF EXISTS iceberg_rustfs CASCADE;
 
-CREATE SERVER iceberg_minio
+CREATE SERVER iceberg_rustfs
     FOREIGN DATA WRAPPER pgaa_fdw
     OPTIONS (
         format 'iceberg',
-        endpoint '{MINIO_ENDPOINT}',
+        endpoint '{S3_ENDPOINT}',
         path_style_access 'true'
     );
 
 -- 3. Create user mapping
 CREATE USER MAPPING FOR gpadmin
-    SERVER iceberg_minio
+    SERVER iceberg_rustfs
     OPTIONS (
-        access_key_id '{MINIO_ACCESS}',
-        secret_access_key '{MINIO_SECRET}'
+        access_key_id '{S3_ACCESS}',
+        secret_access_key '{S3_SECRET}'
     );
 
 -- ═══════════════════════════════════════════════════════════════════════════════
@@ -391,33 +390,33 @@ CREATE FOREIGN TABLE customers_iceberg (
     customer_id BIGINT, email TEXT, first_name TEXT, last_name TEXT,
     country TEXT, city TEXT, signup_date DATE, is_active BOOLEAN,
     lifetime_value NUMERIC(38,2)
-) SERVER iceberg_minio OPTIONS (table_location '{table_locations["customers"]}');
+) SERVER iceberg_rustfs OPTIONS (table_location '{table_locations["customers"]}');
 
 DROP FOREIGN TABLE IF EXISTS products_iceberg;
 CREATE FOREIGN TABLE products_iceberg (
     product_id BIGINT, sku TEXT, name TEXT, category TEXT, subcategory TEXT,
     price NUMERIC(38,2), cost NUMERIC(38,2), stock_quantity BIGINT, is_available BOOLEAN
-) SERVER iceberg_minio OPTIONS (table_location '{table_locations["products"]}');
+) SERVER iceberg_rustfs OPTIONS (table_location '{table_locations["products"]}');
 
 DROP FOREIGN TABLE IF EXISTS orders_iceberg;
 CREATE FOREIGN TABLE orders_iceberg (
     order_id BIGINT, customer_id BIGINT, order_date DATE,
     order_timestamp TIMESTAMP, status TEXT, shipping_country TEXT,
     shipping_city TEXT, total_amount NUMERIC(38,2), discount_amount NUMERIC(38,2)
-) SERVER iceberg_minio OPTIONS (table_location '{table_locations["orders"]}');
+) SERVER iceberg_rustfs OPTIONS (table_location '{table_locations["orders"]}');
 
 DROP FOREIGN TABLE IF EXISTS order_items_iceberg;
 CREATE FOREIGN TABLE order_items_iceberg (
     item_id BIGINT, order_id BIGINT, product_id BIGINT,
     quantity BIGINT, unit_price NUMERIC(38,2), line_total NUMERIC(38,2)
-) SERVER iceberg_minio OPTIONS (table_location '{table_locations["order_items"]}');
+) SERVER iceberg_rustfs OPTIONS (table_location '{table_locations["order_items"]}');
 
 DROP FOREIGN TABLE IF EXISTS events_iceberg;
 CREATE FOREIGN TABLE events_iceberg (
     event_id BIGINT, event_timestamp TIMESTAMP, event_date DATE,
     customer_id BIGINT, event_type TEXT, page_url TEXT,
     product_id BIGINT, session_id TEXT, device_type TEXT, country TEXT
-) SERVER iceberg_minio OPTIONS (table_location '{table_locations["events"]}');
+) SERVER iceberg_rustfs OPTIONS (table_location '{table_locations["events"]}');
 
 -- ═══════════════════════════════════════════════════════════════════════════════
 -- Also create native copies for performance comparison (Lab 2 demo)
@@ -462,7 +461,7 @@ ORDER BY 2 DESC;
 # ═════════════════════════════════════════════════════════════════════════════
 
 def main():
-    parser = argparse.ArgumentParser(description="Generate Iceberg e-commerce data on MinIO")
+    parser = argparse.ArgumentParser(description="Generate Iceberg e-commerce data on RustFS")
     parser.add_argument("--scale", type=int, default=300,
                         help="Scale factor (300=default, 10=10x rows)")
     args = parser.parse_args()
@@ -480,7 +479,7 @@ def main():
     print("=" * 70)
     print("  Iceberg Data Generator — E-Commerce Dataset")
     print("=" * 70)
-    print(f"  MinIO:     {MINIO_ENDPOINT}/{MINIO_BUCKET}")
+    print(f"  RustFS:     {S3_ENDPOINT}/{S3_BUCKET}")
     print(f"  Warehouse: {WAREHOUSE}")
     print(f"  Catalog:   sqlite:///{CATALOG_DB}")
     print(f"  Scale:     {s}x  →  {total:,} total rows")
@@ -489,7 +488,7 @@ def main():
     print("=" * 70)
 
     # Connect
-    print("\n[1/4] Connecting to Iceberg catalog on MinIO...")
+    print("\n[1/4] Connecting to Iceberg catalog on RustFS...")
     catalog = get_catalog()
     ensure_namespace(catalog)
     print(f"  ✓ Ready")
@@ -570,7 +569,7 @@ def main():
     print(f"""
 ╔══════════════════════════════════════════════════════════════════╗
 ║  Done!                                                           ║
-║  Tables:       5 Optimized Iceberg tables on MinIO               ║
+║  Tables:       5 Optimized Iceberg tables on RustFS             ║
 ║  Total rows:   {total:>10,}                                       ║
 ║  Time:         {total_time:>6.1f}s                                          ║
 ║                                                                  ║

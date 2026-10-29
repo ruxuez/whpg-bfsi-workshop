@@ -1,12 +1,12 @@
 -- ═══════════════════════════════════════════════════════════════════════════════
--- Lab 2: PGAA Iceberg Tables on MinIO + Native WHPG Comparison (BFSI analytics)
+-- Lab 2: PGAA Iceberg Tables on RustFS + Native WHPG Comparison (BFSI analytics)
 -- ═══════════════════════════════════════════════════════════════════════════════
 -- Demonstrates EDB WarehousePG reading open-format Iceberg data in place (PGAA over
--- pgfs/MinIO), then materialising it into native AO-columnar tables for MPP speed.
+-- pgfs/RustFS), then materialising it into native AO-columnar tables for MPP speed.
 -- The dataset is a banking analytics mart that complements the fraud/AML model:
 --   customers · card_products · txn_archive · txn_lines · digital_events
 --
--- Run AFTER the companion data generator has populated MinIO. The generator must
+-- Run AFTER the companion data generator has populated RustFS. The generator must
 -- emit Iceberg datasets at the paths below with the column order shown in STEP 3
 -- (PGAA infers the Iceberg schema; the native INSERT ... SELECT * is positional).
 --
@@ -17,13 +17,13 @@
 -- ║  STEP 1: PGFS Storage Location                                             ║
 -- ╚══════════════════════════════════════════════════════════════════════════════╝
 
-SELECT pgfs.delete_storage_location('minio_iceberg');
+SELECT pgfs.delete_storage_location('rustfs_iceberg');
 
 SELECT pgfs.create_storage_location(
-    name        => 'minio_iceberg',
+    name        => 'rustfs_iceberg',
     url         => 's3://warehouse/iceberg',
-    options     => '{"endpoint": "http://minio:9000", "allow_http": "true"}',
-    credentials => '{"access_key_id": "minioadmin", "secret_access_key": "minioadmin"}'
+    options     => '{"endpoint": "http://rustfs:9000", "allow_http": "true"}',
+    credentials => '{"access_key_id": "rustfsadmin", "secret_access_key": "rustfsadmin"}'
 );
 
 SELECT * FROM pgfs.list_storage_locations();
@@ -36,7 +36,7 @@ SELECT * FROM pgfs.list_storage_locations();
 DROP TABLE IF EXISTS customers_iceberg;
 CREATE TABLE customers_iceberg ()
 USING PGAA WITH (
-    pgaa.storage_location = 'minio_iceberg',
+    pgaa.storage_location = 'rustfs_iceberg',
     pgaa.path             = 'analytics/customers',
     pgaa.format           = 'iceberg'
 );
@@ -44,7 +44,7 @@ USING PGAA WITH (
 DROP TABLE IF EXISTS card_products_iceberg;
 CREATE TABLE card_products_iceberg ()
 USING PGAA WITH (
-    pgaa.storage_location = 'minio_iceberg',
+    pgaa.storage_location = 'rustfs_iceberg',
     pgaa.path             = 'analytics/card_products',
     pgaa.format           = 'iceberg'
 );
@@ -52,7 +52,7 @@ USING PGAA WITH (
 DROP TABLE IF EXISTS txn_archive_iceberg;
 CREATE TABLE txn_archive_iceberg ()
 USING PGAA WITH (
-    pgaa.storage_location = 'minio_iceberg',
+    pgaa.storage_location = 'rustfs_iceberg',
     pgaa.path             = 'analytics/txn_archive',
     pgaa.format           = 'iceberg'
 );
@@ -60,7 +60,7 @@ USING PGAA WITH (
 DROP TABLE IF EXISTS txn_lines_iceberg;
 CREATE TABLE txn_lines_iceberg ()
 USING PGAA WITH (
-    pgaa.storage_location = 'minio_iceberg',
+    pgaa.storage_location = 'rustfs_iceberg',
     pgaa.path             = 'analytics/txn_lines',
     pgaa.format           = 'iceberg'
 );
@@ -68,7 +68,7 @@ USING PGAA WITH (
 DROP TABLE IF EXISTS digital_events_iceberg;
 CREATE TABLE digital_events_iceberg ()
 USING PGAA WITH (
-    pgaa.storage_location = 'minio_iceberg',
+    pgaa.storage_location = 'rustfs_iceberg',
     pgaa.path             = 'analytics/digital_events',
     pgaa.format           = 'iceberg'
 );

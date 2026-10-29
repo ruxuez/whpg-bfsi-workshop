@@ -1,45 +1,51 @@
 services:
-  # ─── MinIO (S3-compatible store for Apache Iceberg / PGAA) ───────────────────
-  minio:
-    image: minio/minio:latest
-    container_name: minio
-    command: server /data --console-address ":9001"
+  # ─── RustFS (S3-compatible store for Apache Iceberg / PGAA) ──────────────────
+  rustfs:
+    image: rustfs/rustfs:latest
+    container_name: rustfs
+    hostname: rustfs
+    command: /data
     environment:
-      MINIO_ROOT_USER: minioadmin
-      MINIO_ROOT_PASSWORD: minioadmin
+      RUSTFS_ACCESS_KEY: rustfsadmin
+      RUSTFS_SECRET_KEY: rustfsadmin
+      RUSTFS_ADDRESS: ":9000"
+      RUSTFS_CONSOLE_ADDRESS: ":9001"
+      RUSTFS_CONSOLE_ENABLE: "true"
+      RUSTFS_CONSOLE_CORS_ALLOWED_ORIGINS: "*"
     ports:
       - "9000:9000"
       - "9001:9001"
     volumes:
-      - minio-data:/data
+      - rustfs-data:/data
     networks:
       - converged-analytics-network
     healthcheck:
-      test: ["CMD", "mc", "ready", "local"]
+      test: ["CMD-SHELL", "curl -s -o /dev/null http://localhost:9000/ || exit 1"]
       interval: 5s
       timeout: 5s
-      retries: 5
+      retries: 10
 
 
-  # ─── MinIO bucket initialisation (one-shot) ───────────────────────────────────
-  createbuckets:
-    image: minio/mc:latest
-    container_name: minio-createbuckets
-    restart: "no"
+  # ─── S3 client: creates the bucket, then stays up for `docker exec s3cli aws s3 ...`
+  s3cli:
+    image: amazon/aws-cli:latest
+    container_name: s3cli
     depends_on:
-      minio:
+      rustfs:
         condition: service_healthy
     networks:
       - converged-analytics-network
+    environment:
+      AWS_ACCESS_KEY_ID: rustfsadmin
+      AWS_SECRET_ACCESS_KEY: rustfsadmin
+      AWS_DEFAULT_REGION: us-east-1
+      AWS_ENDPOINT_URL: http://rustfs:9000
     entrypoint: ["/bin/sh", "-c"]
     command:
       - |
-        set -e
-        mc alias set local http://minio:9000 minioadmin minioadmin
-        echo "MinIO is ready, creating bucket..."
-        mc mb local/whpg-lakehouse --ignore-existing
-        echo "Bucket created successfully"
-        exit 0
+        aws s3api head-bucket --bucket whpg-lakehouse 2>/dev/null || aws s3 mb s3://whpg-lakehouse
+        echo "Bucket whpg-lakehouse ready"
+        exec sleep infinity
 
 # ─── WHPG Cluster: 1 Coordinator + 2 Segments ───────────────────────────────────
   whpg_cdw:
@@ -132,7 +138,7 @@ volumes:
   sdw1_primary2:
   sdw2_primary1:  
   sdw2_primary2:
-  minio-data:   # /data   — MinIO object storage
+  rustfs-data:  # /data   — RustFS object storage
 
 networks:
   converged-analytics-network:

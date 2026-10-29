@@ -17,10 +17,10 @@ schema and persona seed.
 | File | Type | Lab | Purpose |
 |------|------|-----|---------|
 | `app1.py` | Flask dashboard | Lab 1 | JSONB (ISO 20022) + `int8range` operators on card transactions |
-| `app2.py` | Flask dashboard | Lab 2 | PGAA lakehouse — Iceberg-on-MinIO vs native AOCO |
+| `app2.py` | Flask dashboard | Lab 2 | PGAA lakehouse — Iceberg-on-RustFS vs native AOCO |
 | `app3.py` | Flask dashboard | Lab 3 | pgvector semantic search + MADlib clustering ("AI Factory") |
 | `dashboard.py` | Dash / Plotly | Lab 3 | K-Means fraud-cluster explorer (scatter / radar / heatmap) |
-| `iceberg_data_generator.py` | Generator | Lab 2 | Writes the 5 BFSI lakehouse tables to Iceberg on MinIO |
+| `iceberg_data_generator.py` | Generator | Lab 2 | Writes the 5 BFSI lakehouse tables to Iceberg on RustFS |
 | `data_generator_personas.py` | Generator | Lab 3 | Tight persona `transactions` + `case_narratives` for clustering |
 | `03_load_external_bfsi.sql` | Loader | all | gpfdist external tables + INSERT for the CSV path |
 
@@ -139,10 +139,10 @@ CSVs are headerless and follow `01_schema` column order (minus each serial PK).
 `transactions.iso_msg` is emitted as quoted JSON and loads straight into the `jsonb`
 column. **Scale:** `--scale 1.0` ≈ 50M rows total (the workshop default); `2.0` ≈ 100M; `0.1` ≈ 5M for a quick test. The generators need only the Python standard library.
 
-### Option C — Lab 2 lakehouse (Iceberg on MinIO, required for app2)
+### Option C — Lab 2 lakehouse (Iceberg on RustFS, required for app2)
 ```bash
-# start MinIO, then:
-python3 generators/iceberg_data_generator.py --scale 10     # writes analytics.{5 tables} to MinIO
+# start RustFS, then:
+python3 generators/iceberg_data_generator.py --scale 10     # writes analytics.{5 tables} to RustFS
 psql -f 05_pgaa_tables.sql                        # PGAA in-place + native AOCO copies
 python3 apps/app2.py --port 5000
 ```
@@ -154,7 +154,7 @@ python3 apps/app2.py --port 5000
 | App | How validated |
 |-----|---------------|
 | app1 | All 6 queries run live against `bfsi_demo`; every panel returns rows |
-| app2 | 5 queries + challenge EXPLAIN-validated on `bfsi_analytics` (needs MinIO to run live) |
+| app2 | 5 queries + challenge EXPLAIN-validated on `bfsi_analytics` (needs RustFS to run live) |
 | app3 | All 5 queries run live; persona labels resolve correctly; C1 correlates clusters with semantic notes |
 | dashboard.py | Both queries run live; clusters separate cleanly into STRUCTURING / CARD-TESTING / BUST-OUT |
 | `data_generator_updated.py` | All 6 CSVs COPY-load; `iso_msg` parses as JSONB; watchlist join hits all 3 persona BINs |
@@ -171,7 +171,7 @@ python3 apps/app2.py --port 5000
 - **Empty result sets** — the seeds are time-relative (`now() - 28 days`). If data was
   loaded long ago, re-run `03_seed_traffic_with_personas.sql` (or the CSV path) so the
   rolling window still contains rows.
-- **app2 errors on Iceberg queries** — Lab 2 needs MinIO + `iceberg_data_generator.py`
+- **app2 errors on Iceberg queries** — Lab 2 needs RustFS + `iceberg_data_generator.py`
   + `05_pgaa_tables.sql` first; the native-only side works once `bfsi_analytics` exists.
 - **app3 Part A returns little** — load `08_add_diverse_narratives.sql` (or run
   `data_generator_personas.py`) so `case_embeddings` has the curated semantic notes.

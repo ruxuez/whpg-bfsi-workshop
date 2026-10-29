@@ -125,7 +125,7 @@ CHECK_QUESTIONS = [
     {
         'kind': 'concept',
         'title': 'How does WHPG query Iceberg data without loading it into the database first?',
-        'ask': "You just ran SQL directly against Iceberg tables stored in MinIO object storage. "
+        'ask': "You just ran SQL directly against Iceberg tables stored in RustFS object storage. "
                "What technology lets WHPG read external lakehouse data as if it were native tables?",
         'listen': "PGAA (Postgres AI & Analytics) exposes Iceberg tables as External tables and leverage separate analytics engine to query Data. "
                   "The DirectScan vectorized engine reads Parquet files directly from object storage, pushing down predicates and projections. "
@@ -161,7 +161,7 @@ ORDER  BY revenue DESC
 LIMIT  5''',
     'solution': 'p.product_id = oi.product_id',
     'why_it_matters': "products and order_items share product_id as the natural join key. "
-                      "This query runs directly on Iceberg data in object storage (MinIO) - no ETL, no data copying. "
+                      "This query runs directly on Iceberg data in object storage (RustFS) - no ETL, no data copying. "
                       "PGAA's DirectScan handles the JOIN across Parquet files with vectorized execution, demonstrating "
                       "that you can run complex analytics on your data lakehouse without moving data into the warehouse.",
 }
@@ -475,7 +475,7 @@ tr:last-child td{border-bottom:none}
 <div class="page">
 
   <div class="pane on" id="pane-0">
-    <p class="lead">Five analytics queries running directly on <strong>Iceberg tables stored in MinIO object storage</strong>.
+    <p class="lead">Five analytics queries running directly on <strong>Iceberg tables stored in RustFS object storage</strong>.
        No ETL, no data loading - just pure SQL against your data lakehouse. Click <strong>Run</strong> to execute
        and see the results. Notice the query times - <strong>this is impressive for external data!</strong></p>
     <div class="qgrid" id="qgrid"></div>
@@ -483,7 +483,7 @@ tr:last-child td{border-bottom:none}
 
   <div class="pane" id="pane-1">
     <p class="lead">Hit <strong>Run All</strong> to execute all five queries on the Iceberg lakehouse data concurrently.
-       Watch the execution times - these queries are running on data stored in object storage (MinIO), not in the database.
+       Watch the execution times - these queries are running on data stored in object storage (RustFS), not in the database.
        <strong>Sub-second to few-second response times on external data = lakehouse federation working.</strong></p>
     <div class="run-bar">
       <button class="run-btn" id="run-all-btn" onclick="runAll()">Run All Queries</button>
@@ -492,7 +492,7 @@ tr:last-child td{border-bottom:none}
     <div class="totals" id="totals" style="display:none">
       <div class="tot ice"><span class="tot-l">Total Wall Time</span><span class="tot-v" id="tot-wall">-</span></div>
       <div class="tot"><span class="tot-l">Queries Run</span><span class="tot-v" id="tot-count" style="color:var(--teal-d)">-</span></div>
-      <div class="tot"><span class="tot-l">Data Source</span><span class="tot-v" id="tot-src" style="color:var(--txs);font-size:14px">MinIO/S3</span></div>
+      <div class="tot"><span class="tot-l">Data Source</span><span class="tot-v" id="tot-src" style="color:var(--txs);font-size:14px">RustFS/S3</span></div>
     </div>
     <div class="bars" id="bars"><div class="empty">Run the queries to see performance metrics.</div></div>
   </div>
@@ -577,7 +577,7 @@ function buildQueryCards() {
       '</div>' +
       '<div class="qbody">' +
         '<div style="margin-bottom:14px">' +
-          '<div class="qsql-lbl" style="margin-bottom:6px"><span class="cd ice"></span>Iceberg Query &mdash; runs directly on MinIO object storage</div>' +
+          '<div class="qsql-lbl" style="margin-bottom:6px"><span class="cd ice"></span>Iceberg Query &mdash; runs directly on RustFS object storage</div>' +
           '<div class="qsql">' + esc(q.sql) + '</div>' +
         '</div>' +
         '<div id="qr-' + qid + '"><div class="empty">Click Run to execute this query.</div></div>' +
@@ -821,7 +821,7 @@ if __name__ == '__main__':
 +-----------------------------------------------------+
 |  PGAA Lab 3 Dashboard - Lakehouse Analytics        |
 |  DB:     {DB_CONFIG['host']}:{DB_CONFIG['port']}/{DB_CONFIG['database']}
-|  Tables: *_iceberg (Iceberg tables on MinIO)
+|  Tables: *_iceberg (Iceberg tables on RustFS)
 |  Listen: http://{args.host}:{args.port}
 +-----------------------------------------------------+
 """)
