@@ -16,11 +16,11 @@ SET search_path TO bfsi_demo, public;
 -- ╔════════════════════════════════════════════════════════════════════════════╗
 -- ║ LAB 1 · PART A — ISO 20022 PAYMENT MESSAGES IN JSONB  (THE HERO)         ║
 -- ║ The competitor angle: Snowflake/Databricks store messages as VARIANT but  ║
--- ║ cannot GIN-index arbitrary containment — you flatten or full-scan. WHPG    ║
--- ║ indexes the raw message and answers containment in one operator.           ║
+-- ║ query nested messages natively — you flatten them first. WHPG stores the   ║
+-- ║ raw message as JSONB and answers containment in one operator, in parallel. ║
 -- ╚════════════════════════════════════════════════════════════════════════════╝
 
--- ─── 1A: SEPA Instant payments — JSONB containment (GIN-accelerated) ────────
+-- ─── 1A: SEPA Instant payments — JSONB containment (native JSONB) ────────
 -- ⚡ ONE operator (@>) vs flattening every nested field on a columnar warehouse
 -- "Show me every SEPA Instant payment we settled today"
 SELECT
