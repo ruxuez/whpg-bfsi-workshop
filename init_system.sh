@@ -65,7 +65,7 @@ done
 for host in sdw1 sdw2; do
   ssh -o StrictHostKeyChecking=no "$host" bash -c '"
     for f in /data1/primary/gpseg*/pg_hba.conf /data2/primary/gpseg*/pg_hba.conf\
-             /data1/mirror/gpseg*/pg_hba.conf; do
+             /data1/mirror/gpseg*/pg_hba.conf /data2/mirror/gpseg*/pg_hba.conf; do
       [ -f \"\$f\" ] && echo \"host all all 0.0.0.0/0 trust\" >> \"\$f\"
     done
   "' || echo "WARNING: Could not update pg_hba on $host"

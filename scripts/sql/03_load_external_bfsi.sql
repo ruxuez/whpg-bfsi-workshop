@@ -16,10 +16,15 @@
 
 SET search_path TO bfsi_demo, public;
 
+-- Show elapsed time for every statement: each table's INSERT prints
+-- "INSERT 0 <rows loaded>" followed by "Time: <ms>".
+\timing on
+
 -- Note: gpfdist must be running on the cdw container at port 8081
 -- Start with: docker exec -d cdw gpfdist -d /data/csv -p 8081
 
 -- ── transactions ────────────────────────────────────────────────────────────
+\echo '>>> Loading transactions ...'
 DROP EXTERNAL TABLE IF EXISTS ext_transactions;
 CREATE READABLE EXTERNAL TABLE ext_transactions (
     ts TIMESTAMP, account_id BIGINT, card_bin BIGINT, pan_last4 CHAR(4),
@@ -40,6 +45,7 @@ SELECT ts, account_id, card_bin, pan_last4, amount, currency, mcc, merchant_id,
 FROM ext_transactions;
 
 -- ── device_events ───────────────────────────────────────────────────────────
+\echo '>>> Loading device_events ...'
 DROP EXTERNAL TABLE IF EXISTS ext_device_events;
 CREATE READABLE EXTERNAL TABLE ext_device_events (
     ts TIMESTAMP, account_id BIGINT, device_fingerprint VARCHAR(64),
@@ -54,6 +60,7 @@ SELECT ts, account_id, device_fingerprint, ip_country, channel, event_type, resu
 FROM ext_device_events;
 
 -- ── auth_decisions ──────────────────────────────────────────────────────────
+\echo '>>> Loading auth_decisions ...'
 DROP EXTERNAL TABLE IF EXISTS ext_auth_decisions;
 CREATE READABLE EXTERNAL TABLE ext_auth_decisions (
     ts TIMESTAMP, account_id BIGINT, card_bin BIGINT, mcc INT,
@@ -68,6 +75,7 @@ SELECT ts, account_id, card_bin, mcc, amount, decision, rule_id, channel, mercha
 FROM ext_auth_decisions;
 
 -- ── case_narratives ─────────────────────────────────────────────────────────
+\echo '>>> Loading case_narratives ...'
 DROP EXTERNAL TABLE IF EXISTS ext_case_narratives;
 CREATE READABLE EXTERNAL TABLE ext_case_narratives (
     ts TIMESTAMP, account_id BIGINT, card_bin BIGINT, analyst VARCHAR(40),
@@ -81,6 +89,7 @@ SELECT ts, account_id, card_bin, analyst, queue, severity, narrative, region_id
 FROM ext_case_narratives;
 
 -- ── wire_events ─────────────────────────────────────────────────────────────
+\echo '>>> Loading wire_events ...'
 DROP EXTERNAL TABLE IF EXISTS ext_wire_events;
 CREATE READABLE EXTERNAL TABLE ext_wire_events (
     ts TIMESTAMP, ordering_account BIGINT, beneficiary_bic VARCHAR(16),
@@ -95,6 +104,7 @@ SELECT ts, ordering_account, beneficiary_bic, beneficiary_country, event_type, r
 FROM ext_wire_events;
 
 -- ── account_kpis ────────────────────────────────────────────────────────────
+\echo '>>> Loading account_kpis ...'
 DROP EXTERNAL TABLE IF EXISTS ext_account_kpis;
 CREATE READABLE EXTERNAL TABLE ext_account_kpis (
     ts TIMESTAMP, customer_id INT, region_id INT, txn_velocity NUMERIC(10,1),

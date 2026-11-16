@@ -18,6 +18,7 @@ chown -R gpadmin:gpadmin /usr/local/greenplum-db \
 if [ "$(hostname)" = "cdw" ]; then
   chown -R gpadmin:gpadmin /data
 else
+  mkdir -p /data1/mirror /data2/mirror
   chown -R gpadmin:gpadmin /data1
   chown -R gpadmin:gpadmin /data2
 fi

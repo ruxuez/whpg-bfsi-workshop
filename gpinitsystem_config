@@ -49,13 +49,13 @@ ENCODING=UNICODE
 
 #### Base number by which mirror segment port numbers
 #### are calculated.
-#### MIRROR_PORT_BASE=7000
+MIRROR_PORT_BASE=7000
 
 #### File system location(s) where mirror segment data directories
 #### will be created. The number of mirror locations must equal the
 #### number of primary locations as specified in the
 #### DATA_DIRECTORY parameter.
-#### declare -a MIRROR_DATA_DIRECTORY=(/data1/mirror /data2/mirror)
+declare -a MIRROR_DATA_DIRECTORY=(/data1/mirror /data2/mirror)
 
 
 ################################################

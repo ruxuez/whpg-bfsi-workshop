@@ -100,6 +100,8 @@ services:
     volumes:
       - sdw1_primary1:/data1/primary
       - sdw1_primary2:/data2/primary
+      - sdw1_mirror1:/data1/mirror
+      - sdw1_mirror2:/data2/mirror
     healthcheck:
       test: ["CMD-SHELL", "pgrep -x postgres > /dev/null || pgrep -x sshd > /dev/null"]
       interval: 10s
@@ -125,6 +127,8 @@ services:
     volumes:
       - sdw2_primary1:/data1/primary
       - sdw2_primary2:/data2/primary
+      - sdw2_mirror1:/data1/mirror
+      - sdw2_mirror2:/data2/mirror
     healthcheck:
       test: ["CMD-SHELL", "pgrep -x postgres > /dev/null || pgrep -x sshd > /dev/null"]
       interval: 10s
@@ -136,8 +140,12 @@ volumes:
   master:
   sdw1_primary1:
   sdw1_primary2:
-  sdw2_primary1:  
+  sdw2_primary1:
   sdw2_primary2:
+  sdw1_mirror1:
+  sdw1_mirror2:
+  sdw2_mirror1:
+  sdw2_mirror2:
   rustfs-data:  # /data   — RustFS object storage
 
 networks:
