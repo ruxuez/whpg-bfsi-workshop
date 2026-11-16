@@ -82,7 +82,7 @@ schema and tables it can see.
 
 **app1 — Lab 1 (3 panels + comprehension check + SQL editor)**
 - *Card Transactions:* `1A` watchlist BIN match (`card_bin <@ bin_range`),
-  `1C` high-value SEPA-Instant scan (JSONB `@>` + jsonpath `@?` on the GIN index).
+  `1C` high-value SEPA-Instant scan (JSONB `@>` + jsonpath `@?`, partition-pruned parallel scan).
 - *Case & Auth Analytics:* `2A` case x auth same-day correlation, `2C` 5-source event-volume rollup.
 - *BIN, Limits + Bonus:* `3C` customer risk scorecard via `fraud_risk_score()`,
   `4B` forensic trace of structuring account `105900001` across transactions / auth / device / wires.

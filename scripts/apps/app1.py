@@ -142,8 +142,8 @@ ORDER BY hit_count DESC LIMIT 20"""
     },
     {
         "id": "1c", "panel": 0,
-        "name": "1C \u00b7 High-Value Instant Payments (JSONB + GIN)",
-        "desc": "ISO 20022 message filter via @> + jsonpath @? \u2014 hits the GIN index, impossible on VARIANT",
+        "name": "1C \u00b7 High-Value Instant Payments (JSONB)",
+        "desc": "ISO 20022 message filter via @> + jsonpath @? on native JSONB \u2014 evaluated in parallel on every segment",
         "sql": """SELECT t.account_id, t.amount,
     COALESCE(t.iso_msg #>> '{Cdtr,CtryOfRes}', t.beneficiary_country) AS bene_ctry,
     t.iso_msg #>> '{PmtTpInf,SvcLvl,Cd}'   AS svc_level,
@@ -259,18 +259,19 @@ CHECK_QUESTIONS = [
     },
     {
         "kind": "concept",
-        "title": "Why can Query 1C's `@>` and `@?` filters use a GIN index?",
+        "title": "How does WarehousePG answer Query 1C on 5.2M JSON payment messages?",
         "ask": "Query 1C filters ISO 20022 messages with `iso_msg @> '{...}'` (containment) and "
                "`iso_msg @? '$.IntrBkSttlmAmt ? (@.value > 9000)'` (jsonpath), then pulls fields out with `#>>`. "
-               "Which of these actually touch the GIN index, and why is this filter 'impossible on VARIANT'?",
-        "listen": "Both @> (containment) and @? (jsonpath exists) are GIN-indexable: a GIN index on iso_msg stores the "
-                  "document's keys and values as an inverted index, so these operators probe the index and visit only the "
-                  "handful of matching rows. Faster: the index turns 'find SEPA + INST messages with settlement > 9000' "
-                  "into a lookup instead of parsing 5M JSONB documents. The #>> path-extraction in the SELECT is NOT a search "
-                  "\u2014 it just pulls text values (Cdtr.CtryOfRes, SvcLvl.Cd, LclInstrm.Cd) out of the rows that already "
-                  "survived the filter. Slower / impossible on VARIANT: engines that store semi-structured data as an opaque "
-                  "VARIANT blob have no inverted index over its contents, so the same predicate degrades to a full scan plus "
-                  "per-row parse. Native JSONB + GIN is what makes the search indexable.",
+               "Run it with `EXPLAIN ANALYZE` from the SQL Editor. What does the plan do, and which parts of the "
+               "table design help?",
+        "listen": "The filters are native JSONB operators evaluated inside the database, so no JSON text is exported "
+                  "or parsed by an application. Faster: the `ts >= '2026-06-01'` predicate lets the planner skip "
+                  "partitions (the plan scans 7 of 13), and every segment applies the JSONB filters to its own slice "
+                  "in parallel (`Gather Motion 4:1`); only matching rows travel to the coordinator to be sorted for the "
+                  "top 20. In this dataset about 520,000 rows (10%) match, so a parallel scan of the relevant "
+                  "partitions beats an index lookup. A GIN index (`idx_txn_iso_gin`) exists on iso_msg and pays off when "
+                  "the filter is much more selective. The `#>>` path extraction in the SELECT is not a search: it only "
+                  "pulls text values (Cdtr.CtryOfRes, SvcLvl.Cd, LclInstrm.Cd) out of rows that already passed the filter.",
     },
 ]
 

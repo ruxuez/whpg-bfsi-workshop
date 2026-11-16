@@ -1,6 +1,6 @@
 # Lab 1: Card Fraud & AML Analytics (WarehousePG)
 
-In this lab, you will explore the power of native **int8range** operators and **native JSONB** handling in WarehousePG for financial services analytics. You will perform high-speed fraud detection on approximately 12.7 million events (5.2M card transactions plus authorization, device, case and wire data), demonstrating how native range types and **native JSON operators** (with GIN indexing) outperform standard cloud data warehouses that rely on VARIANT types or string parsing.
+In this lab, you will explore the power of native **int8range** operators and **native JSONB** handling in WarehousePG for financial services analytics. You will perform high-speed fraud detection on approximately 12.7 million events (5.2M card transactions plus authorization, device, case and wire data), demonstrating how native range types and **native JSON operators** outperform standard cloud data warehouses that rely on VARIANT types or string parsing.
 
 ## ⚠️ DO NOT HIT "Next" button yet! Wait for your instructor! ⚠️
 
@@ -17,7 +17,7 @@ In this lab, you will explore the power of native **int8range** operators and **
 | ID | Query | Key Demonstration |
 | :--- | :--- | :--- |
 | **1A** | **Watchlist BIN Match** | Native `int8range` with `<@` operator — no string parsing needed |
-| **1C** | **High-Value Instant Payments (JSONB)** | **Native JSON operators** (`@>`, `@?`) with GIN index — impossible on VARIANT types! |
+| **1C** | **High-Value Instant Payments (JSONB)** | **Native JSON operators** (`@>`, `@?`) run in parallel on every segment, with partition pruning — no string parsing |
 
 **Panel 2: Case & Auth Analytics**
 | ID | Query | Key Demonstration |
@@ -351,7 +351,7 @@ Native types on the 5.2M-row `transactions` table.
 | Query | What to do | What to notice |
 | :--- | :--- | :--- |
 | **1A · Watchlist BIN Match** | Click **Run**. | Returns the 20 card BINs with the most hits against high-confidence watchlist feeds, with hit count, total amount and first and last seen. The watchlist stores BINs as `int8range` bands. The query expands them with `generate_series()` and uses an equality hash join, which avoids probing a GiST index for every row. In the `EXPLAIN ANALYZE` plan, look for `Gather Motion 4:1`: your 4 primary segments each work on their own slice in parallel. |
-| **1C · High-Value Instant Payments (JSONB + GIN)** | Click **Run**. | Returns the 20 largest SEPA instant payments with a settlement amount above 9,000, with fields taken out of the ISO 20022 JSON message. Both filters work directly on the JSONB column, `@>` (containment) and `@?` (jsonpath), with no string parsing. In the `EXPLAIN ANALYZE` plan, notice `Number of partitions to scan: 7 (out of 13)` (partition pruning from the date filter) and that the JSONB filter runs on all 4 segments in parallel. About 520,000 rows match, so scanning the relevant partitions in parallel is cheaper than an index lookup here. The GIN index `idx_txn_iso_gin` on `iso_msg` pays off for more selective filters. |
+| **1C · High-Value Instant Payments (JSONB)** | Click **Run**. | Returns the 20 largest SEPA instant payments with a settlement amount above 9,000, with fields taken out of the ISO 20022 JSON message. Both filters work directly on the JSONB column, `@>` (containment) and `@?` (jsonpath), with no string parsing. In the `EXPLAIN ANALYZE` plan, notice `Number of partitions to scan: 7 (out of 13)` (partition pruning from the date filter) and that the JSONB filter runs on all 4 segments in parallel. About 520,000 rows match, so scanning the relevant partitions in parallel is cheaper than an index lookup here. The GIN index `idx_txn_iso_gin` on `iso_msg` pays off for more selective filters. |
 
 #### Panel 2: Case & Auth Analytics
 Joins across fact tables that a SIEM would normally correlate.
